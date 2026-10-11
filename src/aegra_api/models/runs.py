@@ -205,6 +205,10 @@ class Run(BaseModel):
         None, description="Final output produced by the run, or null if not yet complete."
     )
     error_message: str | None = Field(None, description="Error message if the run failed.")
+    error: str | None = Field(
+        None,
+        description="Agent Protocol alias of error_message (clients read `error`); mirrors it on every response.",
+    )
     config: dict[str, Any] | None = Field(
         default_factory=dict, description="Configuration passed to the graph at runtime."
     )
@@ -222,6 +226,13 @@ class Run(BaseModel):
         if not isinstance(v, str):
             raise ValueError(f"Status must be a string, got {type(v)}")
         return validate_run_status(v)
+
+    @model_validator(mode="after")
+    def _mirror_error_message(self) -> "Run":
+        """Agent Protocol clients read `error`; keep it in lockstep with error_message."""
+        if self.error is None and self.error_message is not None:
+            self.error = self.error_message
+        return self
 
 
 class RunStatus(BaseModel):
