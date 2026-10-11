@@ -72,6 +72,7 @@ async def _cleanup_cancelled_execution(run_id: str, execution_task: asyncio.Task
             status="interrupted",
             thread_status="idle",
             output={},
+            interrupted_by="cancel",
         )
     except Exception:
         logger.exception("Failed to persist explicit run cancellation", run_id=run_id)

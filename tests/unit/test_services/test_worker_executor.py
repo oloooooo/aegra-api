@@ -689,6 +689,7 @@ class TestExecuteAndRelease:
             status="interrupted",
             thread_status="idle",
             output={},
+            interrupted_by="cancel",
         )
         assert run_id not in explicit_run_cancellations
         assert run_id not in active_runs
@@ -796,6 +797,7 @@ class TestExecuteAndRelease:
             status="interrupted",
             thread_status="idle",
             output={},
+            interrupted_by="cancel",
         )
         assert run_id not in explicit_run_cancellations
         assert run_id not in active_runs

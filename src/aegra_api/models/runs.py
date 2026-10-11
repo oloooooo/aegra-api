@@ -209,6 +209,11 @@ class Run(BaseModel):
         None,
         description="Agent Protocol alias of error_message (clients read `error`); mirrors it on every response.",
     )
+    interrupted_by: Literal["cancel", "hitl"] | None = Field(
+        None,
+        description="Why status is 'interrupted': 'cancel' (client cancel or Supersede), "
+        "'hitl' (graph interrupt); null otherwise. Non-standard extension.",
+    )
     config: dict[str, Any] | None = Field(
         default_factory=dict, description="Configuration passed to the graph at runtime."
     )

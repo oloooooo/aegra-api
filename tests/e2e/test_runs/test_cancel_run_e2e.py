@@ -176,6 +176,11 @@ async def test_cancel_status_not_overwritten_to_success():
         f"Expected status to remain 'interrupted' or 'error', but got '{final_run['status']}'. "
         "This suggests the asyncio task completed and overwrote the status."
     )
+    # interrupted_by attribution (design §4): client cancel -> 'cancel'
+    if final_run["status"] == "interrupted":
+        assert final_run["interrupted_by"] == "cancel", (
+            f"Expected interrupted_by='cancel', got {final_run.get('interrupted_by')!r}"
+        )
 
 
 @pytest.mark.e2e

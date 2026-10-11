@@ -167,6 +167,9 @@ class Run(Base):
     context: Mapped[dict | None] = mapped_column(JsonbSafe, nullable=True)
     output: Mapped[dict | None] = mapped_column(JsonbSafe)
     error_message: Mapped[str | None] = mapped_column(Text)
+    # Why the run ended as 'interrupted': 'cancel' (client cancel / Supersede),
+    # 'hitl' (graph interrupt), or NULL for any other run.
+    interrupted_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))

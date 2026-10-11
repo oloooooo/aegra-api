@@ -64,6 +64,7 @@ async def execute_run(job: RunJob) -> None:
                 status="interrupted",
                 thread_status="interrupted",
                 output=final_output.data,
+                interrupted_by="hitl",
             )
         else:
             finalized = await finalize_run(
@@ -109,6 +110,7 @@ async def execute_run(job: RunJob) -> None:
                 status="interrupted",
                 thread_status="idle",
                 output={},
+                interrupted_by="cancel",
             )
             if finalized:
                 await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)

@@ -115,6 +115,9 @@ async def interrupt_unowned_run(
     or claims the run concurrently cannot be overwritten by the API process.
     If a live worker merely missed its lease, the caller asks it to stop through
     the broker, and guarded finalization rejects any late worker write.
+
+    Attribution is always ``interrupted_by='cancel'``: this path only fires
+    from explicit cancellation (client cancel or Supersede), never from HITL.
     """
     now = datetime.now(UTC)
     result = cast(
@@ -133,6 +136,7 @@ async def interrupt_unowned_run(
             )
             .values(
                 status="interrupted",
+                interrupted_by="cancel",
                 claimed_by=None,
                 lease_expires_at=None,
                 updated_at=now,
@@ -158,11 +162,15 @@ async def finalize_run(
     thread_status: str,
     output: Any = None,
     error: str | None = None,
+    interrupted_by: str | None = None,
 ) -> bool:
     """Conditionally update run and thread status in one transaction.
 
     Returns false when another actor has already made the run terminal. This
     prevents an expired worker from overwriting a reconciled cancellation.
+
+    ``interrupted_by`` attributes an ``interrupted`` status to its cause
+    ('cancel' or 'hitl'); pass None for normal terminal states.
     """
     validated_run = validate_run_status(status)
     validated_thread = validate_thread_status(thread_status)
@@ -176,6 +184,8 @@ async def finalize_run(
         run_values["output"] = _safe_serialize(output, run_id)
     if error is not None:
         run_values["error_message"] = error
+    if interrupted_by is not None:
+        run_values["interrupted_by"] = interrupted_by
 
     async with maker() as session:
         result = await session.execute(

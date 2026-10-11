@@ -98,6 +98,10 @@ async def test_human_in_loop_interrupt_resume_e2e():
             return
 
     assert interrupted_run["status"] == "interrupted", f"Expected interrupted, got {interrupted_run['status']}"
+    # interrupted_by attribution (design §4): graph HITL -> 'hitl'
+    assert interrupted_run["interrupted_by"] == "hitl", (
+        f"Expected interrupted_by='hitl', got {interrupted_run.get('interrupted_by')!r}"
+    )
     elog("✅ Interrupt detected", {"run_id": run_id})
 
     # Verify thread history has interrupt
