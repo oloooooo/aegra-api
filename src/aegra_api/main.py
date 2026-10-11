@@ -1,8 +1,7 @@
 """FastAPI application for Aegra (Agent Protocol Server)"""
 
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, AsyncGenerator, AsyncIterator
 
 import structlog
 from asgi_correlation_id import CorrelationIdMiddleware
@@ -49,12 +48,27 @@ from aegra_api.utils.setup_logging import setup_logging
 
 OPENAPI_TAGS: list[dict[str, Any]] = [
     {"name": "Assistants", "description": "A configured instance of a graph."},
-    {"name": "Threads", "description": "Accumulated state and outputs from a group of runs."},
-    {"name": "Thread Runs", "description": "Invoke a graph on a thread, updating its persistent state."},
-    {"name": "Stateless Runs", "description": "Invoke a graph without state or memory persistence."},
+    {
+        "name": "Threads",
+        "description": "Accumulated state and outputs from a group of runs.",
+    },
+    {
+        "name": "Thread Runs",
+        "description": "Invoke a graph on a thread, updating its persistent state.",
+    },
+    {
+        "name": "Stateless Runs",
+        "description": "Invoke a graph without state or memory persistence.",
+    },
     {"name": "Crons", "description": "Scheduled recurring runs on a cron schedule."},
-    {"name": "Store", "description": "Persistent key-value and semantic storage available from any thread."},
-    {"name": "Event Streaming", "description": "Agent Protocol v2 thread event streaming and commands."},
+    {
+        "name": "Store",
+        "description": "Persistent key-value and semantic storage available from any thread.",
+    },
+    {
+        "name": "Event Streaming",
+        "description": "Agent Protocol v2 thread event streaming and commands.",
+    },
     {"name": "Health", "description": "Server health checks and service information."},
 ]
 
@@ -82,7 +96,7 @@ def _log_connection_help(error: Exception) -> None:
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_app: FastAPI)-> AsyncGenerator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
     # Resolve the durability default up front: an invalid value fails the boot, not every run.
     get_default_durability()
@@ -229,7 +243,12 @@ def _apply_auth_to_custom_routes(app: FastAPI, auth_deps: list[Any]) -> int:
     stay public, and protocol routes carry their own auth. Returns the number
     of routes protected.
     """
-    fastapi_pages = {app.openapi_url, app.docs_url, app.redoc_url, app.swagger_ui_oauth2_redirect_url}
+    fastapi_pages = {
+        app.openapi_url,
+        app.docs_url,
+        app.redoc_url,
+        app.swagger_ui_oauth2_redirect_url,
+    }
     protected = 0
     uncovered: list[str] = []
 
@@ -263,7 +282,10 @@ def _apply_auth_to_custom_routes(app: FastAPI, auth_deps: list[Any]) -> int:
     if uncovered:
         # Plain Starlette routes and mounted non-FastAPI apps take no dependency, and
         # websockets are skipped by `_require_auth_on_http`; say so rather than imply cover.
-        logger.warning("enable_custom_route_auth does not cover these custom routes", paths=uncovered)
+        logger.warning(
+            "enable_custom_route_auth does not cover these custom routes",
+            paths=uncovered,
+        )
     return protected
 
 
@@ -448,7 +470,12 @@ app = create_app()
 
 
 if __name__ == "__main__":
+    import sys
+
     import uvicorn
 
+    # Windows' Proactor loop cannot run the psycopg pool (#513); "auto" elsewhere.
+    loop = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
+
     port = int(settings.app.PORT)
-    uvicorn.run(app, host=settings.app.HOST, port=port)  # nosec B104 - binding to all interfaces is intentional
+    uvicorn.run(app, host=settings.app.HOST, port=port, loop=loop)  # nosec B104 - binding to all interfaces is intentional
