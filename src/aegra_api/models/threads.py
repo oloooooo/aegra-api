@@ -100,6 +100,11 @@ class Thread(BaseModel):
     user_id: str = Field(..., description="Identifier of the user who owns this thread.")
     created_at: datetime = Field(..., description="Timestamp when the thread was created.")
     updated_at: datetime = Field(..., description="Timestamp when the thread was last updated.")
+    values: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Latest checkpoint values (e.g. messages). Empty until a run has checkpointed; "
+        "populated by GET /threads/{id} only.",
+    )
 
     @field_validator("status", mode="before")
     @classmethod

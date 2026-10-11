@@ -104,7 +104,11 @@ def _resolve_sort(request: ThreadSearchRequest) -> tuple[Any, bool]:
 # --- Helper for safe ORM -> Pydantic conversion (Test/Mock compatible) ---
 
 
-def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | None = None) -> Thread:
+def _serialize_thread(
+    thread_orm: ThreadORM,
+    default_metadata: dict[str, Any] | None = None,
+    values: dict[str, Any] | None = None,
+) -> Thread:
     """
     Safely converts ThreadORM to Thread model using dictionary construction.
     This handles None values and MagicMocks that appear in tests, preventing
@@ -164,8 +168,46 @@ def _serialize_thread(thread_orm: ThreadORM, default_metadata: dict[str, Any] | 
             "user_id": u_id,
             "created_at": c_at,
             "updated_at": u_at,
+            # Latest checkpoint values; only GET /threads/{id} populates it —
+            # list/search/create must not pay for a checkpoint read.
+            "values": values or {},
         }
     )
+
+
+async def _load_thread_values(thread_id: str, metadata: dict[str, Any] | None, user: User) -> dict[str, Any]:
+    """Latest checkpoint values for GET /threads/{id} (deepagents' result path).
+
+    Returns {} when the thread has no graph_id or no checkpoint yet — this
+    endpoint must stay 200 (404 is /state's contract, not this one). Real
+    failures surface as 5xx; the client degrades to placeholder text.
+    """
+    graph_id = (metadata or {}).get("graph_id")
+    if not graph_id:
+        return {}
+
+    from aegra_api.services.langgraph_service import (
+        create_thread_config,
+        get_langgraph_service,
+    )
+
+    config = create_thread_config(thread_id, user)
+    try:
+        async with get_langgraph_service().get_graph(
+            graph_id,
+            config=config,
+            access_context="threads.read",
+            user=user,
+        ) as agent:
+            agent = agent.with_config(config)
+            snapshot = await agent.aget_state(config)
+    except Exception as e:
+        logger.exception("Failed to load checkpoint values for thread '%s'", thread_id)
+        raise HTTPException(500, f"Failed to retrieve thread values: {str(e)}") from e
+
+    if not snapshot:
+        return {}
+    return snapshot.values or {}
 
 
 # --- Endpoints ---
@@ -339,7 +381,8 @@ async def get_thread(
     if not thread:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
-    return _serialize_thread(thread)
+    values = await _load_thread_values(thread_id, getattr(thread, "metadata_json", None), user)
+    return _serialize_thread(thread, values=values)
 
 
 @router.patch("/threads/{thread_id}", response_model=Thread, responses={**NOT_FOUND})
