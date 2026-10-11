@@ -381,3 +381,28 @@ async def test_cancel_many_by_status_cancels_all_active_runs():
     statuses = [await _wait_terminal(client, thread_id, run_id) for thread_id, run_id in started]
     elog("cancel_many by status", statuses)
     assert statuses == ["interrupted", "interrupted"]
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_cancel_rollback_action_rejected_422():
+    """`action=rollback` stays 422 (unimplemented, ADR-0002) and leaves the run untouched."""
+    import httpx
+
+    from aegra_api.settings import settings
+
+    client = get_e2e_client()
+    assistant = await client.assistants.create(graph_id="stress_test", if_exists="do_nothing")
+    assistant_id = assistant["assistant_id"]
+    thread_id, run_id = await _start_slow_run(client, assistant_id)
+    await asyncio.sleep(0.5)
+
+    async with httpx.AsyncClient(base_url=settings.app.SERVER_URL) as http:
+        resp = await http.post(f"/threads/{thread_id}/runs/{run_id}/cancel", params={"action": "rollback"})
+    elog("rollback cancel response", {"status_code": resp.status_code, "body": resp.text[:200]})
+    assert resp.status_code == 422, f"expected 422 for rollback, got {resp.status_code}"
+
+    run = await client.runs.get(thread_id, run_id)
+    assert run["status"] in ("pending", "running"), f"rollback must not change run status, got {run['status']}"
+
+    await client.runs.cancel(thread_id, run_id, action="interrupt")
