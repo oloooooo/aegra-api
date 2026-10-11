@@ -1,6 +1,6 @@
 # aegra-api docs
 
-本目录是 aegra-api 作为 Deep Agents async subagent 通信面（ACP）的文档。旧版需求文档（已废弃的独立包 `aegra-protocol`）在仓库根 [`../../docs/`](../../docs/)，不再更新。
+本目录是 aegra-api 作为 Deep Agents async subagent 通信面（Agent Protocol，简称 ACP）的文档。旧版需求文档属于已废弃的独立包 `aegra-protocol`（该仓库已不存在）。
 
 | 文件 | 内容 |
 | - | - |

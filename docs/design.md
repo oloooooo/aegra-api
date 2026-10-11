@@ -2,7 +2,7 @@
 
 为 Deep Agents 的 async subagent 提供 Agent Protocol（ACP）服务面（术语见 [`../CONTEXT.md`](../CONTEXT.md)）。**本文是需求与设计文档：先定稿，再据此改 `aegra-api` 代码。**
 
-- 旧版需求文档（已废弃的独立包 `aegra-protocol`）在仓库根 [`../../docs/`](../../docs/)；本文取代其地位，旧文档不再更新。
+- 旧版需求文档属于已废弃的独立包 `aegra-protocol`（该仓库已不存在）；本文取代其地位。
 - 术语以 [`../CONTEXT.md`](../CONTEXT.md) 为准；决策记录见 [`./adr/`](./adr/)。
 - 已核实版本：deepagents 0.7.23、langgraph 1.2.14、langgraph-sdk 0.4.6、langchain 1.4.4、agent-protocol 0.1.6。
 
@@ -100,7 +100,24 @@ deepagents 实发 `input`、`assistant_id`、`stream_mode`、`stream_subgraphs`�
 
 ### `GET /threads/{tid}`
 
-**新增 `values`**：取自该线程最新 checkpoint，序列化复用 `GET /threads/{tid}/state` 的路径（`ThreadStateService`）；无 graph_id / 无 checkpoint 时返回 `{}`。`interrupts` 本期不补（deepagents 不读；LangGraph SDK 的 `Thread` 是 TypedDict，不做运行时校验）。
+**新增 `values`**：取自该线程最新 checkpoint。这是 deepagents 取结果的唯一入口——`check_async_task` 在 run 为 `success` 后固定读 `values.messages[-1].content`；现状只返回 `thread_id / status / metadata / user_id / created_at / updated_at`，SDK 读到空。`interrupts` 本期不补（deepagents 不读；LangGraph SDK 的 `Thread` 是 TypedDict，不做运行时校验）。
+
+**响应模型**（`src/aegra_api/models/threads.py`）：`Thread` 增加 `values: dict[str, Any] = Field(default_factory=dict)`；`_serialize_thread()` 增加可选 `values` 参数，**仅 `get_thread` 传入**。list / search / POST / PATCH 不读 checkpoint、`values` 保持 `{}`，不给这些端点加额外开销。
+
+**`get_thread` 算法**（`src/aegra_api/api/threads.py`）：
+
+1. 现有 thread 查询与 auth 不变；
+2. 从 `thread.metadata_json` 取 `graph_id`；为空 → `values = {}`（不报错）；
+3. 非空 → `get_langgraph_service()` + `create_thread_config(thread_id, user)` + `access_context="threads.read"` 打开图，`agent.aget_state(config)`；
+4. 有 snapshot → `values = snapshot.values`（与 `GET /threads/{tid}/state` 同一来源；序列化交给 Pydantic，LangChain 消息会带 `content` / `type`）；
+5. 无 snapshot（尚无 checkpoint）→ `values = {}`；
+6. 读取失败（图加载 / checkpoint 异常）→ 照常 5xx；deepagents 会吞掉异常并退化为占位文案。
+
+**注意**：不要复用 `/state` 的 404 分支（`"No state found for thread"`）——那是 `/state` 的契约，`GET /threads/{tid}` 必须 200。
+
+**代价**：每次 `GET /threads/{tid}` 多一次图加载 + checkpoint 读（factory 图会重建）；deepagents 只在 run `success` 后读一次，可接受。
+
+**施工后要重跑**：threads 相关 e2e——响应多一个字段，若有用例断言精确键集合需同步。
 
 #### `check_async_task` 的结果取用路径（为什么可能没有内容）
 

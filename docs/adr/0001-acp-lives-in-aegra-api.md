@@ -1,8 +1,8 @@
 # ACP 内置于 aegra-api，不再抽独立包
 
-上一轮的决定（[`../../../docs/adr/0004-standalone-package-and-memory-ownership.md`](../../../docs/adr/0004-standalone-package-and-memory-ownership.md)）是新建独立包 `aegra-protocol`：宿主传 `build_agent(checkpointer)` 工厂、包自建 checkpointer 与专用 schema、一个进程服务一个 agent。用户现在改主意：**不抽独立服务，只改 aegra-api**——要的是"服务型的 ACP"，随 aegra-api 一起部署、用 `aegra.json` 注册图。
+上一轮的决定（旧独立包 `aegra-protocol` 的 ADR-0004；该仓库已不存在）是新建独立包：宿主传 `build_agent(checkpointer)` 工厂、包自建 checkpointer 与专用 schema、一个进程服务一个 agent。用户现在改主意：**不抽独立服务，只改 aegra-api**——要的是"服务型的 ACP"，随 aegra-api 一起部署、用 `aegra.json` 注册图。
 
-**决定**：deepagents async subagent 的通信面直接落在 aegra-api 既有的 `/threads`、`/threads/{tid}/runs` 等端点上，不新增路由、不做适配层；子 agent 图与 aegra-api 的其它图一样在 `aegra.json` 的 `graphs` 里注册（graph 名即 deepagents 的 `assistant_id`）。独立包 `aegra-protocol` 与仓库根 `docs/` 保留不动、不再演进，仅作历史参照。
+**决定**：deepagents async subagent 的通信面直接落在 aegra-api 既有的 `/threads`、`/threads/{tid}/runs` 等端点上，不新增路由、不做适配层；子 agent 图与 aegra-api 的其它图一样在 `aegra.json` 的 `graphs` 里注册（graph 名即 deepagents 的 `assistant_id`）。独立包 `aegra-protocol` 及其文档不再维护。
 
 ## Considered Options
 
