@@ -63,7 +63,7 @@ async def test_latest_state_human_in_loop_interrupt_e2e():
             "messages": [
                 {
                     "role": "human",
-                    "content": "Please look up the forecast for tomorrow",
+                    "content": "Please search for the weather forecast in Paris for tomorrow",
                 }
             ]
         },
