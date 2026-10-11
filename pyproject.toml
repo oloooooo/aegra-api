@@ -23,6 +23,8 @@ dependencies = [
     "uvicorn>=0.36.0",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.14.2",
+    # Imported directly in settings.py to load `.env` (already pulled in by pydantic-settings)
+    "python-dotenv>=1.0.0",
     "sse-starlette>=3.3.4,<4.0.0",
     # Imported directly for CancelScope(shield=True); same floor sse-starlette sets
     "anyio>=4.14.2",

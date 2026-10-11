@@ -3,6 +3,7 @@ import re
 from typing import Annotated
 from urllib.parse import parse_qsl, quote_plus, urlencode
 
+from dotenv import load_dotenv
 from pydantic import BeforeValidator, Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -10,6 +11,11 @@ from aegra_api import __version__
 from aegra_api.constants import MULTIHOST_URL_RE
 
 _logger = logging.getLogger(__name__)
+
+# Load `.env` from CWD into os.environ (existing env vars win). One load point for
+# every entrypoint (uvicorn / alembic / tests) and for libs that read env directly
+# (langchain-openai: OPENAI_API_KEY / OPENAI_BASE_URL).
+load_dotenv()
 
 # libpq sslmode → asyncpg ssl query param. asyncpg's ssl param validates
 # via SSLMode.parse(), which accepts libpq spellings only — "true"/"false"
