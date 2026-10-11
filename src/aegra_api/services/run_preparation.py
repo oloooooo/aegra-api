@@ -14,6 +14,7 @@ import structlog
 from asgi_correlation_id import correlation_id
 from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
+from redis import RedisError
 from sqlalchemy import ColumnElement, case, func, literal_column, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +28,8 @@ from aegra_api.models.run_job import RunBehavior, RunExecution, RunIdentity, Run
 from aegra_api.models.runs import Durability
 from aegra_api.services.executor import executor
 from aegra_api.services.langgraph_service import get_langgraph_service
-from aegra_api.services.run_status import set_thread_status
+from aegra_api.services.run_status import ACTIVE_RUN_STATES, interrupt_unowned_run, set_thread_status
+from aegra_api.services.streaming_service import streaming_service
 from aegra_api.settings import settings
 from aegra_api.utils.assistants import resolve_assistant_id
 from aegra_api.utils.jsonb import jsonb_patch, jsonb_shallow_merge
@@ -246,6 +248,50 @@ def _resolve_durability(request: RunCreate) -> Durability | None:
     return get_default_durability()
 
 
+async def _supersede_active_runs(session: AsyncSession, thread_id: str, user: User) -> None:
+    """Cancel every active run on the thread before a Supersede creates a new one.
+
+    ``multitask_strategy="interrupt"`` semantics (ADR-0003): kill pending/running
+    runs via the standard cancel path — unowned runs fall directly in the DB
+    (``interrupted_by='cancel'``), live-owned ones get a broker signal and are
+    finalized by their executor. Checkpoints and thread history are untouched.
+    Runs the new run depends on must already be settled by the caller ordering.
+    """
+    active_runs_to_cancel = (
+        await session.scalars(
+            select(RunORM).where(
+                RunORM.thread_id == thread_id,
+                RunORM.user_id == user.identity,
+                RunORM.status.in_(ACTIVE_RUN_STATES),
+            )
+        )
+    ).all()
+    if not active_runs_to_cancel:
+        return
+
+    logger.info(
+        "Superseding active runs",
+        thread_id=thread_id,
+        superseded_run_ids=[r.run_id for r in active_runs_to_cancel],
+    )
+    for run in active_runs_to_cancel:
+        reconciled = await interrupt_unowned_run(session, run.run_id, thread_id, user_id=user.identity)
+        if reconciled:
+            # Unowned: DB already terminal; signal only closes stragglers/streams.
+            await streaming_service.interrupt_run(run.run_id, emit_end_event=False)
+            try:
+                await streaming_service.signal_run_cancelled(run.run_id)
+            except (RedisError, OSError):
+                logger.exception("Failed to signal superseded run", run_id=run.run_id)
+            continue
+
+        # Live owner: ask it to stop; the executor's guarded finalize wins or loses
+        # atomically against the new run, and a late success write cannot revive it.
+        await session.refresh(run)
+        if run.status in ACTIVE_RUN_STATES:
+            await streaming_service.interrupt_run(run.run_id)
+
+
 async def _prepare_run(
     session: AsyncSession,
     thread_id: str,
@@ -303,6 +349,12 @@ async def _prepare_run(
     available_graphs = langgraph_service.list_graphs()
     if assistant.graph_id not in available_graphs:
         raise HTTPException(404, f"Graph '{assistant.graph_id}' not found for assistant")
+
+    # Supersede (multitask_strategy="interrupt"): kill active runs BEFORE the new
+    # run is persisted, so "old run settles -> new run starts" ordering holds.
+    # Other strategy values remain accepted-but-ignored (known limitation §9).
+    if request.multitask_strategy == "interrupt":
+        await _supersede_active_runs(session, thread_id, user)
 
     # Mark thread as busy and update metadata
     await update_thread_metadata(
