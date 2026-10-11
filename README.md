@@ -203,7 +203,7 @@ Rule of thumb: machine/deployment specific values (credentials, hostnames, ports
 
 ### `aegra.json`
 
-Path resolution: `AEGRA_CONFIG` env var → `./aegra.json` → `./langgraph.json` (compatibility fallback). Relative paths inside the file resolve against the config file's directory. A full example lives in `aegra_example.json`.
+Path resolution: `AEGRA_CONFIG` env var → `./aegra.json` → `./langgraph.json` (compatibility fallback). Relative paths inside the file resolve against the config file's directory. **It is read once at startup — restart after editing it.** A full example lives in `aegra_example.json`.
 
 ```json
 {
@@ -225,17 +225,16 @@ Path resolution: `AEGRA_CONFIG` env var → `./aegra.json` → `./langgraph.json
     "ttl": { "strategy": "delete", "default_ttl": 10080, "sweep_interval_minutes": 30 }
   },
   "auth": {
-    "path": "./auth.py:auth",
-    "disable_studio_auth": false
+    "path": "./auth.py:auth"
   }
 }
 ```
 
 | Key | Purpose |
 |-----|---------|
-| `graphs` | Graph name → `path/to/module.py:attr`. The name doubles as the `assistant_id` clients send. |
-| `dependencies` | Extra directories added to `sys.path` before graphs are imported (shared code living outside the project root). |
-| `http.app` | Custom FastAPI/Starlette app merged into the server — see `examples/custom_routes_example.py`. |
+| `graphs` | Graph name → `path/to/module.py:attr`. The name doubles as the `assistant_id` clients send: every key gets an assistant (`uuid5(namespace, key)`) pre-created at startup, so removing a key breaks every client pointing at it. |
+| `dependencies` | Extra directories added to `sys.path` before graphs are imported (shared code living outside the project root); the first entry wins. |
+| `http.app` | Custom FastAPI app — it **replaces** the app, with the core routers added onto it. See `examples/custom_routes_example.py`. |
 | `http.enable_custom_route_auth` | Apply the Aegra auth dependency to the custom app's routes. |
 | `http.cors` | CORS overrides: `allow_origins`, `allow_origin_regex`, `allow_credentials`, `allow_methods`, `allow_headers`, `expose_headers`, `max_age`. |
 | `store.scopes` | Namespace prefix → list of user attributes allowed to scope it. |
@@ -247,18 +246,18 @@ Path resolution: `AEGRA_CONFIG` env var → `./aegra.json` → `./langgraph.json
 Two of these keys have an env override — env wins over `aegra.json`, and a per-run value wins over both:
 `AEGRA_THREAD_TTL` replaces `checkpointer.ttl`, `AEGRA_CHECKPOINT_DURABILITY` replaces `checkpointer.durability`.
 
+Every key in detail, the startup-time error messages, the graph-key / `assistant_id` rules (and what breaks when they mismatch), every environment variable, and logging — including the rotating `logs/aegra.log` file handler: **[docs/configuration.md](docs/configuration.md)** (Chinese).
+
 ### Environment Variables (`.env`)
 
-Loaded once at import; real environment variables take precedence over the file, so the same `.env` works in Docker/K8s with a few keys overridden. Defaults for everything below are in `src/aegra_api/settings.py`.
+Loaded once at import; real environment variables take precedence over the file, so the same `.env` works in Docker/K8s with a few keys overridden. Defaults for everything are in `src/aegra_api/settings.py`; a commented starting point is [`.env_example`](.env_example), and the full reference (server, PostgreSQL, pools, Redis/workers, cron, retention, logging, OpenTelemetry, metrics) is in [docs/configuration.md](docs/configuration.md).
 
 ```bash
 # --- Server ---
 HOST=0.0.0.0
 PORT=2026
 AEGRA_CONFIG=aegra.json       # path to the aegra.json described above
-DEBUG=false
 AUTH_TYPE=noop                # noop | custom
-LOG_LEVEL=INFO
 RUN_MIGRATIONS_ON_STARTUP=true   # false for multi-pod: run `aegra db upgrade` out-of-band
 
 # --- PostgreSQL (DATABASE_URL wins when both are set) ---
@@ -269,30 +268,15 @@ POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 POSTGRES_DB=aegra
 
-# --- Redis broker (multi-instance streaming + crash recovery) ---
-REDIS_BROKER_ENABLED=false
-REDIS_URL=redis://localhost:6379/0
-
-# --- Workers (used only when REDIS_BROKER_ENABLED=true) ---
-WORKER_COUNT=3
-N_JOBS_PER_WORKER=10
-BG_JOB_TIMEOUT_SECS=3600
-BG_JOB_MAX_RETRIES=3
-
-# --- Pools, cron, retention ---
-SQLALCHEMY_POOL_SIZE=10
-LANGGRAPH_MAX_POOL_SIZE=20
-CRON_ENABLED=true
-AEGRA_THREAD_TTL=10080        # minutes, or JSON: {"strategy":"keep_latest","default_ttl":...}
-AEGRA_CHECKPOINT_DURABILITY=async
+# --- Logging (stdout always; the file handler is on by default) ---
+LOG_LEVEL=INFO
+LOG_FILE=logs/aegra.log       # "" = stdout only
+LOG_FILE_MAX_MB=10            # rotate at this size
+LOG_FILE_RETENTION_DAYS=7     # delete rotated files older than this
 
 # --- LLM (read by langchain-openai inside your graphs) ---
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1   # only for OpenAI-compatible endpoints
-
-# --- Observability (optional) ---
-OTEL_TARGETS=LANGFUSE,PHOENIX
-ENABLE_PROMETHEUS_METRICS=false
 ```
 
 `AEGRA_THREAD_TTL` takes either a bare number (default TTL in minutes) or a JSON object with `strategy` / `default_ttl` / `sweep_interval_minutes` / `sweep_limit`; `LANGGRAPH_THREAD_TTL` is accepted as an alias.
@@ -434,5 +418,6 @@ libs/aegra-api/
 
 ## Documentation
 
+- Configuration reference (aegra.json, environment variables, logging): [docs/configuration.md](docs/configuration.md) (Chinese)
 - Async subagent (ACP) design: [docs/design.md](docs/design.md)
 - Glossary: [CONTEXT.md](CONTEXT.md)

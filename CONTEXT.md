@@ -51,3 +51,21 @@ _Avoid_: 主 agent、调度器
 **Default assistant（默认 assistant）**:
 `aegra.json` 里每个 graph 自动拥有、供 `assistant_id=graph_id` 直连的 assistant；无需显式注册（graph 名即 deepagents 的 assistant_id）。
 _Avoid_: 内置 assistant、系统图
+
+## 配置词表
+
+**Graph key（图名）**:
+`aegra.json` 中 `graphs` 的键，同时是这份部署对外暴露的那个默认 assistant 的身份；客户端可以直接把它当 `assistant_id` 用。
+_Avoid_: 图 id、模型名
+
+**Graph id**:
+assistant 记录指向的图名，值等于它建立时所用的 graph key。key 从配置里删掉后，这条记录的 graph_id 就指向不存在的图。
+_Avoid_: 把 graph_id 当 graph key 的别名（一个是记录字段，一个是配置里的键）
+
+**Assistant id**:
+接口里标识 assistant 的字符串：可以是 assistant 的 uuid，也可以是当前配置里的 graph key。两者都不匹配即 404。
+_Avoid_: 认为任意字符串都能当 assistant_id 用
+
+**File logging（文件日志）**:
+把同一份结构化日志同时写到 stdout 与本地文件的出口；文件恒为 JSON，带大小轮转与按天清理。
+_Avoid_: 把文件日志当成独立于 stdout 的另一套日志

@@ -114,6 +114,12 @@ class AppSettings(EnvBase):
     LOG_LEVEL: UpperStr = "INFO"
     LOG_VERBOSITY: LowerStr = "verbose"
     LOG_EXCLUDE_PATHS: str = ""  # Comma-separated path prefixes to skip in access logs
+    # File logging: rotated at LOG_FILE_MAX_MB, rotated files older than
+    # LOG_FILE_RETENTION_DAYS are deleted on the next rotation. Relative paths
+    # resolve against the process CWD. Empty string = stdout only.
+    LOG_FILE: str = "logs/aegra.log"
+    LOG_FILE_MAX_MB: int = Field(default=10, gt=0)
+    LOG_FILE_RETENTION_DAYS: int = Field(default=7, gt=0)
 
     @computed_field
     @property

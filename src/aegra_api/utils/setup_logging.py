@@ -1,12 +1,60 @@
 import logging
 import logging.config
+import logging.handlers
 import sys
+import time
+from pathlib import Path
 from typing import Any
 
 import structlog
 import structlog.typing
 
 from aegra_api.settings import settings
+
+
+class SizeAndAgeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Size-based rotation with age-based cleanup of rotated files.
+
+    stdlib rotates by size (`RotatingFileHandler`) or by time
+    (`TimedRotatingFileHandler`) but never both, so cleanup by age runs here
+    after each rollover. `LOG_FILE_MAX_MB` sets the rotation point;
+    `LOG_FILE_RETENTION_DAYS` is the retention bound — backupCount is only a
+    hard ceiling on the rename cascade (shortcut: fixed at _MAX_BACKUPS, raise
+    it if a deployment needs more retained files than that).
+    """
+
+    _MAX_BACKUPS = 100
+
+    def __init__(self, filename: str, *, retention_days: int = 7, **kwargs: Any) -> None:
+        self.retention_days = retention_days
+        super().__init__(filename, backupCount=self._MAX_BACKUPS, **kwargs)
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        cutoff = time.time() - self.retention_days * 86400
+        for index in range(1, self._MAX_BACKUPS + 1):
+            rotated = Path(f"{self.baseFilename}.{index}")
+            if rotated.exists() and rotated.stat().st_mtime < cutoff:
+                rotated.unlink(missing_ok=True)
+
+
+def _log_file_path() -> Path | None:
+    """Resolve LOG_FILE to an absolute path, or None when file logging is off or unusable.
+
+    Returns None (stdout logging only) when the configured folder cannot be
+    created, so a read-only working directory cannot stop the server booting.
+    """
+    if not settings.app.LOG_FILE or not settings.app.LOG_FILE.strip():
+        return None
+    path = Path(settings.app.LOG_FILE).expanduser().resolve()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Cannot create log folder %s (%s) - file logging disabled", path.parent, exc
+        )
+        return None
+    return path
 
 
 def get_logging_config() -> dict[str, Any]:
@@ -74,6 +122,30 @@ def get_logging_config() -> dict[str, Any]:
         structlog.processors.UnicodeDecoder(),
     ]
 
+    handlers: dict[str, Any] = {
+        "default": {
+            "level": log_level,
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            # String reference defers sys.stdout lookup until the config
+            # is loaded in the child process (avoids pickling error).
+            "stream": "ext://sys.stdout",
+        },
+    }
+
+    log_file = _log_file_path()
+    if log_file is not None:
+        handlers["file"] = {
+            "()": SizeAndAgeRotatingFileHandler,
+            "level": log_level,
+            "formatter": "file",
+            "filename": str(log_file),
+            "maxBytes": settings.app.LOG_FILE_MAX_MB * 1024 * 1024,
+            "retention_days": settings.app.LOG_FILE_RETENTION_DAYS,
+            # The default locale encoding mangles non-ASCII on Windows consoles.
+            "encoding": "utf-8",
+        }
+
     return {
         "version": 1,
         # Keep library loggers (uvicorn, httpx, etc.) alive
@@ -88,20 +160,24 @@ def get_logging_config() -> dict[str, Any]:
                 ],
                 "foreign_pre_chain": shared_processors,
             },
-        },
-        "handlers": {
-            "default": {
-                "level": log_level,
-                "class": "logging.StreamHandler",
-                "formatter": "default",
-                # String reference defers sys.stdout lookup until the config
-                # is loaded in the child process (avoids pickling error).
-                "stream": "ext://sys.stdout",
+            # Log files are always JSON: ANSI colour codes from the console
+            # renderer would make them unreadable and unparseable, and
+            # format_exc_info is needed because JSONRenderer cannot render
+            # exceptions on its own (see the production branch above).
+            "file": {
+                "()": "structlog.stdlib.ProcessorFormatter",
+                "processors": [
+                    structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                    structlog.processors.format_exc_info,
+                    structlog.processors.JSONRenderer(),
+                ],
+                "foreign_pre_chain": shared_processors,
             },
         },
+        "handlers": handlers,
         "loggers": {
             "": {
-                "handlers": ["default"],
+                "handlers": list(handlers),
                 "level": log_level,
                 "propagate": False,
             },

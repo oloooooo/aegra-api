@@ -7,24 +7,37 @@ in the correct order for both dev and production modes.
 
 import json
 import logging
+import os
+import time
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import structlog
 
-from aegra_api.utils.setup_logging import get_logging_config
+from aegra_api.utils.setup_logging import SizeAndAgeRotatingFileHandler, get_logging_config
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _get_config(*, env_mode: str, log_level: str = "INFO") -> dict:
+def _get_config(
+    *,
+    env_mode: str,
+    log_level: str = "INFO",
+    log_file: str = "",
+    max_mb: int = 10,
+    retention_days: int = 7,
+) -> dict:
     """Get logging config with mocked settings."""
     with patch("aegra_api.utils.setup_logging.settings") as mock_settings:
         mock_settings.app.ENV_MODE = env_mode
         mock_settings.app.LOG_LEVEL = log_level
+        mock_settings.app.LOG_FILE = log_file
+        mock_settings.app.LOG_FILE_MAX_MB = max_mb
+        mock_settings.app.LOG_FILE_RETENTION_DAYS = retention_days
         return get_logging_config()
 
 
@@ -273,3 +286,98 @@ class TestRuntimeOutput:
         assert parsed["request_id"] == "test-req-123"
         assert parsed["user_id"] == "alice"
         assert parsed["status_code"] == 200
+
+
+# ---------------------------------------------------------------------------
+# File logging (LOG_FILE)
+# ---------------------------------------------------------------------------
+
+
+def _make_file_logger(
+    path: Path, *, max_bytes: int, retention_days: int
+) -> tuple[SizeAndAgeRotatingFileHandler, logging.Logger]:
+    """Attach a real rotating file handler to a throwaway logger."""
+    handler = SizeAndAgeRotatingFileHandler(
+        str(path), maxBytes=max_bytes, retention_days=retention_days, encoding="utf-8", delay=True
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger(f"test.file.{path.name}.{id(handler)}")
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return handler, logger
+
+
+class TestFileLoggingConfig:
+    """`get_logging_config` wiring for LOG_FILE."""
+
+    def test_no_file_handler_when_log_file_empty(self) -> None:
+        config = _get_config(env_mode="LOCAL", log_file="")
+        assert "file" not in config["handlers"]
+        assert config["loggers"][""]["handlers"] == ["default"]
+
+    def test_file_handler_added_alongside_stdout(self, tmp_path: Path) -> None:
+        target = tmp_path / "logs" / "aegra.log"
+        config = _get_config(env_mode="LOCAL", log_file=str(target), max_mb=5, retention_days=3)
+
+        handler = config["handlers"]["file"]
+        assert handler["filename"] == str(target)
+        assert handler["maxBytes"] == 5 * 1024 * 1024
+        assert handler["retention_days"] == 3
+        assert handler["encoding"] == "utf-8"
+        assert handler["formatter"] == "file"
+        assert config["loggers"][""]["handlers"] == ["default", "file"]
+
+    def test_relative_path_resolves_against_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        config = _get_config(env_mode="LOCAL", log_file="logs/aegra.log")
+        assert Path(config["handlers"]["file"]["filename"]) == (tmp_path / "logs" / "aegra.log").resolve()
+
+    def test_file_formatter_is_json_even_in_local_mode(self) -> None:
+        """Console keeps colours; the file must stay parseable."""
+        config = _get_config(env_mode="LOCAL", log_file="logs/aegra.log")
+        assert isinstance(config["formatters"]["default"]["processors"][-1], structlog.dev.ConsoleRenderer)
+        assert isinstance(config["formatters"]["file"]["processors"][-1], structlog.processors.JSONRenderer)
+
+    def test_unusable_log_folder_falls_back_to_stdout(self, tmp_path: Path) -> None:
+        """A folder that cannot be created must not stop the server booting."""
+        blocking_file = tmp_path / "logs"
+        blocking_file.write_text("not a folder", encoding="utf-8")
+
+        config = _get_config(env_mode="LOCAL", log_file=str(blocking_file / "aegra.log"))
+
+        assert "file" not in config["handlers"]
+        assert config["loggers"][""]["handlers"] == ["default"]
+
+
+class TestSizeAndAgeRotatingFileHandler:
+    """Rotation by size plus cleanup by age (stdlib does one or the other)."""
+
+    def test_rotates_when_max_bytes_reached(self, tmp_path: Path) -> None:
+        path = tmp_path / "aegra.log"
+        _, logger = _make_file_logger(path, max_bytes=200, retention_days=7)
+
+        for _ in range(20):
+            logger.info("x" * 20)
+
+        assert path.exists()
+        assert (tmp_path / "aegra.log.1").exists()
+
+    def test_rotated_file_older_than_retention_is_deleted(self, tmp_path: Path) -> None:
+        path = tmp_path / "aegra.log"
+        stale = tmp_path / "aegra.log.5"
+        fresh = tmp_path / "aegra.log.4"
+        stale.write_text("stale-marker\n", encoding="utf-8")
+        fresh.write_text("fresh-marker\n", encoding="utf-8")
+        eight_days_ago = time.time() - 8 * 86400
+        os.utime(stale, (eight_days_ago, eight_days_ago))
+
+        _, logger = _make_file_logger(path, max_bytes=10, retention_days=7)
+        # Two records: stdlib never rotates an empty file (gh-116263 in CPython
+        # 3.14), and cleanup only runs on a rollover.
+        logger.info("first")
+        logger.info("trigger rollover")
+
+        rotated = [p.read_text(encoding="utf-8") for p in tmp_path.glob("aegra.log.*")]
+        assert not any("stale-marker" in text for text in rotated)
+        assert any("fresh-marker" in text for text in rotated)
