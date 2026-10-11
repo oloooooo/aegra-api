@@ -34,7 +34,7 @@ aegra init
 cd <your-project>
 
 # Configure environment
-cp .env.example .env
+cp .env_example .env
 # Add your OPENAI_API_KEY to .env
 
 # Install dependencies and start developing
@@ -62,6 +62,128 @@ alembic upgrade head
 # Start server
 uvicorn aegra_api.main:app --port 2026 --reload
 ```
+
+## Tutorial: running from this repo
+
+A complete walkthrough for running the server locally and wiring a Deep Agents
+supervisor to it (the exact steps used to verify the async-subagent contract).
+
+### 1. Install and configure
+
+```bash
+cd aegra-api
+uv sync                      # creates .venv, installs aegra-api in editable mode
+cp .env_example .env         # then fill in real values
+```
+
+`.env` is loaded automatically at startup (`settings.py` calls `load_dotenv()`;
+real environment variables win over the file). Minimum contents:
+
+```bash
+# PostgreSQL — either a single URL ...
+# DATABASE_URL=postgresql://postgres:password@localhost:5432/aegra
+# ...or the individual vars (used when DATABASE_URL is unset)
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=aegra
+
+# OpenAI-compatible LLM API (read by langchain-openai inside your graphs)
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1   # or any OpenAI-compatible endpoint
+OPENAI_MODEL=gpt-4o-mini                     # picked up by graph code via os.environ
+```
+
+### 2. Register your graphs in `aegra.json`
+
+```json
+{
+  "graphs": {
+    "researcher": "./graphs/researcher.py:graph",
+    "supervisor": "./graphs/supervisor.py:graph"
+  }
+}
+```
+
+Each value is `path/to/module.py:attr` exporting a compiled LangGraph
+`graph`. Do **not** pass a checkpointer when compiling — the server injects one
+per request. Graph name doubles as the `assistant_id` clients send; no manual
+assistant registration is needed.
+
+> **Windows**: run uvicorn with the selector event loop —
+> `--loop "asyncio:SelectorEventLoop"` (psycopg/asyncpg are incompatible with
+> the default Proactor loop).
+
+### 3. Migrate and start
+
+```bash
+uv run alembic upgrade head
+
+# Local mode (single process, in-memory broker)
+uv run uvicorn aegra_api.main:app --port 2026 --reload --loop "asyncio:SelectorEventLoop"
+
+# Worker mode (Redis job queue + crash recovery) — requires a running Redis
+REDIS_BROKER_ENABLED=true uv run uvicorn aegra_api.main:app --port 2026 --loop "asyncio:SelectorEventLoop"
+```
+
+Verify: `curl http://localhost:2026/health` →
+`{"status":"healthy","database":"connected",...}`.
+
+### 4. Smoke-test the Agent Protocol surface
+
+```bash
+# Create a thread (body may be {})
+TID=$(curl -s -X POST localhost:2026/threads -H 'Content-Type: application/json' -d '{}' | python -c 'import sys,json;print(json.load(sys.stdin)["thread_id"])')
+
+# Start a run — assistant_id is the graph name from aegra.json
+RUN_ID=$(curl -s -X POST "localhost:2026/threads/$TID/runs" -H 'Content-Type: application/json' \
+  -d '{"assistant_id":"researcher","input":{"messages":[{"role":"user","content":"hello"}]}}' \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["run_id"])')
+
+# Poll the run, then read the result from the thread's latest values
+curl -s "localhost:2026/threads/$TID/runs/$RUN_ID"   # -> status (success/error), error, interrupted_by
+curl -s "localhost:2026/threads/$TID"                # -> values.messages[-1].content
+```
+
+### 5. Point a Deep Agents supervisor at it
+
+```python
+# graphs/supervisor.py
+import os
+from deepagents import AsyncSubAgent, create_deep_agent
+
+graph = create_deep_agent(
+    model=f"openai:{os.environ['OPENAI_MODEL']}",
+    subagents=[
+        AsyncSubAgent(
+            name="researcher",
+            description="Research agent for information gathering",
+            graph_id="researcher",                              # aegra.json key
+            url=os.environ.get("AEGRA_SERVER_URL", "http://localhost:2026"),
+        )
+    ],
+)
+```
+
+Run the supervisor the same way as any other graph. Its async subagent tasks
+start, poll, update and cancel over this server's `/threads` + `/runs`
+endpoints; each subagent's memory lives in its own thread in PostgreSQL.
+
+### 6. Run the tests
+
+```bash
+uv run pytest tests/unit tests/integration -q          # no external deps
+
+# e2e hits a LIVE server (SERVER_URL, default http://localhost:2026)
+# with graphs registered in aegra.json — start the server first, then:
+uv run pytest tests/e2e -q                              # all e2e
+uv run pytest tests/e2e/test_runs/test_supersede_e2e.py -q   # one case
+```
+
+`@pytest.mark.prod_only` tests need worker mode (`REDIS_BROKER_ENABLED=true`
+with a reachable Redis); they exercise lease/crash-recovery paths that do not
+exist in local mode.
 
 ## Configuration
 

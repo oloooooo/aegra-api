@@ -1,6 +1,6 @@
 # aegra-api 作为 Deep Agents async subagent 的 ACP 服务
 
-为 Deep Agents 的 async subagent 提供 Agent Protocol（ACP）服务面（术语见 [`../CONTEXT.md`](../CONTEXT.md)）。**本文是需求与设计文档：先定稿，再据此改 `aegra-api` 代码。**
+为 Deep Agents 的 async subagent 提供 Agent Protocol（ACP）服务面（术语见 [`../CONTEXT.md`](../CONTEXT.md)）。**本文是需求与设计文档。状态：§7 五项改动已全部实现并验证（2026-10-11）**，详见 §7 表内标注与 §10 测试结果。
 
 - 旧版需求文档属于已废弃的独立包 `aegra-protocol`（该仓库已不存在）；本文取代其地位。
 - 术语以 [`../CONTEXT.md`](../CONTEXT.md) 为准；决策记录见 [`./adr/`](./adr/)。
@@ -192,13 +192,13 @@ Supersede（`multitask_strategy="interrupt"`，**在创建新 run 之前**）：
 
 ## 7. 本期改动清单
 
-| # | 改动 | 原因 |
-|---|---|---|
-| 1 | `GET /threads/{tid}` 补 `values` | deepagents 读结果 |
-| 2 | `Run` 补 `error`（与 `error_message` 并存） | deepagents 读错误 |
-| 3 | `Run` 增 `interrupted_by`（列 + 上述写入点） | 区分取消 vs HITL |
-| 4 | 实现 `multitask_strategy="interrupt"` Supersede | `update_async_task` 的硬要求 |
-| 5 | cancel 默认 action 改 `interrupt` | 规范/SDK 对齐（零行为变化） |
+| # | 改动 | 原因 | 状态 |
+|---|---|---|---|
+| 1 | `GET /threads/{tid}` 补 `values` | deepagents 读结果 | ✅ 已实现（`_serialize_thread(values=...)` + `_load_thread_values`；无 graph_id/无 checkpoint → `{}` 200，读取失败 → 5xx） |
+| 2 | `Run` 补 `error`（与 `error_message` 并存） | deepagents 读错误 | ✅ 已实现（`Run._mirror_error_message` 每次响应镜像） |
+| 3 | `Run` 增 `interrupted_by`（列 + 上述写入点） | 区分取消 vs HITL | ✅ 已实现（迁移 `c4d5e6f7a8b9`；cancel/Supersede → `cancel`，HITL → `hitl`，正常终态 → null） |
+| 4 | 实现 `multitask_strategy="interrupt"` Supersede | `update_async_task` 的硬要求 | ✅ 已实现（`run_preparation._supersede_active_runs`：建新 run 前走标准取消，历史不动） |
+| 5 | cancel 默认 action 改 `interrupt` | 规范/SDK 对齐（零行为变化） | ✅ 已实现（单 run cancel 端点默认值；bulk 端点本就是 `interrupt`） |
 
 **已满足、不必改**：五个端点与路径、`assistant_id=graph_id` 直连、取消落 `interrupted` + 活动态守卫、HITL 落 `interrupted` + thread `interrupted`、`rollback` 已自动 422。
 
@@ -255,6 +255,8 @@ supervisor = create_deep_agent(
 6. 独立包 `aegra-protocol` 与根 `docs/` 保留不动，仅作历史参照。
 
 ## 10. 测试清单（e2e，真 PG）
+
+> **状态：全部通过（2026-10-11）**。local executor 与 Redis worker（`REDIS_BROKER_ENABLED=true`）两种模式下均验证；#11 用真实 deepagents 0.7.23 + supervisor 图联测（start / check / cancel 三轮对话，Supersede 由 #4 的服务端 e2e 覆盖）。唯一注意：HITL 用例依赖模型主动发起 tool_calls，非 OpenAI 系模型需用含明确地点的提示词（已修入用例）。
 
 1. 全生命周期：`POST /threads` → `POST runs`（`assistant_id=graph_id`）→ 轮询 `GET run` 到 `success` → `GET /threads/{tid}` 拿到 `values.messages[-1].content`。
 2. 客户端契约：按 §2.1 的真实请求形状打一遍（含多发的 `stream_mode` / `stream_resumable`、空 body 的 cancel、body `{}` 的 thread create）。

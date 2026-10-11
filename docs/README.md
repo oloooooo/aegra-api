@@ -4,7 +4,7 @@
 
 | 文件 | 内容 |
 | - | - |
-| [design.md](./design.md) | **需求与设计**：deepagents 实发的五类请求、状态/动作词表三方对照、端点契约、`interrupted_by` 数据模型、状态机、取消与 Supersede 时序、本期改动清单、`aegra.json` 示例、已知限制、测试清单 |
+| [design.md](./design.md) | **需求与设计（§7 五项改动已全部实现，§10 测试全部通过）**：deepagents 实发的五类请求、状态/动作词表三方对照、端点契约、`interrupted_by` 数据模型、状态机、取消与 Supersede 时序、本期改动清单、`aegra.json` 示例、已知限制、测试清单 |
 | [adr/0001-acp-lives-in-aegra-api.md](./adr/0001-acp-lives-in-aegra-api.md) | ACP 内置于 aegra-api，不再抽独立包（supersedes 旧 ADR-0004） |
 | [adr/0002-status-and-cancel-vocabulary.md](./adr/0002-status-and-cancel-vocabulary.md) | 服务端不引入 `cancelled`；取消与 HITL 共用 `interrupted` + `interrupted_by`；`rollback` 未实现 |
 | [adr/0003-multitask-strategy-interrupt-supersede.md](./adr/0003-multitask-strategy-interrupt-supersede.md) | `multitask_strategy="interrupt"` 真执行 Supersede（行为变更） |
