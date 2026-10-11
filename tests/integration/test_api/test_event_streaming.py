@@ -1,0 +1,426 @@
+"""Integration tests for the v2 event streaming routes."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import uuid
+from collections.abc import AsyncIterator, Iterator, Mapping, MutableMapping
+from functools import partial
+from typing import Any
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+import uvicorn
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sse_starlette import EventSourceResponse
+
+from aegra_api.api import event_streaming as es_module
+from aegra_api.core.auth_deps import get_current_user, require_auth
+from aegra_api.models.auth import User
+from aegra_api.models.event_streaming import EventStreamRequest
+from aegra_api.models.runs import RunCreate
+from aegra_api.services.broker import broker_manager
+from aegra_api.services.event_streaming import capabilities as caps
+from aegra_api.services.event_streaming import commands as cmd_module
+from aegra_api.services.event_streaming.session import ThreadEventSession
+
+_USER = "test-user"
+
+
+class _Session:
+    """Test session: scalar() returns the thread's owner id, execute() lists runs.
+
+    ``owner`` is the existing thread's user_id, or None when the thread does
+    not exist yet (the run.start-creates-it path the SDK relies on). The run
+    lister selects (run_id, status) rows; status stays "running" so tests
+    exercise the live-tail path.
+    """
+
+    def __init__(self, *, owner: str | None, run_ids: list[str] | None = None) -> None:
+        self._owner = owner
+        self._run_ids = run_ids or []
+
+    async def __aenter__(self) -> _Session:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        return None
+
+    async def scalar(self, _stmt: Any) -> Any:
+        return self._owner
+
+    async def execute(self, _stmt: Any) -> Any:
+        rows = [(run_id, "running", "test_graph") for run_id in self._run_ids]
+
+        class _Result:
+            def all(self) -> list[tuple[str, str, str]]:
+                return rows
+
+        return _Result()
+
+
+def _make_app(
+    monkeypatch: pytest.MonkeyPatch, *, owner: str | None = _USER, run_ids: list[str] | None = None
+) -> FastAPI:
+    app = FastAPI()
+    user = User(identity=_USER)
+    app.dependency_overrides[require_auth] = lambda: user
+    app.dependency_overrides[get_current_user] = lambda: user
+    # Routes open short-lived sessions via _get_session_maker(); patch it (per
+    # test, auto-restored) to return a maker yielding the in-memory test session.
+    monkeypatch.setattr(es_module, "_get_session_maker", lambda: lambda: _Session(owner=owner, run_ids=run_ids))
+    app.include_router(es_module.router)
+    return app
+
+
+@pytest.fixture(autouse=True)
+def _v2_enabled(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Turn the flag on and clear the capability cache for each test."""
+    monkeypatch.setattr(caps.settings.event_streaming, "FF_V2_EVENT_STREAMING", True)
+    caps._probe_runtime_symbols.cache_clear()
+    yield
+    caps._probe_runtime_symbols.cache_clear()
+
+
+class TestCommandRoute:
+    def test_run_start_returns_success_envelope(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_requests: list[RunCreate] = []
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            captured_requests.append(_args[2])
+            return "run-1", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 1,
+                "method": "run.start",
+                "params": {
+                    "assistant_id": "agent",
+                    "input": {"messages": []},
+                    "context": {"tenant_id": "acme"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "type": "success",
+            "id": 1,
+            "result": {"run_id": "run-1"},
+            "meta": {"applied_through_seq": 0},
+        }
+        assert captured_requests[0].context == {"tenant_id": "acme"}
+
+    def test_run_start_forks_from_configurable_checkpoint_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_requests: list[RunCreate] = []
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            captured_requests.append(_args[2])
+            return "run-1", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(monkeypatch))
+        checkpoint_id = "1ef4f797-8335-6428-8001-8a1503f9b875"
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 1,
+                "method": "run.start",
+                "params": {"assistant_id": "agent", "config": {"configurable": {"checkpoint_id": checkpoint_id}}},
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "success"
+        assert captured_requests[0].checkpoint == {"checkpoint_id": checkpoint_id}
+        assert captured_requests[0].input is None
+
+    def test_run_start_rejects_malformed_checkpoint_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        prepare = AsyncMock()
+        monkeypatch.setattr(cmd_module, "_prepare_run", prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 1,
+                "method": "run.start",
+                "params": {"assistant_id": "agent", "config": {"configurable": {"checkpoint_id": "not-a-uuid"}}},
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["error"] == "invalid_argument"
+        prepare.assert_not_called()
+
+    def test_input_respond_forwards_update_goto_and_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured_requests: list[RunCreate] = []
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            captured_requests.append(_args[2])
+            return "run-2", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 2,
+                "method": "input.respond",
+                "params": {
+                    "assistant_id": "agent",
+                    "interrupt_id": "a" * 32,
+                    "namespace": [],
+                    "response": {"approved": True},
+                    "update": {"reviewed_by": "alice"},
+                    "goto": "finalize",
+                    "context": {"reasoning_effort": "high"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "success"
+        request = captured_requests[0]
+        assert request.command == {
+            "resume": {"a" * 32: {"approved": True}},
+            "update": {"reviewed_by": "alice"},
+            "goto": "finalize",
+        }
+        assert request.context == {"reasoning_effort": "high"}
+
+    def test_input_respond_rejects_non_object_update(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        prepare = AsyncMock()
+        monkeypatch.setattr(cmd_module, "_prepare_run", prepare)
+        client = TestClient(_make_app(monkeypatch))
+
+        resp = client.post(
+            "/threads/t1/commands",
+            json={
+                "id": 3,
+                "method": "input.respond",
+                "params": {"assistant_id": "agent", "response": 1, "update": ["not", "an", "object"]},
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "error"
+        assert resp.json()["error"] == "invalid_argument"
+        prepare.assert_not_called()
+
+    def test_unknown_command_returns_error_envelope_on_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Protocol errors ride HTTP 200 so envelope-parsing clients see the code."""
+        client = TestClient(_make_app(monkeypatch))
+        resp = client.post("/threads/t1/commands", json={"id": 1, "method": "agent.getTree", "params": {}})
+        assert resp.status_code == 200
+        assert resp.json()["error"] == "unknown_command"
+
+    def test_cross_tenant_thread_is_404(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = TestClient(_make_app(monkeypatch, owner="other-user"))
+        resp = client.post("/threads/t1/commands", json={"id": 1, "method": "run.start", "params": {}})
+        assert resp.status_code == 404
+
+    def test_new_thread_is_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """run.start against a not-yet-created thread is allowed (the SDK path)."""
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            return "run-1", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(monkeypatch, owner=None))  # thread does not exist yet
+        resp = client.post(
+            "/threads/new-thread/commands",
+            json={"id": 1, "method": "run.start", "params": {"assistant_id": "agent", "input": {"messages": []}}},
+        )
+        assert resp.status_code == 200
+
+    def test_disabled_flag_returns_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(caps.settings.event_streaming, "FF_V2_EVENT_STREAMING", False)
+        client = TestClient(_make_app(monkeypatch))
+        resp = client.post("/threads/t1/commands", json={"id": 1, "method": "run.start", "params": {}})
+        assert resp.status_code == 503
+        assert "FF_V2_EVENT_STREAMING" in resp.json()["detail"]
+
+
+class TestStreamRoute:
+    def test_missing_channels_is_422(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = TestClient(_make_app(monkeypatch))
+        resp = client.post("/threads/t1/stream/events", json={})
+        assert resp.status_code == 422
+
+    def test_unknown_channel_is_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = TestClient(_make_app(monkeypatch))
+        resp = client.post("/threads/t1/stream/events", json={"channels": ["bogus"]})
+        assert resp.status_code == 400
+
+    def test_cross_tenant_thread_is_404(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = TestClient(_make_app(monkeypatch, owner="other-user"))
+        resp = client.post("/threads/t1/stream/events", json={"channels": ["messages"]})
+        assert resp.status_code == 404
+
+    def test_stream_emits_v2_frames(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A run on the thread streams content-block frames over SSE."""
+        run_id = f"run-{uuid.uuid4().hex[:8]}"
+
+        def _msg(event_kind: str, **extra: Any) -> tuple[str, dict[str, Any]]:
+            data = {"event": event_kind, **extra}
+            return ("messages", {"type": "event", "method": "messages", "params": {"namespace": [], "data": data}})
+
+        async def seed() -> None:
+            broker = broker_manager.get_or_create_broker(run_id)
+            await broker.put(f"{run_id}_event_1", _msg("message-start", role="ai", id="m1"))
+            await broker.put(
+                f"{run_id}_event_2", _msg("content-block-delta", index=0, delta={"type": "text-delta", "text": "hi"})
+            )
+            await broker.put(f"{run_id}_event_3", _msg("message-finish"))
+            await broker.put(f"{run_id}_event_4", ("end", {"status": "success"}))
+
+        asyncio.run(seed())
+        monkeypatch.setattr(
+            es_module,
+            "ThreadEventSession",
+            partial(ThreadEventSession, idle_grace_seconds=0.01),
+        )
+        client = TestClient(_make_app(monkeypatch, run_ids=[run_id]))
+
+        with client.stream("POST", "/threads/t1/stream/events", json={"channels": ["messages", "lifecycle"]}) as resp:
+            assert resp.status_code == 200
+            body = "".join(resp.iter_text())
+
+        assert "event: messages" in body
+        assert "message-start" in body
+        assert "content-block-delta" in body
+        assert "event: lifecycle" in body
+        assert "completed" in body
+
+    async def test_stream_emits_dual_sdk_interrupt_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run_id = f"run-{uuid.uuid4().hex[:8]}"
+        interrupt_value = {"question": "Approve?"}
+
+        async def seed() -> None:
+            broker = broker_manager.get_or_create_broker(run_id)
+            event = {
+                "type": "event",
+                "method": "updates",
+                "params": {
+                    "namespace": [],
+                    "data": {"__interrupt__": [{"id": "int-1", "value": interrupt_value}]},
+                },
+            }
+            await broker.put(f"{run_id}_event_1", ("updates", event))
+            await broker.put(f"{run_id}_event_2", ("end", {"status": "interrupted"}))
+
+        await seed()
+        monkeypatch.setattr(
+            es_module,
+            "ThreadEventSession",
+            partial(ThreadEventSession, idle_grace_seconds=0.01),
+        )
+        monkeypatch.setattr(
+            es_module,
+            "_get_session_maker",
+            lambda: lambda: _Session(owner=_USER, run_ids=[run_id]),
+        )
+        response = await es_module.stream_thread_events(
+            "t1",
+            EventStreamRequest(channels=["input"], namespaces=None, depth=None, since=None),
+            User(identity=_USER),
+        )
+        chunks: list[str] = []
+        async for chunk in response.body_iterator:
+            assert isinstance(chunk, (bytes, str))
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        body = "".join(chunks)
+
+        input_frame = next(frame for frame in body.split("\n\n") if frame.startswith("event: input.requested"))
+        data_line = next(line for line in input_frame.splitlines() if line.startswith("data: "))
+        envelope = json.loads(data_line.removeprefix("data: "))
+        assert envelope["params"]["data"] == {
+            "interrupt_id": "int-1",
+            "value": interrupt_value,
+            "payload": interrupt_value,
+        }
+
+    async def test_lister_session_close_survives_sse_cancel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Disconnect during a lister poll must still run session ``__aexit__``."""
+        poll_started = threading.Event()
+        closed = threading.Event()
+        # Set and awaited on the server loop, so it fires before cancel_on_finish cancels the stream.
+        disconnected = asyncio.Event()
+        state = {"aexit_cancelled": False, "aexits": 0}
+
+        class _SlowSession(_Session):
+            async def execute(self, _stmt: Any) -> Any:
+                poll_started.set()
+                await disconnected.wait()
+                return await super().execute(_stmt)
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    state["aexit_cancelled"] = True
+                    raise
+                state["aexits"] += 1
+                # Ownership check closes first; the second close is the in-stream poll.
+                if state["aexits"] >= 2:
+                    closed.set()
+
+        monkeypatch.setattr(
+            es_module,
+            "ThreadEventSession",
+            partial(ThreadEventSession, idle_grace_seconds=5),
+        )
+        make_sse_response = es_module.make_sse_response
+
+        async def on_disconnect(_message: MutableMapping[str, Any]) -> None:
+            disconnected.set()
+
+        def make_sse_response_with_close_handler(
+            body: AsyncIterator[bytes], *, headers: Mapping[str, str]
+        ) -> EventSourceResponse:
+            return make_sse_response(body, headers=headers, close_handler=on_disconnect)
+
+        monkeypatch.setattr(es_module, "make_sse_response", make_sse_response_with_close_handler)
+        app = _make_app(monkeypatch)
+        monkeypatch.setattr(es_module, "_get_session_maker", lambda: lambda: _SlowSession(owner=_USER))
+        # Separate loop: uvicorn.serve() cancels every task on its running loop. asyncio.run
+        # also cancels leftovers such as sse-starlette's shutdown watcher before closing it.
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error", lifespan="off"))
+        thread = threading.Thread(target=asyncio.run, args=(server.serve(),), daemon=True)
+        thread.start()
+        try:
+            for _ in range(50):
+                if server.started and server.servers:
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise RuntimeError("uvicorn did not bind a port")
+            port = server.servers[0].sockets[0].getsockname()[1]
+            async with (
+                httpx.AsyncClient(timeout=None) as client,
+                client.stream(
+                    "POST",
+                    f"http://127.0.0.1:{port}/threads/t1/stream/events",
+                    json={"channels": ["messages"]},
+                ) as resp,
+            ):
+                assert resp.status_code == 200
+                if not await asyncio.to_thread(poll_started.wait, 1.5):
+                    raise TimeoutError("lister poll did not start")
+                await resp.aclose()
+            if not await asyncio.to_thread(closed.wait, 1.5):
+                raise TimeoutError("lister session was not closed")
+        finally:
+            server.should_exit = True
+            thread.join(timeout=3)
+            # A hung shutdown fails the test: a generator stuck in shielded polls looks like this.
+            if thread.is_alive():
+                raise TimeoutError("uvicorn did not shut down")
+
+        assert not state["aexit_cancelled"]
