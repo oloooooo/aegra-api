@@ -1,6 +1,6 @@
 {
   "graphs": {
-    "supervisor": "./graphs/supervisor.py:graph",
-    "researcher": "./graphs/researcher.py:graph"
+    "supervisor": "./graphs/deepagents_nodes.py:graph",
+    "xlsx_process": "./graphs/xlsx_process.py:graph"
   }
 }
