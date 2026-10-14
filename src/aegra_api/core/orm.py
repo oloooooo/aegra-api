@@ -266,3 +266,5 @@ async def get_session() -> AsyncIterator[AsyncSession]:
     maker = get_session_maker()
     async with maker() as session:
         yield session
+
+from custom.models import MicroServiceSpace, UserTables, UserWorkspace
