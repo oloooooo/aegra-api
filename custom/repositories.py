@@ -1,8 +1,7 @@
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from custom.models import MicroServiceSpace, UserTables, UserWorkspace
-
+from custom.models import Space, UserSpace, UserTables
 
 
 class UserRepository:
@@ -34,35 +33,35 @@ class UserRepository:
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
-        return result.rowcount > 0 # pyright: ignore[reportAttributeAccessIssue]
+        return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
 
     async def delete(self, account: str) -> bool:
         """删除账号，返回是否命中行。"""
         stmt = delete(UserTables).where(UserTables.account == account)
         result = await self.session.execute(stmt)
         await self.session.commit()
-        return result.rowcount > 0 # pyright: ignore[reportAttributeAccessIssue]
+        return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
 
 
-class MicroServiceSpaceRepository:
-    """MicroServiceSpace 的增删改查，session 由调用方传入。"""
+class SpaceRepository:
+    """Space 的增删改查，session 由调用方传入。"""
 
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get(self, name: str) -> MicroServiceSpace | None:
-        return await self.session.get(MicroServiceSpace, name)
+    async def get(self, name: str) -> Space | None:
+        return await self.session.get(Space, name)
 
     async def exists(self, name: str) -> bool:
-        stmt = select(MicroServiceSpace.name).where(MicroServiceSpace.name == name)
+        stmt = select(Space.name).where(Space.name == name)
         return (await self.session.execute(stmt)).scalar() is not None
 
-    async def list_all(self) -> list[MicroServiceSpace]:
-        stmt = select(MicroServiceSpace).order_by(MicroServiceSpace.name)
+    async def list_all(self) -> list[Space]:
+        stmt = select(Space).order_by(Space.name)
         return list((await self.session.execute(stmt)).scalars())
 
-    async def create(self, name: str, path: str) -> MicroServiceSpace:
-        space = MicroServiceSpace(name=name, path=path)
+    async def create(self, name: str, path: str) -> Space:
+        space = Space(name=name, path=path)
         self.session.add(space)
         await self.session.commit()
         await self.session.refresh(space)
@@ -70,68 +69,65 @@ class MicroServiceSpaceRepository:
 
     async def update_path(self, name: str, path: str) -> bool:
         """更新工作目录路径，返回是否命中行。"""
-        stmt = (
-            update(MicroServiceSpace)
-            .where(MicroServiceSpace.name == name)
-            .values(path=path)
-        )
+        stmt = update(Space).where(Space.name == name).values(path=path)
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
 
     async def delete(self, name: str) -> bool:
         """删除空间，返回是否命中行。"""
-        stmt = delete(MicroServiceSpace).where(MicroServiceSpace.name == name)
+        stmt = delete(Space).where(Space.name == name)
         result = await self.session.execute(stmt)
         await self.session.commit()
-        return result.rowcount > 0 # pyright: ignore[reportAttributeAccessIssue]
+        return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
 
 
-class UserWorkspaceRepository:
-    """UserWorkspace（用户-空间关联）的增删改查，session 由调用方传入。"""
+class UserSpaceRepository:
+    """UserSpace（用户-微服务空间关联）的增删改查，session 由调用方传入。"""
 
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get(self, account: str, workspace_name: str) -> UserWorkspace | None:
-        return await self.session.get(UserWorkspace, (account, workspace_name))
+    async def get(self, account: str, space_name: str) -> UserSpace | None:
+        return await self.session.get(UserSpace, (account, space_name))
 
-    async def exists(self, account: str, workspace_name: str) -> bool:
-        stmt = select(UserWorkspace.account).where(
-            UserWorkspace.account == account,
-            UserWorkspace.workspace_name == workspace_name,
+    async def exists(self, account: str, space_name: str) -> bool:
+        stmt = select(UserSpace.account).where(
+            UserSpace.account == account,
+            UserSpace.space_name == space_name,
         )
         return (await self.session.execute(stmt)).scalar() is not None
 
     async def list_by_user(self, account: str) -> list[str]:
+        """该用户可访问的微服务空间名。"""
         stmt = (
-            select(UserWorkspace)
-            .where(UserWorkspace.account == account)
-            .order_by(UserWorkspace.workspace_name)
+            select(UserSpace.space_name)
+            .where(UserSpace.account == account)
+            .order_by(UserSpace.space_name)
         )
-        return list((await self.session.execute(stmt)).scalars().__dict__)
+        return list((await self.session.execute(stmt)).scalars().all())
 
-    async def list_by_workspace(self, workspace_name: str) -> list[UserWorkspace]:
+    async def list_by_space(self, space_name: str) -> list[UserSpace]:
         stmt = (
-            select(UserWorkspace)
-            .where(UserWorkspace.workspace_name == workspace_name)
-            .order_by(UserWorkspace.account)
+            select(UserSpace)
+            .where(UserSpace.space_name == space_name)
+            .order_by(UserSpace.account)
         )
         return list((await self.session.execute(stmt)).scalars())
 
-    async def create(self, account: str, workspace_name: str) -> UserWorkspace:
-        link = UserWorkspace(account=account, workspace_name=workspace_name)
+    async def create(self, account: str, space_name: str) -> UserSpace:
+        link = UserSpace(account=account, space_name=space_name)
         self.session.add(link)
         await self.session.commit()
         await self.session.refresh(link)
         return link
 
-    async def delete(self, account: str, workspace_name: str) -> bool:
+    async def delete(self, account: str, space_name: str) -> bool:
         """解除关联，返回是否命中行。"""
-        stmt = delete(UserWorkspace).where(
-            UserWorkspace.account == account,
-            UserWorkspace.workspace_name == workspace_name,
+        stmt = delete(UserSpace).where(
+            UserSpace.account == account,
+            UserSpace.space_name == space_name,
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
-        return result.rowcount > 0 # pyright: ignore[reportAttributeAccessIssue]
+        return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]

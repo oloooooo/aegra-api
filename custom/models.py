@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from datetime import datetime
-from typing import Any
-
 from sqlalchemy import (
     Boolean,
     ForeignKey,
     String,
     false,
 )
-from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from aegra_api.core.orm import Base
 
 
-# Base = declarative_base()
 class UserTables(Base):
     """账号 / 密码哈希"""
 
@@ -29,48 +24,54 @@ class UserTables(Base):
     is_super: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=false(), comment="超级用户，只能直接改库"
     )
-    # 只读视图：带权限的关联走 UserWorkspace，写入请直接操作它
-    workspaces: Mapped[list["MicroServiceSpace"]] = relationship(
-        secondary="user_microservice", viewonly=True
+    # 只读视图：带权限的关联走 UserSpace，写入请直接操作它
+    spaces: Mapped[list["Space"]] = relationship(
+        secondary="user_space", viewonly=True
     )
 
     def __repr__(self) -> str:
         return f"<User {self.account!r}>"
 
 
-class MicroServiceSpace(Base):
-    """微服务空间：一个独立的微服务空间，name 唯一，path 指向磁盘或者记忆系统目录。"""
+class Space(Base):
+    """微服务空间：知识空间（KNOWLEDGE_SPACE_DIR）下的一个文件夹。"""
 
-    __tablename__ = "micro_service_space"
+    __tablename__ = "space"
 
     name: Mapped[str] = mapped_column(
-        String(100), index=True, unique=True, comment="业务空间名称", primary_key=True
+        String(100),
+        index=True,
+        unique=True,
+        comment="微服务空间名称，即知识空间下的文件夹名",
+        primary_key=True,
     )
-    path: Mapped[str] = mapped_column(String(512), comment="工作目录路径")
-    # 只读视图，写入走 UserWorkspace
+    path: Mapped[str] = mapped_column(
+        String(512), comment="工作目录路径，相对项目根（服务启动时的 CWD）"
+    )
+    # 只读视图，写入走 UserSpace
     users: Mapped[list["UserTables"]] = relationship(
-        secondary="user_microservice", viewonly=True
+        secondary="user_space", viewonly=True
     )
 
     def __repr__(self) -> str:
-        return f"<Workspace {self.name!r}>"
+        return f"<Space {self.name!r}>"
 
 
-class UserWorkspace(Base):
+class UserSpace(Base):
     """用户 <-> 微服务空间 多对多关联，写入直接操作本表。"""
 
-    __tablename__ = "user_microservice"
+    __tablename__ = "user_space"
 
     account: Mapped[str] = mapped_column(
         String(50),
         ForeignKey("user_tables.account", ondelete="CASCADE"),
         primary_key=True,
     )
-    workspace_name: Mapped[str] = mapped_column(
+    space_name: Mapped[str] = mapped_column(
         String(100),
-        ForeignKey("micro_service_space.name", ondelete="CASCADE"),
+        ForeignKey("space.name", ondelete="CASCADE"),
         primary_key=True,
     )
 
     def __repr__(self) -> str:
-        return f"<UserWorkspace {self.account!r} -> {self.workspace_name!r}>"
+        return f"<UserSpace {self.account!r} -> {self.space_name!r}>"

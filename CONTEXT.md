@@ -69,3 +69,29 @@ _Avoid_: 认为任意字符串都能当 assistant_id 用
 **File logging（文件日志）**:
 把同一份结构化日志同时写到 stdout 与本地文件的出口；文件恒为 JSON，带大小轮转与按天清理。
 _Avoid_: 把文件日志当成独立于 stdout 的另一套日志
+
+## 用户与空间词表
+
+**Account（账号）**:
+一个登录身份，对应 `user_tables.account`，也是 JWT 的 `sub`。
+_Avoid_: user_id（aegra 的 `user_id` 是运行时身份，两者在接上 auth handler 前并不相等）、用户 ID
+
+**Microservice（微服务）**:
+用户拥有的一项业务。不是存储实体：它与微服务空间一一对应，空间名即微服务名。
+_Avoid_: 把它当成数据库里的一张表
+
+**Knowledge space（知识空间）**:
+存放全部业务知识的根目录。不是存储实体，也不可被用户寻址：它只是微服务空间的容器。
+_Avoid_: 知识库、KB、把某个微服务空间当成知识空间
+
+**Space（微服务空间）**:
+知识空间下的一个文件夹，对应 `space` 表一行，也是权限的最小单位：一个 Space 承载且仅承载一个微服务。
+_Avoid_: workspace、业务空间、微服务空间（口语可用，代码与库里一律 Space）
+
+**UserSpace（用户-空间关联）**:
+`user_space` 表：哪个账号能看哪个 Space。写入直接操作本表，不用 `UserTables.spaces`（只读视图）。
+_Avoid_: 把 `user_microservice` 当表名（已改名）
+
+**Space path（空间路径）**:
+Space 的 `path` 列，相对项目根的路径（服务启动时的 CWD）。不存绝对路径。
+_Avoid_: 把它当成绝对路径或 URL

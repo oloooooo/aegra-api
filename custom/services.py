@@ -7,7 +7,7 @@ import os
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from custom.models import UserWorkspace
+from custom.models import UserSpace
 
 
 # access token 有效期（秒），改 .env 可覆盖
@@ -55,11 +55,11 @@ def _decode_access_token(token: str) -> str:
 
 async def count_user_spaces(session: AsyncSession, account: str) -> int:
     """用户加入了多少个微服务空间。"""
-    stmt = select(func.count()).where(UserWorkspace.account == account)
+    stmt = select(func.count()).where(UserSpace.account == account)
     return (await session.execute(stmt)).scalar_one()
 
 
 async def count_space_users(session: AsyncSession, name: str) -> int:
     """一个微服务空间有多少用户。"""
-    stmt = select(func.count()).where(UserWorkspace.workspace_name == name)
+    stmt = select(func.count()).where(UserSpace.space_name == name)
     return (await session.execute(stmt)).scalar_one()

@@ -1,10 +1,9 @@
-from numpy import str_
 from pydantic import BaseModel
 
-from custom.models import UserWorkspace
 
 class MessagesBaseModel(BaseModel):
-    message:str|None = None
+    message: str | None = None
+
 
 class RegisterRequest(BaseModel):
     account: str
@@ -30,12 +29,15 @@ class ListUserSpaceResponse(MessagesBaseModel):
     space: list[str]
     message: str | None = None
 
+
 class CreateSpaceInput(BaseModel):
-    space_name: str 
-    path: str 
+    space_name: str
+    path: str
+
 
 class CreateSpaceResponse(MessagesBaseModel):
     space_name: str | None
 
-class CreateUserWorkspaceResponse(CreateSpaceResponse):
-    user_account:str
+
+class CreateUserSpaceResponse(CreateSpaceResponse):
+    user_account: str
