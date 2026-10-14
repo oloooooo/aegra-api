@@ -6,7 +6,7 @@ from custom.models import UserWorkspace
 class MessagesBaseModel(BaseModel):
     message:str|None = None
 
-class RegisterRequest(MessagesBaseModel):
+class RegisterRequest(BaseModel):
     account: str
     password: str
 
@@ -15,7 +15,7 @@ class RegisterResponse(MessagesBaseModel):
     account: str
 
 
-class LoginRequest(MessagesBaseModel):
+class LoginRequest(BaseModel):
     account: str
     password: str
 
@@ -30,7 +30,7 @@ class ListUserSpaceResponse(MessagesBaseModel):
     space: list[str]
     message: str | None = None
 
-class CreateSpaceInput(MessagesBaseModel):
+class CreateSpaceInput(BaseModel):
     space_name: str 
     path: str 
 

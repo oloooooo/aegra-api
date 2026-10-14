@@ -74,6 +74,19 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 - **`multitask_strategy` 被静默忽略**：`RunCreate` 接收该字段并存进 `RunJob.behavior`，但执行层没有任何消费。
 - **三处 wire 形状缺口**：`GET /threads/{tid}` 无 `values`（只有线程元数据）；`Run` 响应只有 `error_message`、无 `error`；`Run` 无 `interrupted_by`。
 
+### 2.4 子 agent 主动汇报（completion notification）现状（已核实）
+
+> 背景：`custom/middlewares/completion_notifier.py` 想在子 agent 跑完时往 supervisor 的 thread 推一条 run，让 supervisor 不必等被问就汇报。以下为核实过的事实，**尚未接线**。
+
+- **stock 派活不传父上下文**：`deepagents/middleware/async_subagents.py` 的四处 `runs.create`（264、304、499、538 行）只发 `thread_id` / `assistant_id` / `input`（update 路径多一个 `multitask_strategy="interrupt"`），全包 grep `parent_thread_id` / `parent_assistant_id` 零命中。父 ID 必须由 supervisor 侧显式带过去。
+- **aegra 照单接收 `config.configurable`**：`RunCreate.config`（`models/runs.py:46`）→ `run_preparation.py:328` 合并进 `assistant.config` → `create_run_config()`（`langgraph_service.py:717`）交给图；只强制覆盖 `thread_id` / `run_id`（同文件 721-722 行），其余键透传。所以 `parent_thread_id` 能原样到达子 agent 的**图工厂**。
+- **aegra 不往 `configurable` 注入 `assistant_id`**：只注入 `thread_id`、`run_id`、`user_id`、`user_display_name`、`langgraph_auth_user`（`langgraph_service.py:721-722`、684）。父的 assistant_id 只能静态取（用 graph key `"supervisor"`，aegra 会 uuid5 解析，`utils/assistants.py:23`）。
+- **工具能拿到父 thread_id**：`ToolRuntime.config` 就是该 run 的 `RunnableConfig`（`langchain/agents/middleware/types.py` 构造处），自建派活工具可直接读 `runtime.config["configurable"]["thread_id"]`，无需外部传参。
+- **工厂图这条路通**：1 参数 `config: RunnableConfig` 工厂（`graph_factory.py:209`）与 async contextmanager 返回值（`generate_graph`，`graph_factory.py:394`）aegra 都支持，按 run 重建，不缓存工厂图（`_base_graph_cache` 只缓存静态图，`langgraph_service.py:300`）。已用探针验证 `@asynccontextmanager async def graph(config: RunnableConfig)` 被 `classify_factory` 判为 factory。
+- **传输**：`get_client()` 不传 url 走进程内 ASGI（需服务端注册，aegra 未见注册）；传 url 走真 HTTP。`langgraph_sdk` 0.4.6 的 `runs.create` 接受 `config` 与 `context` 关键字（`_async/runs.py:364`）。
+- **无并发保护**（同 §9 #4）：通知 run 会与父 run 并发写同一 thread，aegra 不拦。`POST /threads/{tid}` 的 `GET /threads/{tid}` 响应含 `status`（`idle` / `busy` / `interrupted` / `error`，`models/threads.py:98`），可作为发通知前的忙闲判据。
+- **两份图文件**：`aegra.json` 实际加载 `./graphs/xlsx_process.py:graph`；`graphs/xlsx_process copy.py` 与它逐字节相同（`diff` 无输出），是备份，改它不生效。
+
 ## 3. 端点契约
 
 > 只列与 deepagents 契约相关的行为；未列出的字段与端点保持现状。
