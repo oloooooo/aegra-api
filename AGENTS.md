@@ -1,19 +1,4 @@
-# AGENTS.md
-
-This file provides context for AI coding agents working with this repository.
-
-**📖 For complete documentation, see [CLAUDE.md](./CLAUDE.md)**
-
-The `CLAUDE.md` file contains all the detailed information about:
-- Project overview and architecture
-- Quick start commands
-- Testing guidelines
-- Code quality standards
-- Database migrations
-- Development patterns
-- API endpoints
-- Common tasks
-- Environment variables
-- PR guidelines
-
-This file exists to provide a quick reference point for AI agents. All detailed information is maintained in `CLAUDE.md` to avoid duplication.
+# agent运行要求
+1. 在进行长时任务时，先使用plan规划任务，并列出任务，完成某一任务的时候要生成简报，告知用户
+2. 环境需要安装新的依赖的时候，使用ask-user-question插件询问用户
+3. 遇到较新的，没遇见的问题或者技术的时候，使用联网搜索功能获取最新信息
