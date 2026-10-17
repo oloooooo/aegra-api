@@ -48,6 +48,27 @@ if config.config_file_name is not None and threading.current_thread() is threadi
 # for 'autogenerate' support
 target_metadata = Base.metadata
 
+# langgraph-checkpoint-postgres 在应用启动时 .setup() 自建的 checkpointer/store 表，
+# 没有 ORM 模型，autogenerate 会误判为"应删除"并渲染 drop_table。排除掉，
+# 否则每次 autogenerate 都要手工清理，且误执行会丢对话历史。
+_NON_ORM_TABLES = frozenset(
+    {
+        "checkpoints",
+        "checkpoint_blobs",
+        "checkpoint_writes",
+        "checkpoint_migrations",
+        "store",
+        "store_migrations",
+    }
+)
+
+
+def include_object(obj, name, type_, reflected, compare_to):
+    """Tell autogenerate to ignore tables it does not own."""
+    if type_ == "table" and name in _NON_ORM_TABLES:
+        return False
+    return True
+
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")
@@ -69,6 +90,7 @@ def run_migrations_offline() -> None:
     context.configure(
         url=_get_database_url(),
         target_metadata=target_metadata,
+        include_object=include_object,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -79,7 +101,7 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: Connection) -> None:
     """Run migrations with the given connection."""
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(connection=connection, target_metadata=target_metadata, include_object=include_object)
 
     with context.begin_transaction():
         context.run_migrations()

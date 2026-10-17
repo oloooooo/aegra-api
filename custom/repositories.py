@@ -1,3 +1,6 @@
+from typing import Optional
+
+from openai import organization
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,34 +13,47 @@ class UserRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get(self, account: str) -> UserTables | None:
-        return await self.session.get(UserTables, account)
+    async def get(self, identity: str) -> UserTables | None:
+        return await self.session.get(UserTables, identity)
 
-    async def exists(self, account: str) -> bool:
-        stmt = select(UserTables.account).where(UserTables.account == account)
+    async def exists(self, identity: str) -> bool:
+        stmt = select(UserTables.identity).where(UserTables.identity == identity)
         return (await self.session.execute(stmt)).scalar() is not None
 
-    async def create(self, account: str, hashed_password: str) -> UserTables:
-        user = UserTables(account=account, hashed_password=hashed_password)
+    async def create(
+        self,
+        identity: str,
+        display_name: str,
+        hashed_password: str,
+        org_id: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> UserTables:
+        user = UserTables(
+            identity=identity,
+            display_name=display_name,
+            hashed_password=hashed_password,
+            org_id=org_id,
+            email=email
+        )
         self.session.add(user)
         await self.session.commit()
         await self.session.refresh(user)
         return user
 
-    async def update_password(self, account: str, hashed_password: str) -> bool:
+    async def update_password(self, identity: str, hashed_password: str) -> bool:
         """更新密码哈希，返回是否命中行。"""
         stmt = (
             update(UserTables)
-            .where(UserTables.account == account)
+            .where(UserTables.identity == identity)
             .values(hashed_password=hashed_password)
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
 
-    async def delete(self, account: str) -> bool:
+    async def delete(self, identity: str) -> bool:
         """删除账号，返回是否命中行。"""
-        stmt = delete(UserTables).where(UserTables.account == account)
+        stmt = delete(UserTables).where(UserTables.identity == identity)
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
@@ -88,21 +104,21 @@ class UserSpaceRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get(self, account: str, space_name: str) -> UserSpace | None:
-        return await self.session.get(UserSpace, (account, space_name))
+    async def get(self, identity: str, space_name: str) -> UserSpace | None:
+        return await self.session.get(UserSpace, (identity, space_name))
 
-    async def exists(self, account: str, space_name: str) -> bool:
-        stmt = select(UserSpace.account).where(
-            UserSpace.account == account,
+    async def exists(self, identity: str, space_name: str) -> bool:
+        stmt = select(UserSpace.identity).where(
+            UserSpace.identity == identity,
             UserSpace.space_name == space_name,
         )
         return (await self.session.execute(stmt)).scalar() is not None
 
-    async def list_by_user(self, account: str) -> list[str]:
+    async def list_by_user(self, identity: str) -> list[str]:
         """该用户可访问的微服务空间名。"""
         stmt = (
             select(UserSpace.space_name)
-            .where(UserSpace.account == account)
+            .where(UserSpace.identity == identity)
             .order_by(UserSpace.space_name)
         )
         return list((await self.session.execute(stmt)).scalars().all())
@@ -111,21 +127,21 @@ class UserSpaceRepository:
         stmt = (
             select(UserSpace)
             .where(UserSpace.space_name == space_name)
-            .order_by(UserSpace.account)
+            .order_by(UserSpace.identity)
         )
         return list((await self.session.execute(stmt)).scalars())
 
-    async def create(self, account: str, space_name: str) -> UserSpace:
-        link = UserSpace(account=account, space_name=space_name)
+    async def create(self, identity: str, space_name: str) -> UserSpace:
+        link = UserSpace(identity=identity, space_name=space_name)
         self.session.add(link)
         await self.session.commit()
         await self.session.refresh(link)
         return link
 
-    async def delete(self, account: str, space_name: str) -> bool:
+    async def delete(self, identity: str, space_name: str) -> bool:
         """解除关联，返回是否命中行。"""
         stmt = delete(UserSpace).where(
-            UserSpace.account == account,
+            UserSpace.identity == identity,
             UserSpace.space_name == space_name,
         )
         result = await self.session.execute(stmt)

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Optional
 
 from sqlalchemy import (
     Boolean,
@@ -16,8 +17,19 @@ class UserTables(Base):
 
     __tablename__ = "user_tables"
 
-    account: Mapped[str] = mapped_column(
+    identity: Mapped[str] = mapped_column(
         String(50), index=True, unique=True, comment="登录账号", primary_key=True
+    )
+    display_name: Mapped[str] = mapped_column(
+        String(10),
+        index=True,
+        comment="用户名",
+    )
+    org_id: Mapped[Optional[str]] = mapped_column(
+        String(50), comment="组织名", default=None
+    )
+    email: Mapped[Optional[str]] = mapped_column(
+        String(80), comment="邮箱名", default=None
     )
 
     hashed_password: Mapped[str] = mapped_column(String(100), comment="bcrypt 哈希")
@@ -25,12 +37,10 @@ class UserTables(Base):
         Boolean, default=False, server_default=false(), comment="超级用户，只能直接改库"
     )
     # 只读视图：带权限的关联走 UserSpace，写入请直接操作它
-    spaces: Mapped[list["Space"]] = relationship(
-        secondary="user_space", viewonly=True
-    )
+    spaces: Mapped[list["Space"]] = relationship(secondary="user_space", viewonly=True)
 
     def __repr__(self) -> str:
-        return f"<User {self.account!r}>"
+        return f"<User {self.identity!r}>"
 
 
 class Space(Base):
@@ -62,9 +72,9 @@ class UserSpace(Base):
 
     __tablename__ = "user_space"
 
-    account: Mapped[str] = mapped_column(
+    identity: Mapped[str] = mapped_column(
         String(50),
-        ForeignKey("user_tables.account", ondelete="CASCADE"),
+        ForeignKey("user_tables.identity", ondelete="CASCADE"),
         primary_key=True,
     )
     space_name: Mapped[str] = mapped_column(
@@ -74,4 +84,4 @@ class UserSpace(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<UserSpace {self.account!r} -> {self.space_name!r}>"
+        return f"<UserSpace {self.identity!r} -> {self.space_name!r}>"

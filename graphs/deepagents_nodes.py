@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.middleware import FilesystemPermission
 from deepagents.backends import FilesystemBackend
@@ -5,6 +7,8 @@ import dotenv
 import os
 
 from pathlib import Path
+
+import structlog
 
 from graphs.llms import model
 from pydantic import BaseModel
@@ -16,14 +20,55 @@ class deepAgentContext(BaseModel):
     user_kind: str | None = None
 
 
+from langchain.tools import InjectedToolArg, tool, ToolRuntime
+from langgraph.graph.state import RunnableConfig
+from graphs.xlsx_tools import XLSX_TOOLS
+
+logger = structlog.getLogger(__name__)
+
+import src.aegra_api.models
+
+
+@tool(
+    description="该工具可以返回，用户id，用户名，用户权限，在无法获取相关内容的时候，返回错误信息"
+)
+async def get_user_data(
+    config: Annotated[RunnableConfig, InjectedToolArg], runtime: ToolRuntime
+) -> dict:
+    try:
+        """Tool that accesses the authenticated user."""
+        auth_user = config[
+            "configurable"
+        ][  # pyright: ignore[reportTypedDictNotRequiredAccess]
+            "langgraph_auth_user"
+        ]
+        if not isinstance(auth_user, dict):
+            auth_user = auth_user.to_dict()
+        assert auth_user is not None, "获取auth_user失败"
+        logger.info(type(auth_user))
+        user_id = auth_user["identity"]
+        permissions = auth_user.get("permissions", [])
+        user_name = auth_user.get("display_name", "")
+        user_spaces = auth_user.get("user_spaces", [])
+        return {
+            "user_id": user_id,
+            "permissions": permissions,
+            "user_name": user_name,
+            "user_spaces": user_spaces,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # 和子 agent（xlsx_process）同一份 okf 根，虚拟路径才对得上
 okf_dir = str(Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf"))
 graph = create_deep_agent(
     model=model,
     backend=FilesystemBackend(root_dir=okf_dir),
     context_schema=deepAgentContext,
+    # tools=[get_user_data],
     subagents=[
-        AsyncSubAgent(
+        AsyncSubAgent(  # pyright: ignore[reportCallIssue]
             name="xlsx_process",
             description=(
                 "查 xlsx 表格的专用 agent，跑在后台。任何关于表格内容的问题（有哪些 sheet/列、"
@@ -31,12 +76,17 @@ graph = create_deep_agent(
                 "这样的虚拟路径。用 start_async_task 派活，需要结果时用 check_async_task。"
             ),
             graph_id="xlsx_process",
+            tools=[XLSX_TOOLS],
             url="http://127.0.0.1:2026",
         )
     ],
     permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
 )
 if __name__ == "__main__":
-    message = {"messages":[{"role":"user","content":"hello,表格消融实验1.xlsx中的CER，最低的有哪些"}]}
+    message = {
+        "messages": [
+            {"role": "user", "content": "hello,表格消融实验1.xlsx中的CER，最低的有哪些"}
+        ]
+    }
     response = graph.invoke(message)  # pyright: ignore[reportArgumentType]
     print(response["messages"][-1]["content"])
