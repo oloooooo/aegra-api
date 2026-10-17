@@ -1,158 +1,177 @@
 """Completion notifier middleware for async subagents.
 
-When a subagent finishes (success or error), this middleware sends a message
-to the supervisor's thread so it wakes up and can relay the result to the user
-without waiting to be asked.
+子 agent 跑完（成功或出错）时，主动往父线程（主管）推一条消息，让它醒来把结果
+转达给用户，而不必等用户再问 `check_async_task`。
 
-**This is a bring-your-own component.** The async subagent protocol does not
-include a built-in notification mechanism -- by default the supervisor only
-learns about completion when it (or the user) calls `check_async_subagent`.
-This middleware closes that gap by pushing a notification from the subagent
-back to the supervisor.
+**这是 bring-your-own 组件**：async subagent 协议本身没有完成通知机制，默认只有
+主管主动 `check_async_subagent` 才拿得到结果。本中间件补上这个缺口。
 
-## How it works
+## 回写为什么不能用服务 token（ADR-0005 选项1）
 
-1. The supervisor passes its own `thread_id` and `assistant_id` to the subagent
-   at launch time (via `configurable` or input metadata -- this wiring is
-   deployment-specific).
-2. This middleware is added to the subagent's middleware stack.
-3. When the subagent's run completes, the after-agent hook fires and sends a
-   new run to the supervisor's thread with a summary of the result.
-4. When the subagent errors, the wrap-model-call hook catches the exception,
-   sends an error notification, and re-raises.
+aegra 的 `runs.create` 只允许线程属主写（runs.py 查 `thread.user_id != user.identity`
+→ 404）。服务身份拿不到父线程，所以回写必须以**父用户自己的身份**写。
 
-## Integration
+做法：拦截层（graphs/async_task_guard.py）把父上下文经子 run 的 ``configurable``
+转发进来——``parent_thread_id`` / ``parent_assistant_id`` / ``parent_user_identity``
+（取服务端注入的 ``langgraph_auth_user``，客户端伪造不了）/ ``notify_url``。本中间件在
+hook 内用 ``get_config()`` 读到它们后：
 
-The supervisor needs to pass its thread/assistant IDs to the subagent. How you
-do this depends on your deployment:
+1. 用 env 的 ``JWT_SECRET`` **现铸一枚短时父身份 token**（不写进 config/DB，用完即弃）；
+2. 用显式 ``get_client(url=notify_url, headers=Bearer <父token>)`` 回写父线程。
 
-- **Config-based** (LangSmith Agent Builder pattern): pass via
-  `config.configurable.parent_thread_id` and `config.configurable.parent_assistant_id`
-- **Input-based**: include in the launch message input as metadata
-- **Store-based**: write to a shared LangGraph store namespace
+于是唤醒 run 以父用户身份跑（spaces 正常），同用户写自己的线程，归属校验通过。
 
-This example uses the config-based approach. Adapt `_get_parent_ids()` to match
-your deployment's conventions.
+**不转发父上下文 = 不回写**（本地直跑 demo、或没走拦截层的部署），只是安静跳过。
+
+## 兼容官方 factory 模式
+
+官方例子（graphs/official_researcher.py）用 graph factory 把父 id 从 config 传进
+构造函数。本组件同时支持两条路：优先从 ``get_config()`` 读（拦截层注入的那套），
+读不到再退回构造函数传入的值。但要铸 token 还缺 ``parent_user_identity`` 与
+``notify_url``，两者只能来自 config 或显式构造参数——缺任何一个都跳过并告警，
+绝不静默失败（这正是旧版「试了不太行」的病灶之一）。
 """
 
 from __future__ import annotations
 
-import logging
+import os
+import time
 from typing import Any
 
+import jwt
+import structlog
 from langchain.agents.middleware.types import AgentMiddleware
+from langgraph.config import get_config
 from langgraph.runtime import Runtime
 from langgraph_sdk import get_client
 
-logger = logging.getLogger(__name__)
+logger = structlog.getLogger(__name__)
+
+# 短时父 token 有效期：只够完成一次回写，越短泄露面越小（ADR-0005）
+_PARENT_TOKEN_TTL = 300
 
 
-def _get_parent_ids(config: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Extract parent thread and assistant IDs from the runnable config.
-
-    Adapt this function to match how your deployment passes parent context
-    to subagents. The config-based approach shown here matches the pattern
-    used in LangSmith Agent Builder.
-    """
-    configurable = config.get("configurable", {})
-    return (
-        configurable.get("parent_thread_id"),
-        configurable.get("parent_assistant_id"),
+def _mint_parent_token(identity: str) -> str:
+    """现铸一枚短时父身份 token（sub/iat/exp，HS256——custom_auth 要求的三件套）。"""
+    now = int(time.time())
+    return jwt.encode(
+        {"sub": identity, "iat": now, "exp": now + _PARENT_TOKEN_TTL},
+        os.environ["JWT_SECRET"],
+        algorithm="HS256",
     )
 
 
-async def _notify_parent(
-    parent_thread_id: str,
-    parent_assistant_id: str,
-    notification: str,
-    subagent_name: str,
-) -> None:
-    """Send a notification run to the parent's thread.
-
-    Uses `get_client()` with no URL, which resolves to ASGI transport when
-    running in the same LangGraph deployment. For remote deployments, pass
-    the URL explicitly.
-    """
-    try:
-        client = get_client()
-        await client.runs.create(
-            thread_id=parent_thread_id,
-            assistant_id=parent_assistant_id,
-            input={
-                "messages": [{"role": "user", "content": notification}],
-            },
-        )
-        logger.info(
-            "Notified parent thread %s that subagent '%s' finished",
-            parent_thread_id,
-            subagent_name,
-        )
-    except Exception:
-        logger.warning(
-            "Failed to notify parent thread %s",
-            parent_thread_id,
-            exc_info=True,
-        )
-
-
 class CompletionNotifierMiddleware(AgentMiddleware):
-    """Notifies the supervisor's thread when this subagent completes or errors.
-
-    Add this as the last middleware in a subagent's stack so it fires after
-    all other middleware has run.
+    """子 agent 完成/出错时，往父线程推一条唤醒消息。
 
     Args:
-        parent_thread_id: The supervisor's thread ID to notify.
-        parent_assistant_id: The supervisor's assistant ID (needed to create a run).
-        subagent_name: Human-readable name for log messages and notifications.
+        parent_thread_id: 父线程 ID（通常从 config 读，这里是回退值）。
+        parent_assistant_id: 父 assistant ID（创建 run 需要）。
+        parent_user_identity: 父用户 identity——铸回写 token 必需。
+        notify_url: aegra base URL——显式回写客户端必需。
+        subagent_name: 日志/消息里用的可读名。
     """
 
     def __init__(
         self,
-        parent_thread_id: str | None,
-        parent_assistant_id: str | None,
+        parent_thread_id: str | None = None,
+        parent_assistant_id: str | None = None,
+        parent_user_identity: str | None = None,
+        notify_url: str | None = None,
         subagent_name: str | None = None,
     ):
         self.parent_thread_id = parent_thread_id
         self.parent_assistant_id = parent_assistant_id
+        self.parent_user_identity = parent_user_identity
+        self.notify_url = notify_url
         self.subagent_name = subagent_name or "subagent"
-        self._notified = False
+        # 按 run_id 去重：静态图的 middleware 实例在同 worker 内被并发 run 共享，
+        # 用 set 而非 bool 位，避免一个 run 的完成把另一个 run 的通知吞掉。
+        self._notified_runs: set[str] = set()
 
-    def _should_notify(self) -> bool:
-        return (
-            not self._notified
-            and bool(self.parent_thread_id)
-            and bool(self.parent_assistant_id)
-        )
+    # ---------- 解析父上下文（config 优先，构造值回退） ----------
+
+    @staticmethod
+    def _config() -> dict[str, Any]:
+        try:
+            return get_config() or {}
+        except RuntimeError:  # hook 在图外被触发（测试/脚本）
+            return {}
+
+    def _resolve_parent(self) -> tuple[str, str, str, str] | None:
+        """返回 (thread_id, assistant_id, identity, url)；缺任何一项都放弃回写。"""
+        conf = self._config().get("configurable") or {}
+        thread_id = conf.get("parent_thread_id") or self.parent_thread_id
+        assistant_id = conf.get("parent_assistant_id") or self.parent_assistant_id
+        identity = conf.get("parent_user_identity") or self.parent_user_identity
+        url = conf.get("notify_url") or self.notify_url
+        if not (thread_id and assistant_id and identity and url):
+            logger.warning(
+                "completion_notify_skipped_incomplete_parent_context",
+                parent_thread_id=bool(thread_id),
+                parent_assistant_id=bool(assistant_id),
+                parent_user_identity=bool(identity),
+                notify_url=bool(url),
+                subagent=self.subagent_name,
+            )
+            return None
+        return str(thread_id), str(assistant_id), str(identity), str(url)
+
+    def _run_key(self) -> str:
+        conf = self._config().get("configurable") or {}
+        return str(conf.get("run_id") or conf.get("thread_id") or "unknown-run")
+
+    # ---------- 回写 ----------
 
     async def _send_notification(self, message: str) -> None:
-        if not self._should_notify():
+        parent = self._resolve_parent()
+        if parent is None:
             return
-        self._notified = True
-        await _notify_parent(
-            self.parent_thread_id,  # type: ignore[arg-type]
-            self.parent_assistant_id,  # type: ignore[arg-type]
-            message,
-            self.subagent_name,
-        )
+        run_key = self._run_key()
+        if run_key in self._notified_runs:
+            return
+        self._notified_runs.add(run_key)
 
-    def _extract_last_message(self, state: dict[str, Any]) -> str:
-        """Extract a summary from the subagent's final message."""
+        thread_id, assistant_id, identity, url = parent
+        try:
+            token = _mint_parent_token(identity)
+            client = get_client(url=url, headers={"Authorization": f"Bearer {token}"})
+            await client.runs.create(
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                input={"messages": [{"role": "user", "content": message}]},
+            )
+            logger.info(
+                "completion_notify_sent",
+                parent_thread_id=thread_id,
+                subagent=self.subagent_name,
+                run_key=run_key,
+            )
+        except Exception as e:  # noqa: BLE001 —— 通知是尽力而为，失败要留痕不能吞
+            logger.warning(
+                "completion_notify_failed",
+                parent_thread_id=thread_id,
+                subagent=self.subagent_name,
+                error=str(e),
+                exc_info=True,
+            )
+
+    # ---------- hooks ----------
+
+    @staticmethod
+    def _extract_last_message(state: dict[str, Any]) -> str:
         messages = state.get("messages", [])
         if not messages:
             return "(no output)"
         last = messages[-1]
-        if hasattr(last, "content"):
-            content = last.content
-            return content[:500] if isinstance(content, str) else str(content)[:500]
-        if isinstance(last, dict):
-            return str(last.get("content", ""))[:500]
-        return str(last)[:500]
+        content = getattr(last, "content", None)
+        if content is None and isinstance(last, dict):
+            content = last.get("content", "")
+        content = content if content is not None else str(last)
+        return content[:500] if isinstance(content, str) else str(content)[:500]
 
-    async def aafter_agent(
-        self, state: dict[str, Any], runtime: Runtime
-    ) -> dict[str, Any] | None:
-        """After-agent hook: fires when the subagent run completes successfully."""
+    async def aafter_agent(self, state: dict[str, Any], runtime: Runtime) -> dict[str, Any] | None:
+        """成功完成时：推结果摘要给父线程。"""
         summary = self._extract_last_message(state)
         await self._send_notification(
             f"[Async subagent '{self.subagent_name}' has completed] Result: {summary}"
@@ -160,37 +179,28 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         return None
 
     async def awrap_model_call(self, request, handler):
-        """Wrap-model-call hook: catches errors and notifies the supervisor."""
+        """模型调用出错时：推错误通知，再把异常抛回去。"""
         try:
             return await handler(request)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             await self._send_notification(
-                f"[Async subagent '{self.subagent_name}' encountered an error] "
-                f"Error: {e!s}"
+                f"[Async subagent '{self.subagent_name}' encountered an error] Error: {e!s}"
             )
             raise
 
 
 def build_completion_notifier(
-    parent_thread_id: str | None,
-    parent_assistant_id: str | None,
+    parent_thread_id: str | None = None,
+    parent_assistant_id: str | None = None,
+    parent_user_identity: str | None = None,
+    notify_url: str | None = None,
     subagent_name: str | None = None,
 ) -> CompletionNotifierMiddleware:
-    """Build a completion notifier middleware.
-
-    Convenience factory that mirrors the pattern used in LangSmith Agent Builder.
-
-    Example:
-        ```python
-        notifier = build_completion_notifier(
-            parent_thread_id=config["configurable"].get("parent_thread_id"),
-            parent_assistant_id=config["configurable"].get("parent_assistant_id"),
-            subagent_name="researcher",
-        )
-        ```
-    """
+    """构造完成通知中间件（参数皆可选：拦截层部署下从 config 读，无需传）。"""
     return CompletionNotifierMiddleware(
         parent_thread_id=parent_thread_id,
         parent_assistant_id=parent_assistant_id,
+        parent_user_identity=parent_user_identity,
+        notify_url=notify_url,
         subagent_name=subagent_name,
     )

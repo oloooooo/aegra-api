@@ -26,7 +26,7 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
-from graphs.space_access import allowed_spaces
+from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
 
@@ -42,9 +42,11 @@ def _now() -> str:
 class AsyncTaskGuard(AgentMiddleware):
     """拦截 async subagent 的 run 创建，注入 user_spaces 并限制并发。"""
 
-    def __init__(self, specs: dict[str, dict[str, Any]]) -> None:
-        """specs: {agent_name: AsyncSubAgent spec}（url/headers/graph_id 都在其中）。"""
+    def __init__(self, specs: dict[str, dict[str, Any]], assistant_id: str = "supervisor") -> None:
+        """specs: {agent_name: AsyncSubAgent spec}；assistant_id = 主管自己的 assistant
+        （回写唤醒 run 用；config 里若带 assistant_id 则优先用 config 的）。"""
         self._specs = specs
+        self._assistant_id = assistant_id
         self._sync: dict[tuple, SyncLangGraphClient] = {}
         self._async: dict[tuple, LangGraphClient] = {}
 
@@ -127,8 +129,32 @@ class AsyncTaskGuard(AgentMiddleware):
     def _err(self, request: ToolCallRequest, msg: str) -> ToolMessage:
         return ToolMessage(content=msg, tool_call_id=request.runtime.tool_call_id, name=request.tool_call.get("name"))
 
-    def _config_for(self, request: ToolCallRequest) -> dict[str, Any]:
-        return {"configurable": {"user_spaces": self._spaces_payload(request.runtime.config)}}
+    def _config_for(self, request: ToolCallRequest, spec: dict[str, Any]) -> dict[str, Any]:
+        """子 run 的 configurable：spaces + 父上下文（回写唤醒用，ADR-0005）。
+
+        父上下文只在有鉴权上下文（非本地 demo）时才转发；回写所需的
+        parent_user_identity 取服务端注入的 langgraph_auth_user，客户端伪造不了。
+        """
+        cfg = request.runtime.config or {}
+        conf = cfg.get("configurable") or {}
+        payload: dict[str, Any] = {"user_spaces": self._spaces_payload(request.runtime.config)}
+
+        parent_identity = current_identity(request.runtime.config)
+        parent_thread_id = conf.get("thread_id")
+        if parent_identity != "local" and parent_thread_id:
+            parent_assistant = (
+                conf.get("assistant_id")
+                or (cfg.get("metadata") or {}).get("assistant_id")
+                or self._assistant_id
+            )
+            payload.update(
+                parent_thread_id=parent_thread_id,
+                parent_assistant_id=parent_assistant,
+                parent_user_identity=parent_identity,
+                # 子 run 与父 run 同一部署，用 spec 的 url（本部署即 aegra）
+                notify_url=spec.get("url"),
+            )
+        return {"configurable": payload}
 
     def _task(self, task_id: str, agent_name: str, run_id: str, created_at: str | None = None) -> dict[str, Any]:
         now = _now()
@@ -165,7 +191,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 thread_id=thread["thread_id"],
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": args.get("description", "")}]},
-                config=self._config_for(request),
+                config=self._config_for(request, spec),
             )
         except Exception as e:  # noqa: BLE001 — SDK 异常无类型，回给模型
             logger.warning("failed_to_launch_async_subagent", error=str(e))
@@ -185,7 +211,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 thread_id=thread["thread_id"],
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": args.get("description", "")}]},
-                config=self._config_for(request),
+                config=self._config_for(request, spec),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("failed_to_launch_async_subagent", error=str(e))
@@ -225,7 +251,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
                 multitask_strategy="interrupt",
-                config=self._config_for(request),
+                config=self._config_for(request, spec),
             )
         except Exception as e:  # noqa: BLE001
             return self._err(request, f"Failed to update async subagent: {e}")
@@ -245,7 +271,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
                 multitask_strategy="interrupt",
-                config=self._config_for(request),
+                config=self._config_for(request, spec),
             )
         except Exception as e:  # noqa: BLE001
             return self._err(request, f"Failed to update async subagent: {e}")

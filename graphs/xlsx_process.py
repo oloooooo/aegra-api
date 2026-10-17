@@ -10,6 +10,7 @@ from langchain_quickjs import CodeInterpreterMiddleware
 
 from graphs.space_backend import SpaceBackend
 from graphs.xlsx_tools import XLSX_TOOLS
+from custom.middlewares.completion_notifier import CompletionNotifierMiddleware
 
 dotenv.load_dotenv()
 
@@ -24,8 +25,10 @@ graph = create_deep_agent(
             ptc=XLSX_TOOLS,# pyright: ignore[reportArgumentType]
             timeout = 120,
             max_result_chars=10000
-        )
-    ],  
+        ),
+        # 完成时主动回写父线程（父上下文从 config 读，ADR-0005 选项1）
+        CompletionNotifierMiddleware(subagent_name="xlsx_process"),
+    ],
     # 子 agent 同样按 space 隔离：spaces 来自拦截层经 run config 转发的 user_spaces
     backend=SpaceBackend(root_dir=okf_dir),
     permissions=[FilesystemPermission(operations=['write'],paths=["/"],mode='deny')]
