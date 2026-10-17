@@ -1,5 +1,4 @@
 from deepagents import AsyncSubAgent, FilesystemPermission, create_deep_agent
-from deepagents.backends import FilesystemBackend
 import dotenv
 import os
 
@@ -9,6 +8,7 @@ from graphs.llms import model
 from pydantic import BaseModel
 from langchain_quickjs import CodeInterpreterMiddleware
 
+from graphs.space_backend import SpaceBackend
 from graphs.xlsx_tools import XLSX_TOOLS
 
 dotenv.load_dotenv()
@@ -26,7 +26,8 @@ graph = create_deep_agent(
             max_result_chars=10000
         )
     ],  
-    backend= FilesystemBackend(root_dir=okf_dir),
+    # 子 agent 同样按 space 隔离：spaces 来自拦截层经 run config 转发的 user_spaces
+    backend=SpaceBackend(root_dir=okf_dir),
     permissions=[FilesystemPermission(operations=['write'],paths=["/"],mode='deny')]
 )
 

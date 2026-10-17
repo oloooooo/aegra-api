@@ -24,6 +24,8 @@ from typing import Any
 import pandas as pd
 from langchain.tools import ToolRuntime, tool
 
+from graphs.space_access import allowed_spaces
+
 
 _MAX_ROWS = 200  # query 单次最多返回行数
 _MAX_HITS = 100  # search 单次最多返回命中数
@@ -54,6 +56,27 @@ def _resolve(path: str | Path) -> Path:
     if not p.is_file():  # 目录 / 拼错 / 文件真不在，都在这里挂
         raise FileNotFoundError(f"文件不存在：{p}")  # 带上完整解析结果，方便定位
     return p  # 给 pd.read_excel 用
+
+
+def _check_scope(path: str | Path, config: object) -> None:
+    """空间隔离（ADR-0005）：XLSX_TOOLS 不经 backend（自己 openpyxl 读盘），
+    必须在 tool 层拦：虚拟路径第一段 ∈ allowed spaces，或根散文件共享只读。
+    无鉴权上下文（本地 demo）不设限；相对路径在受限时直接拒绝（它绕开 OKF 根）。
+    """
+    spaces = allowed_spaces(config)  # type: ignore[arg-type]
+    if spaces is None:
+        return
+    raw = str(path).strip()
+    if not raw.startswith(("/", "\\")):
+        raise ValueError(f"受限模式下必须用以 / 开头的虚拟路径（/空间名/文件.xlsx）：{path}")
+    rel = raw.lstrip("/\\")
+    first = rel.split("/", 1)[0]
+    if first in spaces:
+        return  # 文件是否存在由 _resolve 报
+    if "/" not in rel and (_root() / first).is_file():
+        return  # 根散文件共享只读（Q3b）
+    visible = sorted(spaces) or ["（无）"]
+    raise ValueError(f"无权访问 {path}：{first} 不在你的空间列表 {visible} 内")
 
 
 def _load(path: str, sheet: str | None, header: int) -> pd.DataFrame:
@@ -165,6 +188,7 @@ async def _run(name: str, fn: Any, runtime: ToolRuntime, /, *args: Any) -> str:
     writer = runtime.stream_writer
     writer({"tool": name, "event": "start", "args": list(args)})
     try:
+        _check_scope(args[0], runtime.config)  # 四个 tool 的第一个参数都是 path
         result = await asyncio.to_thread(fn, *args)
     except Exception as e:  # noqa: BLE001 —— 故意兜底，错误信息是给 agent 看的
         writer({"tool": name, "event": "error", "error": f"{type(e).__name__}: {e}"})

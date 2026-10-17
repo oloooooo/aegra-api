@@ -2,12 +2,13 @@ from typing import Annotated
 
 from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.middleware import FilesystemPermission
-from deepagents.backends import FilesystemBackend
 import dotenv
 import os
+import time
 
 from pathlib import Path
 
+import jwt
 import structlog
 
 from graphs.llms import model
@@ -22,6 +23,8 @@ class deepAgentContext(BaseModel):
 
 from langchain.tools import InjectedToolArg, tool, ToolRuntime
 from langgraph.graph.state import RunnableConfig
+from graphs.async_task_guard import AsyncTaskGuard
+from graphs.space_backend import SpaceBackend
 from graphs.xlsx_tools import XLSX_TOOLS
 
 logger = structlog.getLogger(__name__)
@@ -62,24 +65,42 @@ async def get_user_data(
 
 # 和子 agent（xlsx_process）同一份 okf 根，虚拟路径才对得上
 okf_dir = str(Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf"))
+
+# 静态服务 token：subagent 的 runs.create 不带终端用户 JWT（deepagents 不转发），
+# 构建期用 JWT_SECRET 铸一枚长期 token，custom_auth.py 对该 identity 免 DB 直接放行。
+# shortcut: 10 年有效、与服务同生共死；要轮换时改 env 或改成启动时铸造。
+_service_token = jwt.encode(
+    {
+        "sub": os.environ.get("SERVICE_IDENTITY", "subagent_service"),
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 10 * 365 * 24 * 3600,
+    },
+    os.environ["JWT_SECRET"],
+    algorithm="HS256",
+)
+
+_xlsx_spec = AsyncSubAgent(  # pyright: ignore[reportCallIssue]
+    name="xlsx_process",
+    description=(
+        "查 xlsx 表格的专用 agent，跑在后台。任何关于表格内容的问题（有哪些 sheet/列、"
+        "按条件筛行、全表找关键词、空值重复值画像）都交给它；路径用 /空间名/文件.xlsx "
+        "这样的虚拟路径。用 start_async_task 派活，需要结果时用 check_async_task。"
+    ),
+    graph_id="xlsx_process",
+    tools=[XLSX_TOOLS],
+    url="http://127.0.0.1:2026",
+    headers={"Authorization": f"Bearer {_service_token}"},
+)
+
 graph = create_deep_agent(
     model=model,
-    backend=FilesystemBackend(root_dir=okf_dir),
+    # 按空间隔离的 backend：8 个 fs 工具单点兜住 allowed_spaces（ADR-0005）
+    backend=SpaceBackend(root_dir=okf_dir),
     context_schema=deepAgentContext,
     # tools=[get_user_data],
-    subagents=[
-        AsyncSubAgent(  # pyright: ignore[reportCallIssue]
-            name="xlsx_process",
-            description=(
-                "查 xlsx 表格的专用 agent，跑在后台。任何关于表格内容的问题（有哪些 sheet/列、"
-                "按条件筛行、全表找关键词、空值重复值画像）都交给它；路径用 /消融实验1.xlsx "
-                "这样的虚拟路径。用 start_async_task 派活，需要结果时用 check_async_task。"
-            ),
-            graph_id="xlsx_process",
-            tools=[XLSX_TOOLS],
-            url="http://127.0.0.1:2026",
-        )
-    ],
+    # 拦截 start/update_async_task：把主管的 spaces 经 run config 转发给子 agent
+    middleware=[AsyncTaskGuard({"xlsx_process": _xlsx_spec})],
+    subagents=[_xlsx_spec],
     permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
 )
 if __name__ == "__main__":

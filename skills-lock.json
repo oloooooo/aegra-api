@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "aegra": {
+      "source": "docs.aegra.dev",
+      "sourceUrl": "https://docs.aegra.dev",
+      "sourceType": "well-known",
+      "computedHash": "ff37317c5bba4fc97be252beecf76551ece18c213232e8bf1c46c9d278df8384",
+      "wellKnownDigest": "sha256:4375d6f56b4689f33d3cd29ee22de37bb26df7ab9759eaea41711a7c897f19d7"
+    }
+  }
+}

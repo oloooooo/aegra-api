@@ -3,7 +3,10 @@
     "supervisor": "./graphs/deepagents_nodes.py:graph",
     "xlsx_process": "./graphs/xlsx_process.py:graph"
   },
-    "http": {
+  "http": {
     "app": "./custom/fastapi.py:app"
+  },
+  "auth": {
+    "path": "./custom/custom_auth.py:auth"
   }
 }

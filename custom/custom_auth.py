@@ -8,6 +8,11 @@ from aegra_api.core.orm import get_session_maker
 from custom.repositories import UserRepository,UserSpaceRepository
 
 logger = structlog.getLogger(__name__)
+
+# 内部服务账号（async subagent 的静态 token）：跳过 DB 查询直接放行。
+# subagent 拿不到终端用户的 JWT，只能用构建期铸的静态 token，见 graphs/deepagents_nodes.py。
+SERVICE_IDENTITY = os.environ.get("SERVICE_IDENTITY", "subagent_service")
+
 auth = Auth()
 
 
@@ -45,6 +50,14 @@ async def _decode_access_token(headers: dict[str, str]):
             raise AuthHTTPException(
                 detail="无效或已过期的令牌", headers={"WWW-Authenticate": "Bearer"}
             )
+        if identity == SERVICE_IDENTITY:
+            return {
+                "identity": identity,
+                "display_name": "Subagent Service",
+                "permissions": ["read"],
+                "is_authenticated": True,
+                "user_spaces": [],
+            }
         user_table = await user_repo.get(identity=identity)
         user_spaces =await user_space_repo.list_by_user(identity=identity)
         if user_table is None:
