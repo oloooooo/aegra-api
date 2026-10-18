@@ -418,6 +418,7 @@ libs/aegra-api/
 
 ## Documentation
 
+- **启动指南 / Getting started (中文)**: [README_zh.md](README_zh.md) — 环境依赖、`.env`、建表、初始化账号与知识空间、前后端启动、排错
 - Configuration reference (aegra.json, environment variables, logging): [docs/configuration.md](docs/configuration.md) (Chinese)
 - Async subagent (ACP) design: [docs/design.md](docs/design.md)
 - Streaming reference (stream modes, sub-agent stream proxy): [docs/streaming.md](docs/streaming.md) (Chinese)
