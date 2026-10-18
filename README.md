@@ -420,4 +420,17 @@ libs/aegra-api/
 
 - Configuration reference (aegra.json, environment variables, logging): [docs/configuration.md](docs/configuration.md) (Chinese)
 - Async subagent (ACP) design: [docs/design.md](docs/design.md)
+- Streaming reference (stream modes, sub-agent stream proxy): [docs/streaming.md](docs/streaming.md) (Chinese)
+- Frontend API contract (custom endpoints, SSE frames, interrupt/resume): [docs/frontend-api.md](docs/frontend-api.md) (Chinese)
 - Glossary: [CONTEXT.md](CONTEXT.md)
+
+## Web UI
+
+`web/` contains a Vue 3 + Vite frontend (chat + sub-agent live progress + knowledge-space browser + cron jobs):
+
+```bash
+cd web && npm install && npm run dev     # http://localhost:5273 (backend on :2026)
+node scripts/smoke.mjs                   # contract smoke test against a running backend
+```
+
+See [web/README.md](web/README.md).
