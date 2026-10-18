@@ -277,5 +277,208 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 ---
 
+## 11. 在 graph 里新增一个子 agent
+
+新增一个领域子 agent（例：`bio_lab`，绑空间 `bio-lab`）需要动 **7 处**。前 2 处是「知识 + 权限」，后 5 处是「代码」。
+
+### 11.1 建知识空间（磁盘）
+
+```
+graphs/okf/bio-lab/
+├── index.md          # 必需：OKF v0.2，只有 frontmatter `okf_version: "0.2"` + 分组链接列表
+├── log.md            # 建议：按日期分组的更新历史
+├── some-concept.md   # 概念文档：frontmatter 带 type/title/description/tags/status/stale_after/generated/sources
+└── xxx.xlsx          # 可选：要查表就放这里（子 agent 用 xlsx_info/query/search/profile 读）
+```
+
+概念文档的最小 frontmatter（`type` 必填，其余见 `docs/streaming.md` 之外的 OKF 规范）：
+
+```yaml
+---
+type: concept
+title: 菌株保藏与复苏
+description: 甘油菌复苏与传代的操作边界
+tags: [bio-lab, strain]
+status: stable
+verified: true
+generated:
+  by: okf-enrichment-agent
+  at: 2026-10-18
+stale_after: 2027-10-18
+sources:
+  - "internal://sop-001"
+---
+```
+
+### 11.2 登记进数据库（否则派活会被拒）
+
+`space` 名字就是磁盘文件夹名，`path` 相对项目根：
+
+```bash
+psql -U postgres -d aegra <<'SQL'
+insert into space(name, path) values ('bio-lab', 'graphs/okf/bio-lab')
+  on conflict (name) do nothing;
+
+-- 谁能用这个空间（不给就没任何人能派活给这个 agent）
+insert into user_space(identity, space_name) values ('root', 'bio-lab')
+  on conflict do nothing;
+SQL
+```
+
+> 拦截层派活前会校验「当前用户的 spaces 包含该空间」，不包含就直接拒绝：
+> `用户没有空间 'bio-lab' 的权限，无法启动该子 agent`。
+
+### 11.3 写两份 prompt
+
+| 文件 | 作用 | 谁读 |
+|---|---|---|
+| `graphs/prompts/bio_lab.md` | 子 agent 的 system prompt：知识库导航、工具用法、边界 | 子 agent 自己 |
+| `graphs/prompts/bio_lab_description.md` | **主 agent 选人用的描述**：一句话讲清「什么问题该找我」 | 主 agent |
+
+`bio_lab_description.md` 的写法（决定主管能不能选中它，比 system prompt 更关键）：
+
+```markdown
+生物实验室领域专家，运行在 bio-lab 知识空间。负责：菌株保藏/复苏、培养基配方、
+实验记录查询（xxx.xlsx）。用户问题涉及菌株、培养基、传代、生物实验 SOP 时派给我。
+```
+
+`bio_lab.md` 里必须写清知识库清单与工具规则，参考 `graphs/prompts/cbam.md`：
+
+```markdown
+你是生物实验室领域的专用知识 agent，只读不写。主 agent 转述的任务会带 /bio-lab/xxx 路径。
+
+## 知识库（先读后答）
+- /bio-lab/index.md：总览与导航
+- /bio-lab/some-concept.md：...
+- /bio-lab/xxx.xlsx：sheet「...」
+
+## 工具
+- read：读 .md 文档，回答业务问题必读对应文档，不要凭记忆答。
+- xlsx_info / xlsx_query / xlsx_search / xlsx_profile：查表（先 info 认表再 query）。
+
+## 边界
+- 只处理本领域；只读，任何写盘请求一律拒绝并说明。
+```
+
+### 11.4 导出常量
+
+`graphs/prompts/__init__.py`：
+
+```python
+BIO_LAB_SYSTEM_PROMPT = load_prompt("bio_lab")
+BIO_LAB_SUBAGENT_DESCRIPTION = load_prompt("bio_lab_description")
+
+__all__ = [
+    # ...
+    "BIO_LAB_SUBAGENT_DESCRIPTION",
+    "BIO_LAB_SYSTEM_PROMPT",
+]
+```
+
+### 11.5 实例化图
+
+`graphs/domain_agents.py`（builder 已封装好工具栈、写禁用、回写钩子）：
+
+```python
+from graphs.prompts import BIO_LAB_SYSTEM_PROMPT
+
+graph_bio_lab = _domain_agent("bio_lab", BIO_LAB_SYSTEM_PROMPT, xlsx=True)
+#                                                  ↑只有文档时用 xlsx=False，
+#                                                  不带 xlsx 四件套，也不装 CodeInterpreterMiddleware
+```
+
+`_domain_agent(name, ...)` 里的 `name` 同时是日志名与回写通知里的名字，必须和下面两处的 agent 名一致。
+
+### 11.6 在 `aegra.json` 注册图
+
+```json
+{
+  "graphs": {
+    "supervisor": "./graphs/deepagents_nodes.py:graph",
+    "bio_lab": "./graphs/domain_agents.py:graph_bio_lab"
+  }
+}
+```
+
+键名（`bio_lab`）就是主管调用 `start_async_task` 时用的 `subagent_type`，也是 `assistant_id`。
+
+### 11.7 在主管侧登记 spec（绑定 space）
+
+`graphs/deepagents_nodes.py` 的 `_DOMAIN_SPECS` 加一条：
+
+```python
+_DOMAIN_SPECS = {
+    # ...现有三个...
+    "bio_lab": {
+        "space": "bio-lab",                 # ← 权限收窄：子 agent 只能看这一个空间
+        "description": BIO_LAB_SUBAGENT_DESCRIPTION,
+    },
+}
+```
+
+同时把常量加进该文件的 import：
+
+```python
+from graphs.prompts import (
+    MAIN_SYSTEM_PROMPT, CBAM_SUBAGENT_DESCRIPTION, HYBRID_BONDING_SUBAGENT_DESCRIPTION,
+    SBOL3_SUBAGENT_DESCRIPTION, BIO_LAB_SUBAGENT_DESCRIPTION,   # ← 新增
+)
+```
+
+### 11.8 告诉主管「有这么个 agent」
+
+`graphs/prompts/main.md` 的「## 可用的子 agent」加一行（漏了这步 = 模型永远不选它）：
+
+```markdown
+- `bio_lab`：生物实验室专家——菌株保藏/复苏、培养基配方、实验记录查询。知识空间 /bio-lab/。
+```
+
+### 11.9 重启 + 验证
+
+```bash
+# 1) 图能 import（注册表在启动时读一次，必须先过这关）
+PYTHONPATH=. uv run python -c "
+import graphs.domain_agents, graphs.deepagents_nodes as s
+print('specs:', {k: v['space'] for k, v in s._specs.items()})"
+# → specs: {'cbam_reporting': 'cbam-reporting', ...}
+#   会伴随一条 CodeInterpreterMiddleware 的 LangChainBetaWarning，属正常
+
+# 2) 重启服务（改了 aegra.json 或图代码都必须重启）
+PYTHONPATH=. uv run python -u src/aegra_api/main.py
+
+# 3) 确认 assistant 已生成
+curl -s http://127.0.0.1:2026/custom/graphs -H "Authorization: Bearer <token>"
+#   → {"graphs":[...,"bio_lab",...]}
+
+# 4) 真正派活（用对应领域的问题）
+uv run python custom_test.py "某个 bio-lab 领域的问题"
+```
+
+### 11.10 不用手写的东西
+
+`_domain_agent` + 拦截层已经把这些固定好了，新增 agent 不用重复实现：
+
+| 能力 | 来自 |
+|---|---|
+| 只能读本 space 的文件（含 ls/grep/glob 过滤） | `graphs/space_backend.py::SpaceBackend` |
+| 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
+| 完成/出错自动回写父线程 | `CompletionNotifierMiddleware(subagent_name=name)` |
+| 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
+| 同时最多 3 个后台任务 + 僵尸状态核实 | `AsyncTaskGuard`（`MAX_ACTIVE_TASKS`） |
+| 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |
+
+### 11.11 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 主管永远不派给新 agent | 忘了改 `graphs/prompts/main.md`，或 description 写得太宽/太窄 |
+| `Unknown async subagent type` | `_DOMAIN_SPECS` 没加，或名字与 `aegra.json` 的键不一致 |
+| `用户没有空间 'bio-lab' 的权限` | `space` / `user_space` 表没登记（§11.2） |
+| 子 agent 说「无权访问 /bio-lab/...」 | 磁盘目录不存在，或 `space.path` 写错（相对项目根） |
+| 子 agent 读不到 xlsx 工具 | 实例化时传了 `xlsx=False` |
+| 改完没生效 | 没重启后端（`aegra.json` 与图注册表启动时只读一次） |
+
+---
+
 更多接口与流式细节见 [`docs/frontend-api.md`](docs/frontend-api.md)、[`docs/streaming.md`](docs/streaming.md)；
 术语见 [`CONTEXT.md`](CONTEXT.md)。
