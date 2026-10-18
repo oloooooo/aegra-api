@@ -1,10 +1,12 @@
 from fastapi import FastAPI
 from custom.routers import router as userspace_router
 from custom.frontend_api import router as frontend_router
+from custom.delivery_api import router as delivery_router
 app = FastAPI()
 
 app.include_router(userspace_router)
 app.include_router(frontend_router)
+app.include_router(delivery_router)
 
 
 def _openapi_with_bearer():

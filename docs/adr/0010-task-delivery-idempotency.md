@@ -1,11 +1,11 @@
 # 任务结果投递的幂等与并发
 
 结果投递（见 `docs/design.md §2.4`）有两处会并发：同一轮里多个后台任务同时完成、以及
-多个子 agent 在几乎同一时刻收尾。本文记录判重依据、每种并发下的行为，以及已知边界。
+多个子 agent 在几乎同一时刻收尾。本文记录为什么用数据库认领、每种并发下的行为。
 
-## 权威判据：state 里的投递消息本身
+## 判据为什么不能只放在 state 里
 
-投递消息统一为：
+投递消息统一为（前端靠前缀识别成「子 agent 返回」）：
 
 ```
 [Async subagent '<name>' has completed] Result: …
@@ -14,52 +14,69 @@ task_id: <id>
 run_id: <完成这次执行的 run id>
 ```
 
-判重键是 **(task_id, run_id) 二元组**，且**只认以 `[Async subagent` 开头的消息**。
-用二元组而不是 `task_id` 单键，是因为 `update_async_task` 会给同一个任务开新 run，
-只认 `task_id` 会把更新后的第二次结果当成重复丢掉。派活工具返回的
-`Launched async subagent. task_id: …` 同样带 `task_id:`，不排除会把"待投递"误判成"已投递"
-（实现时踩过，自检里有回归用例）。
+按消息判重看起来最省事，但有两个硬伤：
 
-判重放在 state 而不是内存表，是因为：
+1. **判重要读整份 state**。`GET /threads/{id}/state` 会把全部 messages 序列化回来——
+   一次投递为了查一个标记要拉几十~几百 KB；重试与延迟复查同样如此。
+2. **跨进程不原子**。两个 worker 同时"查空 → 创建"，两边都通过；同一父线程上还会出现
+   两个投递 run 并发写同一线程。
 
-- 进程重启、队列重投（Redis at-least-once）后再跑一次 `aafter_agent`，读 state 仍能判出来；
-- 多进程部署时 state 是唯一共享的真相，内存表各算各的。
+用 `task_id` 单键判重还会吞掉 `update_async_task` 的第二次结果（同一任务、新 run）。
 
-## 三种并发场景
+## 机制：一张两列主键的认领表
 
-| 场景 | 行为 | 幂等性 |
+`async_task_delivery(task_id, run_id)`，主键即判重键，另有 `parent_thread_id` 与 `claimed_at`。
+接口在 `custom/delivery_api.py`：
+
+```
+POST /custom/tasks/{task_id}/deliver-claim   {parent_thread_id, run_id}
+  → {"claimed": true,  "reason": "claimed" | "reclaimed"}
+  → {"claimed": false, "reason": "delivered" | "in_flight"}
+DELETE /custom/tasks/{task_id}/deliver-claim?parent_thread_id=&run_id=
+```
+
+规则（全部在一个事务里，配 `pg_advisory_xact_lock(hashtext(parent_thread_id))` 串行化同线程认领）：
+
+| 情况 | 结果 | 调用方该做什么 |
 |---|---|---|
-| 同一轮里多个任务同时转终态（主管正在跑） | `abefore_model` 一次 `_plan` 把**所有**待投递任务合成一条 state 更新（一个 `messages` 列表） | 天然幂等：一次事务、一次 checkpoint |
-| 多个子 agent 同时收尾，但主管**正忙** | notifier 看到 `busy` 就不投递，只安排延迟复查（8s/20s/45s）；结果由 ① 在主管边界注入 | 不会并发生成 run |
-| 多个子 agent 同时收尾，主管**空闲** | 各自的 notifier 都要开新 run。用进程内锁把"判重 + 创建"串行化，并记一条 `(父线程, task)` 的本地认领，补上"刚发出去、state 还没落 checkpoint"的空白期 | 单进程内确定唯一；跨进程见下 |
+| 主键已存在且 `claimed_at` 在 10 分钟内 | `delivered` | 跳过——这次执行的结果已经投过 |
+| 主键已存在但超过 10 分钟（认领后进程死掉、没真投出去） | `reclaimed`，刷新时间 | 照常投递 |
+| 同线程上 8 秒内已有别的任务认领 | `in_flight` | 跳过——它的投递 run 正在路上；主管边界的注入会兜住本次结果 |
+| 其它 | `claimed`，插入一行 | 去投递；**投递 run 创建失败时调 `DELETE` 撤回认领** |
 
-## 已知边界：多进程下的重复窗口
+两个调用方：
 
-`_DELIVERY_LOCK` 与 `_DELIVERED_LOCAL` 都是**进程内**的。两个子 agent 跑在不同 worker 进程、
-在几十毫秒内先后完成、且主管此刻空闲时，两次投递可能都通过判重，各开一个 run：
+- `AsyncTaskGuard.abefore_model`（主管正在跑，注入消息）——用服务身份认领；
+- `CompletionNotifierMiddleware`（主管空闲，开新 run）——用现铸的父身份 token 认领。
 
-- 用户会看到两条「子 agent 返回」；
-- 主管会因此多跑一轮（两次模型调用）。
+授权：`Thread.user_id == 调用者` 或调用者是服务身份，否则 403；线程不存在 404。
 
-概率低（要求同一父线程下两个任务几乎同时结束、且主管已空闲），后果是"多答一次"，不丢数据。
-兜底有两层：投递消息里的 `task_id` 让模型能识别重复（主 prompt 要求"同一 task_id 只处理一次"），
-前端按 `task_id` 也只会看到两段可辨识的返回。
+## 三种并发场景的行为
+
+| 场景 | 行为 | 幂等 |
+|---|---|---|
+| 同一轮里多个任务同时终态，主管在跑 | 一次 `before_model` 合并成一条 state 更新；每个任务各自认领一次，全部抢到 | 天然幂等（一次 checkpoint） |
+| 多个子 agent 同时收尾，主管正忙 | notifier 看到 `busy` 完全不认领，只安排延迟复查；结果由 ① 注入 | 不会产生 run |
+| 多个子 agent 同时收尾，主管空闲 | 第一个抢到认领并开 run；8 秒内后到的拿到 `in_flight` 直接放弃（主管下一轮注入兜住） | 同一时刻最多一个投递 run |
+| 同一任务被重试/双 hook 投递 | 第二次拿到 `delivered` | 只投一次 |
+| `update_async_task` 后的新 run | 新 `run_id` → 新主键 → 再投一次 | 有意为之 |
 
 ## Considered Options
 
-- **数据库认领表**（`task_id` 唯一键，投递前 `INSERT … ON CONFLICT DO NOTHING`）：跨进程严格
-  一次，但 `graphs/` 侧没有 DB 通道，要么给 `custom/` 加接口、要么把投递整体搬进服务端。
-  与 ADR-0008 里那张登记表是同一个待办，等有多进程部署需求时一起做。
-- **用 `multitask_strategy="interrupt"` 投递**：能把"两个 run"压成"一个 run"，但语义是
-  Supersede（杀掉前一个 run），前一个投递消息已经写进 state 撤不回来，只是少了一次并发写。
-  收益不抵语义代价，不用。
-- **进程内锁 + 本地认领（选中）**：零新依赖，单进程（当前部署）完全确定；多进程留一个已记录的窄窗口。
+- **只靠 state 消息标记**（原实现）：零新表，但每次判重读整份 state，且跨进程不原子。
+- **进程内锁 + 本地认领**（原实现的加固版）：单进程确定，多 worker 仍有窗口，且不省 state 读取。
+- **数据库认领表（选中）**：一次小写入同时给出幂等与跨进程串行；顺带把"判重"从
+  "读整份对话"降成"查一行主键"，投递路径的 state 读取降到 0（`interrupted` 分支除外，
+  那里仍需读 `interrupts`）。
+- **在服务端直接创建投递 run**：能让"认领 + 创建"彻底原子，但要把 aegra 的 run 创建流程
+  搬进 `custom/`，耦合面太大，不做。
 
 ## Consequences
 
-- 投递在单进程部署下是幂等的：同一 `(父线程, task)` 至多一条消息、至多一个额外 run。
-- 多进程部署下允许"极端并发时多答一次"，不丢结果、不重复执行子 agent。
-- 跨进程严格一次需要 DB 认领；届时应把 `_DELIVERED_LOCAL`、`_DELIVERY_LOCK` 与 ADR-0008 的
-  并发上限账本一起收敛到同一张登记表。
-- 投递的写操作不幂等（`runs.create` 没有幂等键）。重试前会重新读一次父线程状态与 state，
-  因此"请求超时但其实已成功"的情况会被下一次判重拦住，不会重复开 run。
+- 投递判重不再依赖 state，也不再扫消息：**路径上没有任何大对象读取**。
+- 认领是先写后投，存在一个窄的"认领了但没投出去"窗口；靠 `DELETE` 撤回 + 10 分钟过期重投兜底。
+- `in_flight` 的 8 秒窗口意味着：两个任务在同一瞬间完成时，第二个不会单独开 run，
+  它的结果会由主管边界的注入送达（延迟一个 step，不丢）。
+- 认领表会长大：一行对应一次 `(task, run)` 投递，随任务数线性增长。当前没有清理任务；
+  需要时按 `claimed_at` 定期删旧行即可（删了最坏效果是"远古任务被重新投一次"）。
+- 认领行与 `Run` 没有外键：删线程不会级联清理认领行，理由同上。

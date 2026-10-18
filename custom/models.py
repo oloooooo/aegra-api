@@ -1,11 +1,15 @@
 from __future__ import annotations
 from typing import Optional
 
+from datetime import datetime
+
 from sqlalchemy import (
     Boolean,
+    DateTime,
     ForeignKey,
     String,
     false,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -85,3 +89,23 @@ class UserSpace(Base):
 
     def __repr__(self) -> str:
         return f"<UserSpace {self.identity!r} -> {self.space_name!r}>"
+
+class AsyncTaskDelivery(Base):
+    """后台任务结果的投递认领：跨进程/跨 run 的幂等键。
+
+    一行 = (task_id, run_id) 这次执行的结果**已经有权**投递给主管。主键即判重键：
+    `INSERT ... ON CONFLICT DO NOTHING` 抢到的那个调用方才有资格开投递 run 或注入消息。
+    `parent_thread_id` 用于同一父线程上的并发投递让路（短租约看 `claimed_at`）。
+    """
+
+    __tablename__ = "async_task_delivery"
+
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="异步任务 id（= 子线程 id）")
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="子 agent 本次执行的 run id")
+    parent_thread_id: Mapped[str] = mapped_column(String(64), index=True, comment="主管线程 id")
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), comment="认领时间，长于阈值视为过期可重投"
+    )
+
+    def __repr__(self) -> str:
+        return f"<AsyncTaskDelivery {self.task_id!r}/{self.run_id!r}>"

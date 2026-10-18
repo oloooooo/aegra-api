@@ -36,11 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import time
 from collections import deque
 from typing import Any
 
+import httpx
 import jwt
 import structlog
 from langchain.agents.middleware.types import AgentMiddleware
@@ -65,61 +65,8 @@ _RESUMABLE_KINDS: frozenset[str] = frozenset()
 # 父线程正忙：不插队，等父 run 结束后再确认一次"① 是否已经投递过"
 _RECHECK_DELAYS = (8, 20, 45)
 
-# 后台任务结果消息里的投递标记（与 graphs/async_task_guard.py 共用同一格式）
-_TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
-_RUN_ID_RE = re.compile(r"run_id: ([0-9a-zA-Z_-]+)")
-
 # 延迟复查的 task 需要留引用，否则可能被 GC（asyncio 只持弱引用）
 _RECHECK_TASKS: set[asyncio.Task[Any]] = set()
-
-# 投递的进程内串行化：两个子 agent 同时完成时，避免两边都在「state 还没有标记」
-# 的时间窗里各开一个 run。跨进程的同一窗口靠 state 标记兜（后到的那次会看到标记）。
-_DELIVERY_LOCK = asyncio.Lock()
-
-# 本进程已经投递过的 (父线程, task)：state 标记要等投递 run 落 checkpoint 才可见，
-# 这个集合补上"刚刚发出去"的那一段空白期。有界，重启即清空。
-_DELIVERED_LOCAL: set[tuple[str, str, str]] = set()  # (父线程, task_id, run_id)
-_DELIVERED_ORDER: deque[tuple[str, str, str]] = deque()
-_DELIVERED_MAX = 4096
-
-
-def _text_of(msg: Any) -> str:
-    """消息内容 → 纯文本（state 里既可能是 dict，也可能是消息对象）。"""
-    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    return str(content) if content is not None else ""
-
-
-def _already_delivered(snapshot: dict[str, Any], task_id: str, run_id: str) -> bool:
-    """父线程的 state 里是否已经有这个任务的**投递**记录（① 注入或本中间件回写）。
-
-    只认 `[Async subagent …` 开头的消息：派活工具消息同样带 `task_id:`，
-    不区分会把"待投递"误判成"已投递"。
-    """
-    values = (snapshot or {}).get("values") or {}
-    for msg in values.get("messages") or []:
-        text = _text_of(msg)
-        if not text.startswith("[Async subagent"):
-            continue
-        tasks = _TASK_ID_RE.findall(text)
-        runs = _RUN_ID_RE.findall(text)
-        if task_id in tasks and run_id in runs:
-            return True
-    return False
-
-
-def _remember_delivered(thread_id: str, task_id: str, run_id: str) -> None:
-    """记下本进程刚投递过的 (父线程, task, run)；有界，淘汰最旧。"""
-    key = (thread_id, task_id, run_id)
-    if key in _DELIVERED_LOCAL:
-        return
-    _DELIVERED_LOCAL.add(key)
-    _DELIVERED_ORDER.append(key)
-    while len(_DELIVERED_ORDER) > _DELIVERED_MAX:
-        _DELIVERED_LOCAL.discard(_DELIVERED_ORDER.popleft())
 
 
 def _interrupt_kinds(snapshot: dict[str, Any]) -> set[str]:
@@ -132,6 +79,27 @@ def _interrupt_kinds(snapshot: dict[str, Any]) -> set[str]:
         else:
             kinds.add("unknown")
     return kinds
+
+
+async def _claim_delivery(url: str, token: str, parent_thread_id: str, task_id: str, run_id: str) -> tuple[bool, str]:
+    """向服务端认领这次执行结果的投递权（跨进程幂等；见 custom/delivery_api.py）。"""
+    endpoint = f"{url.rstrip('/')}/custom/tasks/{task_id}/deliver-claim"
+    body = {"parent_thread_id": parent_thread_id, "run_id": run_id}
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(endpoint, json=body, headers=headers)
+        resp.raise_for_status()
+        payload = resp.json()
+    return bool(payload.get("claimed")), str(payload.get("reason") or "")
+
+
+async def _release_delivery(url: str, token: str, parent_thread_id: str, task_id: str, run_id: str) -> None:
+    """撤销认领：投递 run 没创建成功时调用，否则这次结果会被永久判为"已投递"。"""
+    endpoint = f"{url.rstrip('/')}/custom/tasks/{task_id}/deliver-claim"
+    params = {"parent_thread_id": parent_thread_id, "run_id": run_id}
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.delete(endpoint, params=params, headers=headers)
 
 
 def _mint_parent_token(identity: str) -> str:
@@ -233,7 +201,8 @@ class CompletionNotifierMiddleware(AgentMiddleware):
     async def _deliver(self, ctx: tuple[str, str, str, str, str, str, str], attempt: int = 1, recheck: int = 0) -> None:
         thread_id, assistant_id, identity, url, message, task_id, run_key = ctx
         try:
-            client = get_client(url=url, headers={"Authorization": f"Bearer {_mint_parent_token(identity)}"})
+            token = _mint_parent_token(identity)
+            client = get_client(url=url, headers={"Authorization": f"Bearer {token}"})
             status = await self._thread_status(client, thread_id)
 
             if status == "busy":
@@ -242,48 +211,56 @@ class CompletionNotifierMiddleware(AgentMiddleware):
             if status == "unknown":
                 raise RuntimeError("parent thread unreachable")
 
-            # 判重 + 创建放在同一把进程内锁里：多个子 agent 同时完成时，
-            # 后到的那个能看到前一个的本地认领，不会各开一个 run。
-            async with _DELIVERY_LOCK:
-                status = await self._thread_status(client, thread_id)  # 锁内复查，防止刚变忙
-                if status == "busy":
-                    self._defer(ctx, recheck)
-                    return
+            if status == "interrupted":
+                # 只在这一种情况下需要 state：要知道挂的是哪种中断（HITL 提问 vs 将来我们自己造的）
                 snapshot = await self._thread_state(client, thread_id)
-                if status == "interrupted":
-                    kinds = _interrupt_kinds(snapshot)
-                    if not (kinds & _RESUMABLE_KINDS):
-                        logger.info(
-                            "completion_notify_skipped_interrupted",
-                            parent_thread_id=thread_id,
-                            subagent=self.subagent_name,
-                            interrupt_kinds=sorted(kinds) or ["none"],
-                        )
-                        return
-                    # 白名单命中（目前为空）：将来做协作式挂起时走这里
-                    await client.runs.create(
-                        thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
-                    )
-                    _remember_delivered(thread_id, task_id, run_key)
-                    logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
-                    return
-                if (thread_id, task_id, run_key) in _DELIVERED_LOCAL or _already_delivered(
-                    snapshot, task_id, run_key
-                ):
+                kinds = _interrupt_kinds(snapshot)
+                if not (kinds & _RESUMABLE_KINDS):
                     logger.info(
-                        "completion_notify_skipped_delivered",
+                        "completion_notify_skipped_interrupted",
                         parent_thread_id=thread_id,
                         subagent=self.subagent_name,
-                        task_id=task_id,
+                        interrupt_kinds=sorted(kinds) or ["none"],
                     )
                     return
+                claimed, reason = await _claim_delivery(url, token, thread_id, task_id, run_key)
+                if not claimed:
+                    logger.info(
+                        "completion_notify_skipped_claim",
+                        parent_thread_id=thread_id,
+                        subagent=self.subagent_name,
+                        reason=reason,
+                    )
+                    return
+                # 白名单命中（目前为空）：将来做协作式挂起时走这里
+                await client.runs.create(
+                    thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
+                )
+                logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
+                return
 
+            # 跨进程认领：主键 (task_id, run_id)；同一线程刚有人认领时让路（in_flight），
+            # 这样不会出现两个投递 run 并发写同一线程。
+            claimed, reason = await _claim_delivery(url, token, thread_id, task_id, run_key)
+            if not claimed:
+                logger.info(
+                    "completion_notify_skipped_claim",
+                    parent_thread_id=thread_id,
+                    subagent=self.subagent_name,
+                    task_id=task_id,
+                    reason=reason,
+                )
+                return
+            try:
                 await client.runs.create(
                     thread_id=thread_id,
                     assistant_id=assistant_id,
                     input={"messages": [{"role": "user", "content": message}]},
                 )
-                _remember_delivered(thread_id, task_id, run_key)
+            except Exception:
+                # 没投出去就把认领撤掉，否则这次结果会被永久判为"已投递"
+                await _release_delivery(url, token, thread_id, task_id, run_key)
+                raise
             logger.info(
                 "completion_notify_sent",
                 parent_thread_id=thread_id,

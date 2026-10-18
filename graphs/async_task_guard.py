@@ -26,9 +26,11 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import structlog
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, ToolMessage
+from langgraph.config import get_config
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
@@ -331,6 +333,52 @@ class AsyncTaskGuard(AgentMiddleware):
         return f"{head}\n\n{_TASK_MARK}{task['task_id']}\nrun_id: {task.get('run_id') or ''}"
 
     @staticmethod
+    def _parent_thread_id() -> str:
+        try:
+            conf = (get_config() or {}).get("configurable") or {}
+        except RuntimeError:  # hook 在图外被触发（脚本/测试）
+            return ""
+        return str(conf.get("thread_id") or "")
+
+    def _claim_endpoint(self, task: dict[str, Any], parent_thread_id: str) -> tuple[str, dict[str, Any], dict[str, str]] | None:
+        """投递认领端点 + body + headers；缺信息时返回 None（不认领、也不阻断）。"""
+        spec = self._specs.get(task.get("agent_name", ""))
+        if not parent_thread_id or spec is None or not spec.get("url"):
+            return None
+        endpoint = f"{str(spec['url']).rstrip('/')}/custom/tasks/{task['task_id']}/deliver-claim"
+        body = {"parent_thread_id": parent_thread_id, "run_id": task.get("run_id")}
+        return endpoint, body, dict(spec.get("headers") or {})
+
+    def _claim_sync(self, task: dict[str, Any], parent_thread_id: str) -> bool | None:
+        """抢投递权：True 抢到 / False 别人抢到（或刚有别的任务在投） / None 无法判定。"""
+        req = self._claim_endpoint(task, parent_thread_id)
+        if req is None:
+            return None
+        endpoint, body, headers = req
+        try:
+            with httpx.Client(timeout=5) as client:
+                resp = client.post(endpoint, json=body, headers=headers)
+                resp.raise_for_status()
+                return bool(resp.json().get("claimed"))
+        except Exception:  # noqa: BLE001 — 认领服务不可用时不阻断投递（宁可多一条，不丢结果）
+            logger.warning("task_delivery_claim_failed", task_id=task.get("task_id"))
+            return None
+
+    async def _claim_async(self, task: dict[str, Any], parent_thread_id: str) -> bool | None:
+        req = self._claim_endpoint(task, parent_thread_id)
+        if req is None:
+            return None
+        endpoint, body, headers = req
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.post(endpoint, json=body, headers=headers)
+                resp.raise_for_status()
+                return bool(resp.json().get("claimed"))
+        except Exception:  # noqa: BLE001
+            logger.warning("task_delivery_claim_failed", task_id=task.get("task_id"))
+            return None
+
+    @staticmethod
     def _plan(
         state: Any, fresh: dict[str, str | None]
     ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
@@ -366,7 +414,13 @@ class AsyncTaskGuard(AgentMiddleware):
         tasks = (state or {}).get("async_tasks") or {}
         fresh = {tid: self._poll_sync(t) for tid, t in tasks.items() if t.get("status") not in _TERMINAL}
         changed, pending = self._plan(state, fresh)
-        texts = [self._completion_text(t, t["status"], self._summary_sync(t)) for t in pending]
+        parent = self._parent_thread_id()
+        texts: list[str] = []
+        for task in pending:
+            if self._claim_sync(task, parent) is False:  # 别人抢到了这次投递
+                logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
+                continue
+            texts.append(self._completion_text(task, task["status"], self._summary_sync(task)))
         return self._assemble(changed, texts)
 
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
@@ -376,8 +430,12 @@ class AsyncTaskGuard(AgentMiddleware):
             if task.get("status") not in _TERMINAL:
                 fresh[task_id] = await self._poll_async(task)
         changed, pending = self._plan(state, fresh)
+        parent = self._parent_thread_id()
         texts: list[str] = []
         for task in pending:
+            if await self._claim_async(task, parent) is False:  # 别人抢到了这次投递
+                logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
+                continue
             texts.append(self._completion_text(task, task["status"], await self._summary_async(task)))
         return self._assemble(changed, texts)
 

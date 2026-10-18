@@ -21,6 +21,10 @@ from graphs.async_task_guard import AsyncTaskGuard
 FAILS: list[str] = []
 
 
+async def _boom(**kwargs: object) -> dict:
+    raise RuntimeError("create failed")
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"{'✓' if ok else '✗'} {name}{'' if ok else f'  ← {detail}'}")
     if not ok:
@@ -54,10 +58,17 @@ class FakeClient:
         self.threads = FakeThreads(texts)
 
 
-def make_guard(statuses: dict[str, str], texts: dict[str, str]) -> tuple[AsyncTaskGuard, FakeClient]:
+def make_guard(
+    statuses: dict[str, str], texts: dict[str, str], claimed: bool = True
+) -> tuple[AsyncTaskGuard, FakeClient]:
     guard = AsyncTaskGuard({"cbam_reporting": {"url": "http://fake", "graph_id": "cbam_reporting"}})
     client = FakeClient(statuses, texts)
     guard._async_client = lambda spec: client  # type: ignore[method-assign]
+
+    async def claim(task: dict, parent: str) -> bool:
+        return claimed
+
+    guard._claim_async = claim  # type: ignore[method-assign]
     return guard, client
 
 
@@ -139,101 +150,122 @@ class FakeNotifierClient:
         self.runs = FakeRunCreate()
 
 
-def make_notifier(status: str, snapshot: dict) -> tuple[notifier_mod.CompletionNotifierMiddleware, FakeNotifierClient]:
+class FakeClaim:
+    """模拟服务端认领表：主键 (parent, task, run)，先到先得。"""
+
+    def __init__(self) -> None:
+        self.keys: set[tuple[str, str, str]] = set()
+        self.releases: list[tuple[str, str, str]] = []
+
+    async def claim(self, url: str, token: str, parent: str, task: str, run: str) -> tuple[bool, str]:
+        key = (parent, task, run)
+        if key in self.keys:
+            return False, "delivered"
+        self.keys.add(key)
+        return True, "claimed"
+
+    async def release(self, url: str, token: str, parent: str, task: str, run: str) -> None:
+        self.releases.append((parent, task, run))
+        self.keys.discard((parent, task, run))
+
+
+def make_notifier(
+    status: str,
+    snapshot: dict,
+    claims: FakeClaim | None = None,
+    run_key: str | None = None,
+) -> tuple[notifier_mod.CompletionNotifierMiddleware, FakeNotifierClient, FakeClaim]:
     mw = notifier_mod.CompletionNotifierMiddleware(subagent_name="cbam_reporting")
     mw.parent_thread_id = "parent"
     mw.parent_assistant_id = "supervisor"
     mw.parent_user_identity = "root"
     mw.notify_url = "http://fake"
+    if run_key is not None:
+        mw._run_key = lambda: run_key  # type: ignore[method-assign]
     client = FakeNotifierClient(status, snapshot)
+    claims = claims or FakeClaim()
     notifier_mod.get_client = lambda url, headers: client  # type: ignore[assignment]
     notifier_mod._mint_parent_token = lambda identity: "tok"  # type: ignore[assignment]
-    return mw, client
+    notifier_mod._claim_delivery = claims.claim  # type: ignore[assignment]
+    notifier_mod._release_delivery = claims.release  # type: ignore[assignment]
+    return mw, client, claims
 
 
 async def notifier_checks() -> None:
     # 1. 父线程 busy → 不插队
-    mw, client = make_notifier("busy", {})
+    mw, client, claims = make_notifier("busy", {})
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t1")
     check("busy → 不投递", client.runs.created == [])
+    check("busy → 不认领（让给主管侧注入）", claims.keys == set())
     check("busy → 安排了延迟复查", len(notifier_mod._RECHECK_TASKS) == 1)
     for t in list(notifier_mod._RECHECK_TASKS):
         t.cancel()
-    await asyncio.sleep(0)  # 让 done_callback 把已取消的任务从集合里摘掉
+    await asyncio.sleep(0)
     notifier_mod._RECHECK_TASKS.clear()
 
     # 2. interrupted（HITL 提问）→ 不碰
-    mw, client = make_notifier("interrupted", {"interrupts": [{"value": {"tool": "ask_user_question"}}]})
+    mw, client, claims = make_notifier("interrupted", {"interrupts": [{"value": {"tool": "ask_user_question"}}]})
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t2")
     check("interrupted(ask) → 不 resume 也不投递", client.runs.created == [])
     check("interrupted(ask) → 没有安排复查", len(notifier_mod._RECHECK_TASKS) == 0)
 
-    # 3. idle 且 state 里已有投递记录 → 跳过
-    delivered = "[Async subagent 'cbam_reporting' has completed] Result: 结果" + chr(10) * 2
-    delivered += "task_id: t3" + chr(10) + "run_id: unknown-run"
-    snapshot = {"values": {"messages": [{"type": "human", "content": delivered}]}}
-    mw, client = make_notifier("idle", snapshot)
+    # 3. 认领失败（别的路径已投递）→ 跳过
+    claims = FakeClaim()
+    claims.keys.add(("parent", "t3", "unknown-run"))
+    mw, client, _ = make_notifier("idle", {"values": {"messages": []}}, claims)
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t3")
-    check("已投递过 → 跳过", client.runs.created == [])
+    check("认领失败（已投递/在投）→ 跳过", client.runs.created == [])
 
-    # 4. idle 且没有投递记录 → 开新一轮投递
-    mw, client = make_notifier("idle", {"values": {"messages": []}})
+    # 4. idle 且认领成功 → 开新一轮投递
+    mw, client, claims = make_notifier("idle", {"values": {"messages": []}})
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t4")
-    check("idle 且未投递 → 投递一次", len(client.runs.created) == 1, str(client.runs.created))
+    check("idle 且抢到认领 → 投递一次", len(client.runs.created) == 1, str(client.runs.created))
     sent = (client.runs.created[0].get("input") or {}).get("messages", [{}])[0].get("content", "")
-    check("投递消息带 task_id 标记", "task_id: t4" in sent)
+    check("投递消息带 task_id / run_id 标记", "task_id: t4" in sent and "run_id: unknown-run" in sent)
 
-    # 4b. 派活工具消息里的 task_id 不算"已投递"（回归：曾因此永不投递）
-    notifier_mod._DELIVERED_LOCAL.clear()
-    notifier_mod._DELIVERED_ORDER.clear()
-    launch = {"values": {"messages": [{"type": "tool", "content": "Launched async subagent. task_id: t4"}]}}
-    mw, client = make_notifier("idle", launch)
-    await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t4")
-    check("派活消息不算已投递 → 仍会投递", len(client.runs.created) == 1, str(client.runs.created))
-
-    # 4c. 两个子 agent 同时完成（父线程 idle）：只允许开出 1 个投递 run
-    notifier_mod._DELIVERED_LOCAL.clear()
-    notifier_mod._DELIVERED_ORDER.clear()
-    mw_a, client_a = make_notifier("idle", {"values": {"messages": []}})
-    # 两个中间件共用同一个假客户端，模拟同一父线程上的两次并发投递
-    mw_b = notifier_mod.CompletionNotifierMiddleware(subagent_name="hybrid_bonding")
-    for attr in ("parent_thread_id", "parent_assistant_id", "parent_user_identity", "notify_url"):
-        setattr(mw_b, attr, getattr(mw_a, attr))
+    # 5. 两个不同任务并发完成 → 各投一次
+    shared = FakeClaim()
+    mw_a, client_a, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
+    mw_b, _, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
     notifier_mod.get_client = lambda url, headers: client_a  # type: ignore[assignment]
     await asyncio.gather(
         mw_a._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t6a"),
         mw_b._send_notification("[Async subagent 'hybrid_bonding' has completed] Result: B", "t6b"),
     )
-    check("并发完成：两个不同任务各投递一次", len(client_a.runs.created) == 2, str(len(client_a.runs.created)))
+    check("不同任务并发 → 各投递一次", len(client_a.runs.created) == 2, str(len(client_a.runs.created)))
 
-    # 4d. 同一个任务被并发投递两次（重投/双 hook）：只允许 1 个 run
-    notifier_mod._DELIVERED_LOCAL.clear()
-    notifier_mod._DELIVERED_ORDER.clear()
-    mw_c, client_c = make_notifier("idle", {"values": {"messages": []}})
-    mw_d = notifier_mod.CompletionNotifierMiddleware(subagent_name="cbam_reporting")
-    for attr in ("parent_thread_id", "parent_assistant_id", "parent_user_identity", "notify_url"):
-        setattr(mw_d, attr, getattr(mw_c, attr))
+    # 6. 同一任务并发投递两次 → 只投一次
+    shared = FakeClaim()
+    mw_c, client_c, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
+    mw_d, _, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
     notifier_mod.get_client = lambda url, headers: client_c  # type: ignore[assignment]
     await asyncio.gather(
         mw_c._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t7"),
         mw_d._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t7"),
     )
-    check("同一任务并发投递：只开 1 个 run", len(client_c.runs.created) == 1, str(len(client_c.runs.created)))
+    check("同一任务并发 → 只投一次", len(client_c.runs.created) == 1, str(len(client_c.runs.created)))
 
-    # 4e. update_async_task 后同一任务的新 run：新结果必须再投递一次
-    #     （判重键是 (task_id, run_id)，只认 task_id 会把更新后的结果吞掉）
-    notifier_mod._DELIVERED_LOCAL.clear()
-    notifier_mod._DELIVERED_ORDER.clear()
-    first = "[Async subagent 'cbam_reporting' has completed] Result: 旧结果" + chr(10) * 2
-    first += "task_id: t8" + chr(10) + "run_id: run-old"
-    mw, client = make_notifier("idle", {"values": {"messages": [{"type": "human", "content": first}]}})
-    old_snapshot = notifier_mod._already_delivered({"values": {"messages": [{"type": "human", "content": first}]}}, "t8", "run-old")
-    new_snapshot = notifier_mod._already_delivered({"values": {"messages": [{"type": "human", "content": first}]}}, "t8", "run-new")
-    check("旧的 run 已投递 → 判为已投递", old_snapshot is True)
-    check("同一任务的新 run → 判为未投递（会再投）", new_snapshot is False)
+    # 7. update_async_task 后的新 run → 新结果再投一次（判重键含 run_id）
+    shared = FakeClaim()
+    mw_e, client_e, _ = make_notifier("idle", {"values": {"messages": []}}, shared, run_key="run-old")
+    mw_f, _, _ = make_notifier("idle", {"values": {"messages": []}}, shared, run_key="run-new")
+    notifier_mod.get_client = lambda url, headers: client_e  # type: ignore[assignment]
+    await mw_e._send_notification("[Async subagent 'cbam_reporting' has completed] Result: 旧", "t8")
+    await mw_f._send_notification("[Async subagent 'cbam_reporting' has completed] Result: 新", "t8")
+    check("同一任务的新 run → 再投一次", len(client_e.runs.created) == 2, str(len(client_e.runs.created)))
 
-    # 5. 未知中断 → 不碰
-    mw, client = make_notifier("interrupted", {"interrupts": [{"value": {"kind": "some_future_thing"}}]})
+    # 8. 开 run 失败 → 撤销认领（否则这次结果会被永久判为已投递）
+    mw, client, claims = make_notifier("idle", {"values": {"messages": []}})
+    client.runs.create = _boom  # type: ignore[method-assign]
+    await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t9")
+    check(
+        "投递失败（重试 3 次）→ 每次都撤销认领，最终认领为空",
+        len(claims.releases) == 3 and claims.keys == set(),
+        f"{claims.releases!r} keys={claims.keys!r}",
+    )
+
+    # 9. 未知中断 → 不碰
+    mw, client, claims = make_notifier("interrupted", {"interrupts": [{"value": {"kind": "some_future_thing"}}]})
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t5")
     check("未知中断 → 不碰", client.runs.created == [])
 

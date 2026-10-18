@@ -92,9 +92,13 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 | `idle` / `error` | `CompletionNotifier` | 以父身份开新 run 投递 |
 
 **去重**：两条路的消息都以 `[Async subagent '<name>' …] Result: …` 开头（前端 `toView`
-靠此前缀识别成「子 agent 返回」），结尾带 `task_id: <id>` 与 `run_id: <id>`；判重键是
-**(task_id, run_id)** —— `update_async_task` 会给同一任务开新 run，只认 task_id 会吞掉更新后的结果。
-投递前先查父线程 state 是否已有该二元组。主管侧从 `state.messages` 查（零成本），中间件查 `GET /threads/{tid}/state`
+靠此前缀识别成「子 agent 返回」），结尾带 `task_id: <id>` 与 `run_id: <id>`。
+
+判重放在数据库而不是 state：`async_task_delivery(task_id, run_id)`（主键即判重键），
+接口 `POST /custom/tasks/{task_id}/deliver-claim` 抢认领，`DELETE` 撤回
+（`custom/delivery_api.py`）。这样跨进程原子，也不需要为了查一个标记把整份 messages 读回来。
+只有认领成功的一方才投递；投递 run 创建失败会撤回认领。判重键含 `run_id`，因为
+`update_async_task` 会给同一任务开新 run，只认 task_id 会吞掉更新后的结果。主管侧从 `state.messages` 查（零成本），中间件查 `GET /threads/{tid}/state`
 （仅在投递尝试时）。
 
 **成本**：guard 每次模型调用最多 3 次 `runs.get`（带 5s TTL；工具路径原本就会核实状态）；
@@ -104,11 +108,11 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 **并发与幂等**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md)）：
 
 - 同一轮里多个任务同时终态 → 一次 `before_model` 合并成一条 state 更新，天然幂等。
-- 多个子 agent 同时收尾而主管**正忙** → 全部交给 ①，notifier 不生成 run。
-- 多个子 agent 同时收尾而主管**空闲** → 「判重 + 创建」在进程内锁里串行，并用
-  `(父线程, task)` 的本地认领补上「刚发出、state 尚未落 checkpoint」的空白期；
-  跨进程仍有窄窗口（可能多答一次，不丢结果）。
-- `runs.create` 没有幂等键，因此重试前一律重新读状态 + state —— 「超时但其实已成功」会被判重拦住。
+- 多个子 agent 同时收尾而主管**正忙** → 全部交给 ①，notifier 不认领、不生成 run。
+- 多个子 agent 同时收尾而主管**空闲** → 第一个抢到认领并开 run；8 秒内后到的拿到
+  `in_flight` 直接放弃，由主管边界的注入兜住（同一时刻最多一个投递 run）。
+- 同一任务被重试/双 hook 投递 → 第二次拿到 `delivered`，只投一次。
+- `runs.create` 没有幂等键：创建失败会先撤回认领再重试，不会留下"已认领但没投"的死行。
 
 **仍存在的空隙**：子 agent 恰好在主管生成最终答案的那一刻完成时，那一轮答不到，会由
 `idle` 路径补一轮（用户看到先答一版、再补一段）。消除它只能硬杀主管的 run（丢当前步骤 +

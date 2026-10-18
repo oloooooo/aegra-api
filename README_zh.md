@@ -278,9 +278,10 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | `interrupted`（图在等某个 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，主管恢复后的下一轮由 guard 自动补上 |
 | `idle` / `error`（主管已经答完） | `CompletionNotifier`（子 agent 侧） | 用父身份开一轮新 run 投递（就是上一轮对话里看到的那条「子 agent 返回」） |
 
-两条路不重复：消息末尾都带 `task_id: <id>` 与 `run_id: <id>`，判重键是 **(task_id, run_id)**，
-投递前先查父线程 state 里有没有这个标记；已有就跳过。用二元组是因为 `update_async_task`
-会给同一任务开新 run，只认 task_id 会把更新后的第二次结果当成重复丢掉。同一个 task 只处理一次，主 prompt 也要求模型对重复通知只更新 todo。
+两条路不重复：投递前先向服务端**认领** `(task_id, run_id)`（`async_task_delivery` 表，
+接口 `POST /custom/tasks/{id}/deliver-claim`），只有抢到的那方才有资格投递；投递 run 创建失败会撤回认领。
+判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run，只认 task_id 会把更新后的第二次结果当成重复丢掉。
+用表而不是读 state 判重，是因为跨进程才原子，而且不用为了查一个标记把整份对话读回来。同一个 task 只处理一次，主 prompt 也要求模型对重复通知只更新 todo。
 
 ### 多个子任务同时完成会怎样
 
@@ -288,8 +289,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 |---|---|
 | 同一轮里几个任务一起完成，主管正在跑 | 它们在**一次**状态更新里合并注入，各一条消息，不多跑一轮模型 |
 | 几个子 agent 几乎同时收尾，主管正忙 | 全部交给主管侧注入，notifier 全程不创建 run |
-| 几个子 agent 几乎同时收尾，主管空闲 | “判重 + 建 run” 在进程内串行，并用 `(线程, task)` 本地认领补上空白期；单进程部署下确定只投一次 |
-| 同上，但分属不同 worker 进程 | 极窄的重复窗口：可能多开一个 run、用户看到两段返回（不会丢结果）；详见 [adr/0010](./docs/adr/0010-task-delivery-idempotency.md) |
+| 几个子 agent 几乎同时收尾，主管空闲 | 第一个抢到认领并开 run；8 秒内后到的拿到 `in_flight` 直接让路，结果由主管边界的注入送达（同一时刻最多一个投递 run，跨 worker 也成立） |
 
 子 agent 自身不受影响：每个任务在自己的线程里独立执行，同时完成只是把结果一起排队送到主管。
 
