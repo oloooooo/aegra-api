@@ -4,16 +4,17 @@ from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.middleware import FilesystemPermission
 import dotenv
 import os
-import time
 
 from pathlib import Path
 
-import jwt
 import structlog
 
 from graphs.llms import model
 from pydantic import BaseModel
 
+# 服务身份的 token 只在 custom/services.py 铸造（单一来源）。
+# 导入不读 env，真正的读取发生在下方 service_token() 调用时（已在 load_dotenv 之后）。
+from custom.services import service_token
 dotenv.load_dotenv()
 
 
@@ -72,17 +73,9 @@ async def get_user_data(
 okf_dir = str(Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf"))
 
 # 静态服务 token：subagent 的 runs.create 不带终端用户 JWT（deepagents 不转发），
-# 构建期用 JWT_SECRET 铸一枚长期 token，custom_auth.py 对该 identity 免 DB 直接放行。
-# shortcut: 10 年有效、与服务同生共死；要轮换时改 env 或改成启动时铸造。
-_service_token = jwt.encode(
-    {
-        "sub": os.environ.get("SERVICE_IDENTITY", "subagent_service"),
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 10 * 365 * 24 * 3600,
-    },
-    os.environ["JWT_SECRET"],
-    algorithm="HS256",
-)
+# 用服务身份的长效 token（铸造在 custom/services.py::service_token，单一来源）；
+# custom_auth.py 对该 identity 免 DB 直接放行。
+_service_token = service_token()
 
 # 领域子 agent：(agent 名 = graph_id, 绑定 space, 描述)。
 # space 经拦截层单发给子 agent（guard._config_for），用户没有该 space 权限时

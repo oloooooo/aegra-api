@@ -42,35 +42,70 @@ router = APIRouter(prefix="/custom", tags=["/custom"])
 
 _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_GRAPH_IDS_CACHE: dict[str, tuple[int, list[str]]] = {}
+
+# 客户端缓存：同一 (base_url, token) 复用，避免每请求新建连接池。
+# shortcut: 超过上限时丢弃最旧条目但不显式 aclose()，连接由 GC 回收；
+#           并发用户数远大于 8 时才需要改成带关闭的 LRU。
+_CLIENTS: dict[tuple[str, str], Any] = {}
+_CLIENT_CACHE_MAX = 8
 
 
 # ---------- 工具 ----------
 
 
 def _graph_ids() -> list[str]:
-    """aegra.json 里注册的图（启动时读的那份配置）。"""
+    """aegra.json 里注册的图（启动时读的那份配置）。
+
+    按 mtime 缓存：配置改了（通常需重启）不必每请求重读；配置坏了要留痕，
+    不能静默变成空列表——前端会以为「没有可用助手」。
+    """
     cfg = _PROJECT_ROOT / os.environ.get("AEGRA_CONFIG", "aegra.json")
     try:
-        return sorted(json.loads(cfg.read_text(encoding="utf-8")).get("graphs", {}))
-    except (OSError, ValueError):
-        logger.warning("aegra_config_unreadable", path=str(cfg))
+        mtime = cfg.stat().st_mtime_ns
+    except OSError:
+        logger.warning("aegra_config_missing", path=str(cfg))
         return []
+    cached = _GRAPH_IDS_CACHE.get("v")
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("aegra_config_unreadable", path=str(cfg), error=str(e))
+        return []
+    graphs = data.get("graphs")
+    if not isinstance(graphs, dict) or not graphs:
+        logger.warning("aegra_config_no_graphs", path=str(cfg), keys=sorted(data))
+        return []
+    ids = sorted(graphs)
+    _GRAPH_IDS_CACHE["v"] = (mtime, ids)
+    return ids
 
 
-def _service_client(request: Request):
+def _client(request: Request, token: str) -> Any:
+    """按 (base_url, token) 复用 SDK 客户端；token 相同即同一身份，可安全共享。"""
+    key = (str(request.base_url).rstrip("/"), token)
+    client = _CLIENTS.get(key)
+    if client is None:
+        if len(_CLIENTS) >= _CLIENT_CACHE_MAX:
+            _CLIENTS.pop(next(iter(_CLIENTS)))
+        client = get_client(url=key[0], headers={"Authorization": f"Bearer {token}"})
+        _CLIENTS[key] = client
+    return client
+
+
+def _service_client(request: Request) -> Any:
     """服务身份客户端（能读子 agent 的线程）。"""
-    return get_client(
-        url=str(request.base_url).rstrip("/"),
-        headers={"Authorization": f"Bearer {service_token()}"},
-    )
+    return _client(request, service_token())
 
 
-async def _user_client(request: Request):
+def _user_client(request: Request) -> Any:
     """用户身份客户端：借它走原生接口，顺带享受 ownership 校验。"""
-    auth = request.headers.get("authorization", "")
-    if not auth:
+    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+    if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="缺少令牌")
-    return get_client(url=str(request.base_url).rstrip("/"), headers={"Authorization": auth})
+    return _client(request, token)
 
 
 async def _own_space_names(session: AsyncSession, user: User) -> set[str]:
@@ -88,7 +123,7 @@ async def _parent_state(client: Any, thread_id: str) -> dict[str, Any]:
 
 async def _authorized_task(request: Request, task_id: str, parent_thread_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """校验 task 属于该用户的这个父线程，返回 (task, 父 state)。"""
-    client = await _user_client(request)
+    client = _user_client(request)
     state = await _parent_state(client, parent_thread_id)  # 原生接口自带 ownership 校验
     task = (state.get("async_tasks") or {}).get(task_id)
     if not task:
