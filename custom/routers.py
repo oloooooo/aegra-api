@@ -3,6 +3,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 from aegra_api.models.auth import User
@@ -39,13 +40,18 @@ async def register(
     if await repo.exists(body.identity):
         raise HTTPException(status_code=409, detail="账号名已存在")
     hashed = _hash_password(body.password)
-    user = await repo.create(
-        identity=body.identity,
-        display_name=body.display_name,
-        hashed_password=hashed,
-        email=body.email,
-        org_id=body.org_id,
-    )
+    try:
+        user = await repo.create(
+            identity=body.identity,
+            display_name=body.display_name,
+            hashed_password=hashed,
+            email=body.email,
+            org_id=body.org_id,
+        )
+    except IntegrityError:
+        # exists() 与 create() 之间是 TOCTOU：并发注册同名会撞主键，归一成 409 而不是 500
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="账号名已存在") from None
     return RegisterResponse(user_identity=user.identity)
 
 

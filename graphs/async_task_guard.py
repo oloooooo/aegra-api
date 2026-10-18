@@ -19,6 +19,8 @@ check/cancel/list 不创建 run，直接放行给内置 handler。
 
 from __future__ import annotations
 
+import threading
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -53,6 +55,11 @@ class AsyncTaskGuard(AgentMiddleware):
         self._assistant_id = assistant_id
         self._sync: dict[tuple, SyncLangGraphClient] = {}
         self._async: dict[tuple, LangGraphClient] = {}
+        # 并发派活的原子占位：ToolNode 对同一批 tool_call 用 gather / 线程池并发执行，
+        # state 在整批执行完才落盘，所以两个并发 start 会看到同一份旧 state 而双双放行。
+        # 这里用一个进程内 ledger 记「已预留但尚未写进 state」的任务，锁内判上限+占位。
+        self._mu = threading.Lock()
+        self._ledger: dict[str, dict[str, dict[str, Any]]] = {}
 
     # ---------- 客户端（按 url+headers 缓存，与 deepagents _ClientCache 同键） ----------
 
@@ -99,17 +106,61 @@ class AsyncTaskGuard(AgentMiddleware):
         )
 
     def _start_args(
-        self, request: ToolCallRequest, refreshed: dict[str, dict[str, Any]]
+        self, request: ToolCallRequest, refreshed: dict[str, dict[str, Any]], parent: str
     ) -> tuple[dict[str, Any] | None, str | None]:
-        """返回 (spec, error_msg)。refreshed 是刚核实过的任务状态（覆盖 state 里的）。"""
+        """返回 (spec, error_msg)。refreshed 是刚核实过的任务状态（覆盖 state 里的）。
+
+        调用方必须持 ``self._mu``。计数 = state + 核实结果 + 本进程已预留的任务。
+        """
         args = request.tool_call.get("args") or {}
         agent_type = args.get("subagent_type", "")
         if err := self._validate(agent_type):
             return None, err
-        tasks = {**((request.state or {}).get("async_tasks") or {}), **refreshed}
+        state_tasks: dict[str, Any] = (request.state or {}).get("async_tasks") or {}
+        ledger = self._ledger.setdefault(parent, {})
+        # ledger 已被 state 记账（或已终态）的条目退位，state 为准
+        for tid in [t for t in ledger if t in state_tasks or ledger[t].get("status") in _TERMINAL]:
+            ledger.pop(tid, None)
+        tasks = {**state_tasks, **refreshed, **ledger}
         if self._active_count({"async_tasks": tasks}) >= MAX_ACTIVE_TASKS:
             return None, self._over_limit(request.state)
         return self._specs[agent_type], None
+
+    def _parent_key(self, request: ToolCallRequest) -> str:
+        conf = (request.runtime.config or {}).get("configurable") or {}
+        return str(conf.get("thread_id") or "local")
+
+    def _reserve(
+        self, request: ToolCallRequest, refreshed: dict[str, dict[str, Any]], parent: str
+    ) -> tuple[dict[str, Any] | None, str | None, str | None]:
+        """锁内完成「判上限 + 占位」，返回 (spec, 占位 key, 错误)。
+
+        锁内不能有 await：并发来自 asyncio gather 与 ToolNode 的线程池两条路，
+        所以用 threading.Lock；网络创建放在锁外，靠占位保证名额不被重复使用。
+        """
+        with self._mu:
+            spec, err = self._start_args(request, refreshed, parent)
+            if err:
+                return None, None, err
+            assert spec is not None
+            key = f"pending-{uuid.uuid4()}"
+            self._ledger.setdefault(parent, {})[key] = {
+                "task_id": key,
+                "agent_name": spec_name(spec, self._specs),
+                "status": "pending",
+                "created_at": _now(),
+            }
+            return spec, key, None
+
+    def _settle(self, parent: str, key: str, task: dict[str, Any] | None = None) -> None:
+        """创建成功后用真实任务替掉占位；失败则直接退位（名额释放）。"""
+        with self._mu:
+            ledger = self._ledger.get(parent)
+            if ledger is None:
+                return
+            ledger.pop(key, None)
+            if task is not None:
+                ledger[task["task_id"]] = task
 
     # ---------- 状态核实（防僵尸 running 卡死名额） ----------
 
@@ -237,14 +288,16 @@ class AsyncTaskGuard(AgentMiddleware):
         )
 
     def _start_sync(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
+        parent = self._parent_key(request)
         refreshed = self._refreshed_sync(request)
-        spec, err = self._start_args(request, refreshed)
+        spec, reserve, err = self._reserve(request, refreshed, parent)
         if err:
             return self._err(request, err)
-        assert spec is not None
+        assert spec is not None and reserve is not None
         args = request.tool_call.get("args") or {}
         config, err = self._config_for(request, spec)
         if err:
+            self._settle(parent, reserve)
             return self._err(request, err)
         client = self._sync_client(spec)
         try:
@@ -258,21 +311,24 @@ class AsyncTaskGuard(AgentMiddleware):
                 config=config,
             )
         except Exception as e:  # noqa: BLE001 — SDK 异常无类型，回给模型
+            self._settle(parent, reserve)
             logger.warning("failed_to_launch_async_subagent", error=str(e))
             return self._err(request, f"Failed to launch async subagent: {e}")
-        return self._launched(
-            request, self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"]), refreshed
-        )
+        task = self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"])
+        self._settle(parent, reserve, task)
+        return self._launched(request, task, refreshed)
 
     async def _astart(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
+        parent = self._parent_key(request)
         refreshed = await self._refreshed_async(request)
-        spec, err = self._start_args(request, refreshed)
+        spec, reserve, err = self._reserve(request, refreshed, parent)
         if err:
             return self._err(request, err)
-        assert spec is not None
+        assert spec is not None and reserve is not None
         args = request.tool_call.get("args") or {}
         config, err = self._config_for(request, spec)
         if err:
+            self._settle(parent, reserve)
             return self._err(request, err)
         client = self._async_client(spec)
         try:
@@ -286,11 +342,12 @@ class AsyncTaskGuard(AgentMiddleware):
                 config=config,
             )
         except Exception as e:  # noqa: BLE001
+            self._settle(parent, reserve)
             logger.warning("failed_to_launch_async_subagent", error=str(e))
             return self._err(request, f"Failed to launch async subagent: {e}")
-        return self._launched(
-            request, self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"]), refreshed
-        )
+        task = self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"])
+        self._settle(parent, reserve, task)
+        return self._launched(request, task, refreshed)
 
     # ---------- update（新 run 同样要带 config，否则子 agent 中途丢 spaces） ----------
 

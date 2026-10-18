@@ -2,6 +2,7 @@ from typing import Optional
 
 from openai import organization
 from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from custom.models import Space, UserSpace, UserTables
@@ -77,10 +78,15 @@ class SpaceRepository:
         return list((await self.session.execute(stmt)).scalars())
 
     async def create(self, name: str, path: str) -> Space:
-        space = Space(name=name, path=path)
-        self.session.add(space)
+        """幂等创建：同名已存在时直接返回既有行（不抛 IntegrityError）。"""
+        await self.session.execute(
+            pg_insert(Space)
+            .values(name=name, path=path)
+            .on_conflict_do_nothing(index_elements=[Space.name])
+        )
         await self.session.commit()
-        await self.session.refresh(space)
+        space = await self.get(name)
+        assert space is not None
         return space
 
     async def update_path(self, name: str, path: str) -> bool:
@@ -132,10 +138,15 @@ class UserSpaceRepository:
         return list((await self.session.execute(stmt)).scalars())
 
     async def create(self, identity: str, space_name: str) -> UserSpace:
-        link = UserSpace(identity=identity, space_name=space_name)
-        self.session.add(link)
+        """幂等分配：已关联时返回既有行，重复调用不报错。"""
+        await self.session.execute(
+            pg_insert(UserSpace)
+            .values(identity=identity, space_name=space_name)
+            .on_conflict_do_nothing()
+        )
         await self.session.commit()
-        await self.session.refresh(link)
+        link = await self.get(identity, space_name)
+        assert link is not None
         return link
 
     async def delete(self, identity: str, space_name: str) -> bool:

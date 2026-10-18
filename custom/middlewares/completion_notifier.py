@@ -34,8 +34,10 @@ hook 内用 ``get_config()`` 读到它们后：
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
+from collections import deque
 from typing import Any
 
 import jwt
@@ -49,6 +51,13 @@ logger = structlog.getLogger(__name__)
 
 # 短时父 token 有效期：只够完成一次回写，越短泄露面越小（ADR-0005）
 _PARENT_TOKEN_TTL = 300
+
+# 去重集合的上限：只增不减会随进程寿命缓慢涨；淘汰最旧，最坏多一次重复通知
+_NOTIFIED_MAX = 4096
+
+
+class _ParentBusy(Exception):
+    """父线程正忙：让回写走退避重试，而不是与用户 run 并发写同一线程。"""
 
 
 def _mint_parent_token(identity: str) -> str:
@@ -88,6 +97,8 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         # 按 run_id 去重：静态图的 middleware 实例在同 worker 内被并发 run 共享，
         # 用 set 而非 bool 位，避免一个 run 的完成把另一个 run 的通知吞掉。
         self._notified_runs: set[str] = set()
+        # 插入顺序，配合 set 做有界淘汰
+        self._notified_order: deque[str] = deque()
 
     # ---------- 解析父上下文（config 优先，构造值回退） ----------
 
@@ -128,33 +139,73 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         if parent is None:
             return
         run_key = self._run_key()
-        if run_key in self._notified_runs:
+        if not self._mark_once(run_key):
             return
-        self._notified_runs.add(run_key)
 
         thread_id, assistant_id, identity, url = parent
+        for attempt in (1, 2, 3):
+            try:
+                token = _mint_parent_token(identity)
+                client = get_client(url=url, headers={"Authorization": f"Bearer {token}"})
+                # 父线程正在跑另一个 run 时不硬撞（aegra 不拦并发写），等它空闲再唤醒
+                if await self._parent_busy(client, thread_id):
+                    raise _ParentBusy(thread_id)
+                await client.runs.create(
+                    thread_id=thread_id,
+                    assistant_id=assistant_id,
+                    input={"messages": [{"role": "user", "content": message}]},
+                )
+                logger.info(
+                    "completion_notify_sent",
+                    parent_thread_id=thread_id,
+                    subagent=self.subagent_name,
+                    run_key=run_key,
+                    attempt=attempt,
+                )
+                return
+            except Exception as e:  # noqa: BLE001 —— 通知是尽力而为，失败要留痕不能吞
+                if attempt == 3:
+                    # 放弃时释放占位，让后续 hook（同一 run 的其它阶段）还能重试
+                    self._notified_runs.discard(run_key)
+                    logger.warning(
+                        "completion_notify_failed",
+                        parent_thread_id=thread_id,
+                        subagent=self.subagent_name,
+                        error=str(e),
+                        attempt=attempt,
+                        exc_info=True,
+                    )
+                    return
+                logger.info(
+                    "completion_notify_retry",
+                    parent_thread_id=thread_id,
+                    subagent=self.subagent_name,
+                    attempt=attempt,
+                    error=str(e),
+                )
+                await asyncio.sleep(0.5 * attempt)
+
+    @staticmethod
+    async def _parent_busy(client: Any, thread_id: str) -> bool:
+        """父线程是否正在跑别的 run（aegra 对非 interrupt 策略不拦并发写）。"""
         try:
-            token = _mint_parent_token(identity)
-            client = get_client(url=url, headers={"Authorization": f"Bearer {token}"})
-            await client.runs.create(
-                thread_id=thread_id,
-                assistant_id=assistant_id,
-                input={"messages": [{"role": "user", "content": message}]},
-            )
-            logger.info(
-                "completion_notify_sent",
-                parent_thread_id=thread_id,
-                subagent=self.subagent_name,
-                run_key=run_key,
-            )
-        except Exception as e:  # noqa: BLE001 —— 通知是尽力而为，失败要留痕不能吞
-            logger.warning(
-                "completion_notify_failed",
-                parent_thread_id=thread_id,
-                subagent=self.subagent_name,
-                error=str(e),
-                exc_info=True,
-            )
+            state = await client.threads.get(thread_id)
+        except Exception:  # noqa: BLE001 —— 查不到就不阻塞通知
+            return False
+        return str(state.get("status") or "") == "busy"
+
+    def _mark_once(self, run_key: str) -> bool:
+        """首次见到这个 run_key 返回 True；重复返回 False。
+
+        去重集合保量：超过上限时按插入顺序淘汰最旧（最坏情况多一次重复通知）。
+        """
+        if run_key in self._notified_runs:
+            return False
+        self._notified_runs.add(run_key)
+        self._notified_order.append(run_key)
+        while len(self._notified_order) > _NOTIFIED_MAX:
+            self._notified_runs.discard(self._notified_order.popleft())
+        return True
 
     # ---------- hooks ----------
 

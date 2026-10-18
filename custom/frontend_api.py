@@ -228,13 +228,11 @@ async def remove_space_user(
     session: Annotated[AsyncSession, Depends(get_session)],
     user: Annotated[User, Depends(require_auth)],
 ) -> dict[str, Any]:
-    """把用户移出空间（仅超级用户）。"""
+    """把用户移出空间（仅超级用户）。幂等：本来就不在也算成功（existed=false）。"""
     if "write" not in (user.permissions or []):
         raise HTTPException(status_code=403, detail="只有超级用户可以分配空间")
-    ok = await UserSpaceRepository(session).delete(identity, space_name)
-    if not ok:
-        raise HTTPException(status_code=404, detail="该用户不在这个空间里")
-    return {"space": space_name, "removed": identity}
+    existed = await UserSpaceRepository(session).delete(identity, space_name)
+    return {"space": space_name, "removed": identity, "existed": existed}
 
 
 # ---------- 异步子任务 ----------
