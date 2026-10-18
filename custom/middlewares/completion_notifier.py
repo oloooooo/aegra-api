@@ -72,8 +72,10 @@ _NOTIFIED_MAX = 4096
 # 将来做"协作式挂起"时，把那种中断的 kind 加进来即可。
 _RESUMABLE_KINDS: frozenset[str] = frozenset()
 
-# 父线程正忙：不插队，等父 run 结束后再确认一次"① 是否已经投递过"
-_RECHECK_DELAYS = (8, 20, 45)
+# 父线程正忙：不插队，等父 run 结束后再确认一次"① 是否已经投递过"。
+# 这组延迟之和（35s）+ 重试（约 3s）必须小于 custom/delivery_api.py 的 _STALE_SECONDS，
+# 否则正常投递过的结果会在复查时被当成"认领过期"再投一次。
+_RECHECK_DELAYS = (5, 10, 20)
 
 # 延迟复查的 task 需要留引用，否则可能被 GC（asyncio 只持弱引用）
 _RECHECK_TASKS: set[asyncio.Task[Any]] = set()

@@ -38,8 +38,13 @@ router = APIRouter(prefix="/custom", tags=["custom"])
 # - 同线程让路窗口（`_IN_FLIGHT_SECONDS`）：刚认领的任务说明它的投递 run 正在创建，
 #   此时再开第二个会并发写同一线程；
 # - 过期重投（`_STALE_SECONDS`）：认领后进程崩溃导致没真投出去，过了这个时间允许重投。
+#
+# 不变式：`_STALE_SECONDS` 必须大于「一次正常投递可能占用的全部时间」——即 notifier 的
+# 重试（0.5+1+1.5s）+ 延迟复查（5+10+20s，见 completion_notifier._RECHECK_DELAYS）
+# ≈ 38s。否则同一任务会被正常投完一次之后又因"过期"再投一次。
+# 真正的投递动作（插认领 + 建 run）是毫秒级，90s 已留足余量；崩溃场景下最多损失 90s。
 _IN_FLIGHT_SECONDS = 8
-_STALE_SECONDS = 600
+_STALE_SECONDS = 90
 
 
 async def _authorize_thread(session: AsyncSession, thread_id: str, user: User) -> None:

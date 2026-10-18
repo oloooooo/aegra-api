@@ -87,7 +87,7 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 
 | 父线程当时 | 谁投递 | 行为 |
 |---|---|---|
-| `busy` | 主管侧 guard | 注入一条带 `task_id:` 标记的消息；不打断、不开新 run。子 agent 侧只安排延迟复查（8s/20s/45s）兜住「主管正好在收尾」 |
+| `busy` | 主管侧 guard | 注入一条带 `task_id:` 标记的消息；不打断、不开新 run。子 agent 侧只安排延迟复查（5s/10s/20s）兜住「主管正好在收尾」 |
 | `interrupted` | 谁都不动 | 硬 resume 会把用户正等着回答的答案顶掉（同 §9 #1）；用户答完后下一轮 guard 自动补上。白名单 `_RESUMABLE_KINDS` 为空，将来做协作式挂起时再加 |
 | `idle` / `error` | `CompletionNotifier` | 以父身份开新 run 投递 |
 
@@ -312,7 +312,7 @@ supervisor = create_deep_agent(
 7. **任务投递的三个边界**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md#consequences)）：
    同线程 8 秒 `in_flight` 窗口内后到的任务不开 run、改由主管边界注入（延迟一个 step，不丢）；
    认领行随任务数线性增长且当前没有清理任务（按 `claimed_at` 定期删旧行即可）；
-   认领后崩溃时该结果 10 分钟内不投（过期后允许重投）。
+   认领后崩溃时该结果 90 秒内不投（过期后允许重投）。
 
 ## 10. 测试清单（e2e，真 PG）
 

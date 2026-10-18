@@ -39,8 +39,8 @@ DELETE /custom/tasks/{task_id}/deliver-claim?parent_thread_id=&run_id=
 
 | 情况 | 结果 | 调用方该做什么 |
 |---|---|---|
-| 主键已存在且 `claimed_at` 在 10 分钟内 | `delivered` | 跳过——这次执行的结果已经投过 |
-| 主键已存在但超过 10 分钟（认领后进程死掉、没真投出去） | `reclaimed`，刷新时间 | 照常投递 |
+| 主键已存在且 `claimed_at` 在 90 秒内 | `delivered` | 跳过——这次执行的结果已经投过 |
+| 主键已存在但超过 90 秒（认领后进程死掉、没真投出去） | `reclaimed`，刷新时间 | 照常投递 |
 | 同线程上 8 秒内已有别的任务认领 | `in_flight` | 跳过——它的投递 run 正在路上；主管边界的注入会兜住本次结果 |
 | 其它 | `claimed`，插入一行 | 去投递；**投递 run 创建失败时调 `DELETE` 撤回认领** |
 
@@ -61,6 +61,13 @@ DELETE /custom/tasks/{task_id}/deliver-claim?parent_thread_id=&run_id=
 | 同一任务被重试/双 hook 投递 | 第二次拿到 `delivered` | 只投一次 |
 | `update_async_task` 后的新 run | 新 `run_id` → 新主键 → 再投一次 | 有意为之 |
 
+### 过期窗口为什么是 90 秒
+
+`_STALE_SECONDS` 必须大于「一次正常投递可能占用的全部时间」，否则正常投过的结果会在
+notifier 的延迟复查里被当成"认领过期"再投一次。当前上界是：
+重试 `0.5+1+1.5s` + 延迟复查 `5+10+20s` ≈ 38 秒；实际的投递动作（插认领 + 建 run）
+是毫秒级，90 秒留了 2 倍余量。崩溃场景下最多损失 90 秒。
+
 ## Considered Options
 
 - **只靠 state 消息标记**（原实现）：零新表，但每次判重读整份 state，且跨进程不原子。
@@ -75,7 +82,7 @@ DELETE /custom/tasks/{task_id}/deliver-claim?parent_thread_id=&run_id=
 
 - 投递判重不再依赖 state，也不再扫消息：**路径上没有任何大对象读取**。
 - 认领是先写后投：进程在"认领成功"与"run 创建成功"之间崩溃时，这次结果会被判为已投递，
-  **10 分钟内不会被投出去**（`claimed_at` 过期后允许 `reclaimed` 重投）；正常路径下
+  **90 秒内不会被投出去**（`claimed_at` 过期后允许 `reclaimed` 重投）；正常路径下
   创建失败会先 `DELETE` 撤回，不留死行。
 - `in_flight` 的 8 秒窗口意味着：两个任务在同一瞬间完成时，第二个不会单独开 run，
   它的结果会由主管边界的注入送达（延迟一个 step，不丢）。
