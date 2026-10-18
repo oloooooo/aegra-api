@@ -25,11 +25,10 @@ from langchain.tools import InjectedToolArg, tool, ToolRuntime
 from langgraph.graph.state import RunnableConfig
 from graphs.async_task_guard import AsyncTaskGuard
 from graphs.space_backend import SpaceBackend
-from graphs.xlsx_tools import XLSX_TOOLS
+from graphs.prompts import MAIN_SYSTEM_PROMPT, XLSX_SUBAGENT_DESCRIPTION
+from graphs.tools import MAIN_TOOLS
 
 logger = structlog.getLogger(__name__)
-
-import src.aegra_api.models
 
 
 @tool(
@@ -81,19 +80,16 @@ _service_token = jwt.encode(
 
 _xlsx_spec = AsyncSubAgent(  # pyright: ignore[reportCallIssue]
     name="xlsx_process",
-    description=(
-        "查 xlsx 表格的专用 agent，跑在后台。任何关于表格内容的问题（有哪些 sheet/列、"
-        "按条件筛行、全表找关键词、空值重复值画像）都交给它；路径用 /空间名/文件.xlsx "
-        "这样的虚拟路径。用 start_async_task 派活，需要结果时用 check_async_task。"
-    ),
+    description=XLSX_SUBAGENT_DESCRIPTION,
     graph_id="xlsx_process",
-    tools=[XLSX_TOOLS],
     url="http://127.0.0.1:2026",
     headers={"Authorization": f"Bearer {_service_token}"},
 )
 
 graph = create_deep_agent(
     model=model,
+    system_prompt=MAIN_SYSTEM_PROMPT,
+    tools=[*MAIN_TOOLS],
     # 按空间隔离的 backend：8 个 fs 工具单点兜住 allowed_spaces（ADR-0005）
     backend=SpaceBackend(root_dir=okf_dir),
     context_schema=deepAgentContext,

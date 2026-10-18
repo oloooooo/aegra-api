@@ -9,7 +9,8 @@ from pydantic import BaseModel
 from langchain_quickjs import CodeInterpreterMiddleware
 
 from graphs.space_backend import SpaceBackend
-from graphs.xlsx_tools import XLSX_TOOLS
+from graphs.prompts import XLSX_SYSTEM_PROMPT
+from graphs.tools import XLSX_TOOLS
 from custom.middlewares.completion_notifier import CompletionNotifierMiddleware
 
 dotenv.load_dotenv()
@@ -19,6 +20,7 @@ okf_dir = str(Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf"))
 
 graph = create_deep_agent(
     model=model,
+    system_prompt=XLSX_SYSTEM_PROMPT,
     middleware=[
         CodeInterpreterMiddleware(
             mode="turn",
