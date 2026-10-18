@@ -309,6 +309,10 @@ supervisor = create_deep_agent(
 4. `multitask_strategy` 的 `reject` / `enqueue` / `rollback` 仍被忽略（同线程并发 run 可并存）。因此投递不会用 `multitask_strategy` 抢占，而是按父线程三态分派（见 §2.4）。
 5. `GET /threads/{tid}` 不返回 `interrupts`。
 6. 独立包 `aegra-protocol` 与根 `docs/` 保留不动，仅作历史参照。
+7. **任务投递的三个边界**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md#consequences)）：
+   同线程 8 秒 `in_flight` 窗口内后到的任务不开 run、改由主管边界注入（延迟一个 step，不丢）；
+   认领行随任务数线性增长且当前没有清理任务（按 `claimed_at` 定期删旧行即可）；
+   认领后崩溃时该结果 10 分钟内不投（过期后允许重投）。
 
 ## 10. 测试清单（e2e，真 PG）
 
