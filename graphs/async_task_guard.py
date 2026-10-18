@@ -4,9 +4,11 @@ deepagents 内置的 start/update 工具创建子 run 时不带任何 config（A
 spec 没有 config 字段，内置工具也没有关闭开关），因此这里短路 handler，自己用
 spec 里的静态服务 token 建 thread/run，并附上：
 
-- ``config.configurable.user_spaces``：主管此刻的 spaces（取自主管自己的
-  ``langgraph_auth_user``，服务端注入、客户端伪造不了）；主管无鉴权上下文
-  （本地 demo）时透传 null，子侧解析为不设限。
+- ``config.configurable.user_spaces``：spec 绑定了 ``space`` 的子 agent 只转发
+  ``[space]``（仅本任务 space 收紧），且先校验主管此刻的 spaces（取自主管自己的
+  ``langgraph_auth_user``，服务端注入、客户端伪造不了）含该空间，否则拒绝启动；
+  spec 无 space 绑定则回退全量快照；主管无鉴权上下文（本地 demo）时透传 null，
+  子侧解析为不设限。
 - 并发上限：非终态任务 ≥ ``MAX_ACTIVE_TASKS``（3）时拒绝，返回错误文本让模型
   自己等待/重试（Q3a：普通错误，不走 HITL）。
 
@@ -129,15 +131,28 @@ class AsyncTaskGuard(AgentMiddleware):
     def _err(self, request: ToolCallRequest, msg: str) -> ToolMessage:
         return ToolMessage(content=msg, tool_call_id=request.runtime.tool_call_id, name=request.tool_call.get("name"))
 
-    def _config_for(self, request: ToolCallRequest, spec: dict[str, Any]) -> dict[str, Any]:
-        """子 run 的 configurable：spaces + 父上下文（回写唤醒用，ADR-0005）。
+    def _config_for(self, request: ToolCallRequest, spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+        """(子 run 的 configurable, 错误文本)：本任务 space + 父上下文（回写唤醒用）。
 
-        父上下文只在有鉴权上下文（非本地 demo）时才转发；回写所需的
-        parent_user_identity 取服务端注入的 langgraph_auth_user，客户端伪造不了。
+        spec 绑定了 ``space`` 的子 agent 只发 ``[space]``（仅本任务 space），并先
+        校验主管有该空间权限，没有则拒绝启动。父上下文只在有鉴权上下文
+        （非本地 demo）时才转发；回写所需的 parent_user_identity 取服务端注入的
+        langgraph_auth_user，客户端伪造不了。
         """
         cfg = request.runtime.config or {}
         conf = cfg.get("configurable") or {}
-        payload: dict[str, Any] = {"user_spaces": self._spaces_payload(request.runtime.config)}
+        space = spec.get("space")
+        if space:
+            spaces = allowed_spaces(cfg)
+            if spaces is not None and space not in spaces:
+                return None, (
+                    f"用户没有空间 {space!r} 的权限，无法启动该子 agent"
+                    f"（可用：{sorted(spaces)}）"
+                )
+            user_spaces: list[str] | None = [space]
+        else:
+            user_spaces = self._spaces_payload(cfg)
+        payload: dict[str, Any] = {"user_spaces": user_spaces}
 
         parent_identity = current_identity(request.runtime.config)
         parent_thread_id = conf.get("thread_id")
@@ -154,7 +169,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 # 子 run 与父 run 同一部署，用 spec 的 url（本部署即 aegra）
                 notify_url=spec.get("url"),
             )
-        return {"configurable": payload}
+        return {"configurable": payload}, None
 
     def _task(self, task_id: str, agent_name: str, run_id: str, created_at: str | None = None) -> dict[str, Any]:
         now = _now()
@@ -184,6 +199,9 @@ class AsyncTaskGuard(AgentMiddleware):
             return self._err(request, err)
         assert spec is not None
         args = request.tool_call.get("args") or {}
+        config, err = self._config_for(request, spec)
+        if err:
+            return self._err(request, err)
         client = self._sync_client(spec)
         try:
             thread = client.threads.create()
@@ -191,7 +209,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 thread_id=thread["thread_id"],
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": args.get("description", "")}]},
-                config=self._config_for(request, spec),
+                config=config,
             )
         except Exception as e:  # noqa: BLE001 — SDK 异常无类型，回给模型
             logger.warning("failed_to_launch_async_subagent", error=str(e))
@@ -204,6 +222,9 @@ class AsyncTaskGuard(AgentMiddleware):
             return self._err(request, err)
         assert spec is not None
         args = request.tool_call.get("args") or {}
+        config, err = self._config_for(request, spec)
+        if err:
+            return self._err(request, err)
         client = self._async_client(spec)
         try:
             thread = await client.threads.create()
@@ -211,7 +232,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 thread_id=thread["thread_id"],
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": args.get("description", "")}]},
-                config=self._config_for(request, spec),
+                config=config,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("failed_to_launch_async_subagent", error=str(e))
@@ -244,6 +265,9 @@ class AsyncTaskGuard(AgentMiddleware):
         spec = self._specs.get(tracked["agent_name"])
         if spec is None:
             return self._err(request, f"Unknown agent for task: {tracked['task_id']!r}")
+        config, err = self._config_for(request, spec)
+        if err:
+            return self._err(request, err)
         client = self._sync_client(spec)
         try:
             run = client.runs.create(
@@ -251,7 +275,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
                 multitask_strategy="interrupt",
-                config=self._config_for(request, spec),
+                config=config,
             )
         except Exception as e:  # noqa: BLE001
             return self._err(request, f"Failed to update async subagent: {e}")
@@ -264,6 +288,9 @@ class AsyncTaskGuard(AgentMiddleware):
         spec = self._specs.get(tracked["agent_name"])
         if spec is None:
             return self._err(request, f"Unknown agent for task: {tracked['task_id']!r}")
+        config, err = self._config_for(request, spec)
+        if err:
+            return self._err(request, err)
         client = self._async_client(spec)
         try:
             run = await client.runs.create(
@@ -271,7 +298,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
                 multitask_strategy="interrupt",
-                config=self._config_for(request, spec),
+                config=config,
             )
         except Exception as e:  # noqa: BLE001
             return self._err(request, f"Failed to update async subagent: {e}")

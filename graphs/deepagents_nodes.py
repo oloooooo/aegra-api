@@ -23,9 +23,15 @@ class deepAgentContext(BaseModel):
 
 from langchain.tools import InjectedToolArg, tool, ToolRuntime
 from langgraph.graph.state import RunnableConfig
+from langchain.agents.middleware import TodoListMiddleware
 from graphs.async_task_guard import AsyncTaskGuard
 from graphs.space_backend import SpaceBackend
-from graphs.prompts import MAIN_SYSTEM_PROMPT, XLSX_SUBAGENT_DESCRIPTION
+from graphs.prompts import (
+    MAIN_SYSTEM_PROMPT,
+    CBAM_SUBAGENT_DESCRIPTION,
+    HYBRID_BONDING_SUBAGENT_DESCRIPTION,
+    SBOL3_SUBAGENT_DESCRIPTION,
+)
 from graphs.tools import MAIN_TOOLS
 
 logger = structlog.getLogger(__name__)
@@ -62,7 +68,7 @@ async def get_user_data(
         return {"error": str(e)}
 
 
-# 和子 agent（xlsx_process）同一份 okf 根，虚拟路径才对得上
+# 和子 agent（graphs/domain_agents.py）同一份 okf 根，虚拟路径才对得上
 okf_dir = str(Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf"))
 
 # 静态服务 token：subagent 的 runs.create 不带终端用户 JWT（deepagents 不转发），
@@ -78,13 +84,35 @@ _service_token = jwt.encode(
     algorithm="HS256",
 )
 
-_xlsx_spec = AsyncSubAgent(  # pyright: ignore[reportCallIssue]
-    name="xlsx_process",
-    description=XLSX_SUBAGENT_DESCRIPTION,
-    graph_id="xlsx_process",
-    url="http://127.0.0.1:2026",
-    headers={"Authorization": f"Bearer {_service_token}"},
-)
+# 领域子 agent：(agent 名 = graph_id, 绑定 space, 描述)。
+# space 经拦截层单发给子 agent（guard._config_for），用户没有该 space 权限时
+# start 直接拒绝；绑定只在 guard spec 里，deepagents 不读多余键。
+_DOMAIN_SPECS = {
+    "cbam_reporting": {
+        "space": "cbam-reporting",
+        "description": CBAM_SUBAGENT_DESCRIPTION,
+    },
+    "hybrid_bonding": {
+        "space": "hybrid-bonding",
+        "description": HYBRID_BONDING_SUBAGENT_DESCRIPTION,
+    },
+    "sbol3_synbio": {
+        "space": "sbol3-synbio",
+        "description": SBOL3_SUBAGENT_DESCRIPTION,
+    },
+}
+
+_specs: dict[str, dict] = {
+    name: AsyncSubAgent(  # pyright: ignore[reportCallIssue]
+        name=name,
+        description=meta["description"],
+        graph_id=name,
+        url="http://127.0.0.1:2026",
+        headers={"Authorization": f"Bearer {_service_token}"},
+        space=meta["space"],  # type: ignore[typeddict-unknown-key]  guard 专用
+    )
+    for name, meta in _DOMAIN_SPECS.items()
+}
 
 graph = create_deep_agent(
     model=model,
@@ -94,9 +122,10 @@ graph = create_deep_agent(
     backend=SpaceBackend(root_dir=okf_dir),
     context_schema=deepAgentContext,
     # tools=[get_user_data],
-    # 拦截 start/update_async_task：把主管的 spaces 经 run config 转发给子 agent
-    middleware=[AsyncTaskGuard({"xlsx_process": _xlsx_spec})],
-    subagents=[_xlsx_spec],
+    # 拆任务清单（write_todos）；guard 拦截 start/update_async_task：按 spec 绑定的
+    # space 经 run config 转发给子 agent（ADR-0005）+ 并发上限
+    middleware=[TodoListMiddleware(), AsyncTaskGuard(_specs)],
+    subagents=[* _specs.values()],
     permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
 )
 if __name__ == "__main__":

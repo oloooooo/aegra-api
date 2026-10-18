@@ -1,6 +1,7 @@
 """ask 域：主 agent 专用的人工追问工具 + 输入输出 schema。
 
-只有 supervisor（主 agent）装这个工具，子 agent（xlsx_process）看不到它——
+只有 supervisor（主 agent）装这个工具，子 agent（graphs/domain_agents.py 的领域
+agent）看不到它——
 物理隔离，不在工具里做鉴权。
 
 机制：tool 内调 ``langgraph.types.interrupt`` 抛可恢复中断，图停在工具节点，

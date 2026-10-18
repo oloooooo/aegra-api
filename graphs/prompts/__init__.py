@@ -3,10 +3,14 @@
 文件布局（与包同目录）::
 
     graphs/prompts/
-    ├── main.md              主 agent（supervisor）system prompt
-    ├── researcher.md        researcher 子 agent system prompt
-    ├── xlsx.md              xlsx_process 子 agent system prompt
-    └── xlsx_description.md  主 agent 派活时看到的子 agent 描述
+    ├── main.md                    主 agent（supervisor）system prompt
+    ├── researcher.md              researcher 子 agent system prompt
+    ├── cbam.md                    CBAM 申报子 agent system prompt
+    ├── cbam_description.md        CBAM 子 agent 描述
+    ├── hybrid_bonding.md          混合键合工艺子 agent system prompt
+    ├── hybrid_bonding_description.md  混合键合子 agent 描述
+    ├── sbol3.md                   SBOL3 本体子 agent system prompt
+    └── sbol3_description.md       SBOL3 子 agent 描述
 
 用法::
 
@@ -67,14 +71,22 @@ def render_prompt(name: str, **kwargs: object) -> str:
 # 模块级常量：图 import 时直接取，调用方不必关心加载方式
 MAIN_SYSTEM_PROMPT = load_prompt("main")
 RESEARCHER_SYSTEM_PROMPT = load_prompt("researcher")
-XLSX_SYSTEM_PROMPT = load_prompt("xlsx")
-XLSX_SUBAGENT_DESCRIPTION = load_prompt("xlsx_description")
+CBAM_SYSTEM_PROMPT = load_prompt("cbam")
+CBAM_SUBAGENT_DESCRIPTION = load_prompt("cbam_description")
+HYBRID_BONDING_SYSTEM_PROMPT = load_prompt("hybrid_bonding")
+HYBRID_BONDING_SUBAGENT_DESCRIPTION = load_prompt("hybrid_bonding_description")
+SBOL3_SYSTEM_PROMPT = load_prompt("sbol3")
+SBOL3_SUBAGENT_DESCRIPTION = load_prompt("sbol3_description")
 
 __all__ = [
+    "CBAM_SUBAGENT_DESCRIPTION",
+    "CBAM_SYSTEM_PROMPT",
+    "HYBRID_BONDING_SUBAGENT_DESCRIPTION",
+    "HYBRID_BONDING_SYSTEM_PROMPT",
     "MAIN_SYSTEM_PROMPT",
     "RESEARCHER_SYSTEM_PROMPT",
-    "XLSX_SUBAGENT_DESCRIPTION",
-    "XLSX_SYSTEM_PROMPT",
+    "SBOL3_SUBAGENT_DESCRIPTION",
+    "SBOL3_SYSTEM_PROMPT",
     "get_prompt",
     "list_prompts",
     "load_prompt",
