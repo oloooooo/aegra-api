@@ -28,6 +28,22 @@
 （`langgraph_service.py:75 _base_graph_cache`），所以这个前提当前成立。若将来把 supervisor 改成
 factory 式图（按 run 重建），账本会变成每次请求一本空账，**连单进程都不成立**。
 
+## 怎么改这个上限
+
+单一来源在 `graphs/limits.py`：
+
+```bash
+# .env
+MAX_ACTIVE_TASKS=3      # 正整数；非法值退回默认 3，启动不会因为错字崩掉
+```
+
+- 拦截层（`graphs/async_task_guard.py`）按它判断名额；
+- 主 prompt 里“同时最多 N 个后台任务”那句由 `graphs/prompts/__init__.py` 用同一个常量替换
+  （`main.md` 里写的是占位符 `{max_active_tasks}`）——**不要直接改 `main.md` 里的数字**，
+  否则提示词和实际拦截会漂移。
+- 改完重启服务生效（常量在 import 时读取）。前端不需要改：任务面板只显示实际任务，
+  超限时的错误文本由拦截层动态生成。
+
 ## 已知边界：多进程部署下上限按进程各算
 
 账本和锁都在进程内存里。aegra 的 worker 模式（`REDIS_BROKER_ENABLED=true`，见

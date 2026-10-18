@@ -42,11 +42,12 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
+from graphs import limits
 from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
 
-MAX_ACTIVE_TASKS = 3
+MAX_ACTIVE_TASKS = limits.MAX_ACTIVE_TASKS
 
 _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
 

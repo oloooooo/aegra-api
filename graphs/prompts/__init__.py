@@ -28,6 +28,8 @@ from pathlib import Path
 
 from langchain_core.prompts import PromptTemplate
 
+from graphs.limits import MAX_ACTIVE_TASKS as _MAX_ACTIVE_TASKS
+
 _PROMPT_DIR = Path(__file__).resolve().parent
 
 
@@ -68,8 +70,9 @@ def render_prompt(name: str, **kwargs: object) -> str:
     return PromptTemplate.from_template(template).format(**kwargs)
 
 
-# 模块级常量：图 import 时直接取，调用方不必关心加载方式
-MAIN_SYSTEM_PROMPT = load_prompt("main")
+# 模块级常量：图 import 时直接取，调用方不必关心加载方式。
+# main.md 里的 {max_active_tasks} 用常量替换（不走 PromptTemplate，避免别的花括号被当变量）。
+MAIN_SYSTEM_PROMPT = load_prompt("main").replace("{max_active_tasks}", str(_MAX_ACTIVE_TASKS))
 RESEARCHER_SYSTEM_PROMPT = load_prompt("researcher")
 CBAM_SYSTEM_PROMPT = load_prompt("cbam")
 CBAM_SUBAGENT_DESCRIPTION = load_prompt("cbam_description")

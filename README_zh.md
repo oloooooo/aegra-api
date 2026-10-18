@@ -60,6 +60,10 @@ OPENAI_MODEL=deepseek-flash
 JWT_SECRET=换成长随机串
 PASSWORD_PEPPER=换成长随机串
 
+# --- 业务上限 ---
+# 一个主管线程同时最多几个非终态后台任务（默认 3）；提示词里的数字由它生成
+MAX_ACTIVE_TASKS=3
+
 # --- 服务 ---
 HOST=127.0.0.1
 PORT=2026
@@ -497,7 +501,7 @@ uv run python custom_test.py "某个 bio-lab 领域的问题"
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
 | 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管在跑时注入）+ `CompletionNotifierMiddleware`（主管空闲时回写唤醒） |
 | 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
-| 同时最多 3 个后台任务 + 僵尸状态核实 | `AsyncTaskGuard`（`MAX_ACTIVE_TASKS`） |
+| 同时最多 N 个后台任务（`MAX_ACTIVE_TASKS`，默认 3，可配）+ 僵尸状态核实 | `AsyncTaskGuard` + `graphs/limits.py` |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |
 
 ### 11.11 常见坑
