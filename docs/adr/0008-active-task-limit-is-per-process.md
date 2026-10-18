@@ -46,19 +46,27 @@ MAX_ACTIVE_TASKS=3      # 正整数；非法值退回默认 3，启动不会因�
 
 ## 已知边界：多进程部署下上限按进程各算
 
-账本和锁都在进程内存里。aegra 的 worker 模式（`REDIS_BROKER_ENABLED=true`，见
-`src/aegra_api/services/executor.py:17` / `worker_executor.py`）会跑多个 worker 进程，同一父线程的两次
-派活可能落到不同进程：
+账本和锁都在进程内存里。判断条件是**图执行是否分散在多个进程**，与 Redis 无关
+（Redis 修的是跨进程取消与事件流，见 ADR-0009，不共享这本账）。以下部署都命中：
+
+- `uvicorn --workers N`（N > 1）；
+- 多副本（同一 `aegra.json` 起多个进程/容器）；
+- `REDIS_BROKER_ENABLED=true` 的 worker 队列：run 由不同进程认领，同一个父线程的两次派活
+  因此可能落在不同进程。
 
 ```
-进程 A：账本 0 条 → 放行 → 账本 1
-进程 B：账本 0 条 → 放行 → 账本 1
-→ 实际活跃 2、…、2×3 = 6，业务约束退化为「每进程 3 个」
+上限 3，状态里已有 2 个活跃：
+进程 A：state 2 + 账本 0 → 放行 X → 账本 1（state 还没落盘）
+进程 B：state 2 + 账本 0 → 放行 Y → 账本 1（它看不到 A 的账本）
+→ 落盘后实际活跃 4，业务约束退化为「每进程 3 个」，最坏 N × MAX_ACTIVE_TASKS
 ```
 
-**当前部署不受影响**：`.env` 未开 `REDIS_BROKER_ENABLED`，启动日志是 `Using local asyncio executor (in-process tasks)`。
-**什么时候必须升级**：开启 worker 模式、或多副本部署（同一 `aegra.json` 起多个 uvicorn）、
-或把 supervisor 改成 factory 图的那一天。
+触发需要「同一父线程上两个并发 run 各自派活」：用户在主管运行期间又发一句（aegra 不拦并发 run）、
+或 cron 与用户同时触发。单个 run 内部的并行 `start_async_task` 由 `threading.Lock` 串行，**不受影响**。
+
+**当前部署命中这条**：`.env` 是 `REDIS_BROKER_ENABLED=true` + `--workers 2`，最坏 2 × 3 = 6。
+实际影响只是"可能多派一两个子 agent"，不丢数据、不重复执行。
+**要多副本且严格要求上限**：见下面的升级方案（改成数据库认领/计数，与投递认领表同一套做法）。
 
 ### 升级时怎么改（届时再选，别现在做）
 
@@ -82,7 +90,9 @@ MAX_ACTIVE_TASKS=3      # 正整数；非法值退回默认 3，启动不会因�
 ## Consequences
 
 - 单进程部署：上限准确，并发派活被拒绝时会返回一条可读错误给模型，由它自己等待或 check。
+- 多进程部署：单个 run 内部（并行工具调用）仍准确；跨 run/跨进程的并发窗口能超出上限。
 - 多进程部署：上限按进程放大。**这是已知缺陷，不是 bug**——部署形态变化时必须先处理本条 ADR。
-- 自查方法：看启动日志是否出现 `Using local asyncio executor`；出现即单进程，上限可信。
+- 自查方法：看进程数——单进程（日志 `Using local asyncio executor` 且没有 `--workers`）上限可信；
+  多进程部署按"最坏 N × 上限"估算。
 - 账本只存在内存：进程重启后清空；此时以父 state 的 `async_tasks` 为准（重启前已派发的任务仍是活跃的，
   因为它们在 state 里）。
