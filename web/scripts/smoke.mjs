@@ -100,7 +100,7 @@ const main = async () => {
     method: "POST",
     body: JSON.stringify({
       assistant_id: "supervisor",
-      input: { messages: [{ role: "user", content: "CBAM 默认排放因子里铝的因子是多少？" }] },
+      input: { messages: [{ role: "user", content: "请派给负责 CBAM 的子 agent 去查：/cbam-reporting/cn_goods_rules.xlsx 里默认排放因子里铝的因子是多少？" }] },
       stream_mode: ["messages", "updates", "values", "custom"],
     }),
   })) {
@@ -111,6 +111,11 @@ const main = async () => {
   }
   check("主对话流有 token", sawPartial);
   check("拿到 async_tasks", !!taskId);
+  if (!taskId) {
+    console.log(`\n通过 ${ok.length}/${ok.length + bad.length}`);
+    for (const b of bad) console.log("  ✗", b);
+    process.exit(1);
+  }
 
   // 5. 任务代理
   const st = await api(`/custom/tasks/${taskId}?parent_thread_id=${threadId}`);

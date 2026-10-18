@@ -64,6 +64,6 @@ async_tasks: {'d9eb5ea6': 'running'}   ← 子 run 早已 success，父 state �
 ### Consequences
 
 - 每次派活多 N 次 `runs.get`（N = 当时非终态任务数，≤3），可接受。
-- `GET /custom/tasks/{id}` 复用同一套核实逻辑，前端拿到的状态和拦截层判上限的口径一致。
+- `GET /custom/tasks/{id}` 独立实现了一份同样的「向子 run 核实状态」逻辑（`custom/frontend_api.py::_fresh_status`），因此口径与拦截层一致，但**是两份代码**（另两份在 `graphs/async_task_guard.py::_refreshed_sync/_refreshed_async`）；把三处收敛成一处是已知的后续清理项。
 - state 里的 `status` 仍是「上次核实时」的快照，不是实时值；文档（`docs/streaming.md` §8.2、
   `docs/frontend-api.md` §5.4）明确要求前端用代理接口而非直接读 state。

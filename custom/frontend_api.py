@@ -27,11 +27,9 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langgraph_sdk import get_client
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.auth_deps import require_auth
-from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session
 from aegra_api.core.sse import format_sse_message, get_sse_headers
 from aegra_api.models.auth import User

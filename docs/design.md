@@ -85,7 +85,7 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 - **工厂图这条路通**：1 参数 `config: RunnableConfig` 工厂（`graph_factory.py:209`）与 async contextmanager 返回值（`generate_graph`，`graph_factory.py:394`）aegra 都支持，按 run 重建，不缓存工厂图（`_base_graph_cache` 只缓存静态图，`langgraph_service.py:300`）。已用探针验证 `@asynccontextmanager async def graph(config: RunnableConfig)` 被 `classify_factory` 判为 factory。
 - **传输**：`get_client()` 不传 url 走进程内 ASGI（需服务端注册，aegra 未见注册）；传 url 走真 HTTP。`langgraph_sdk` 0.4.6 的 `runs.create` 接受 `config` 与 `context` 关键字（`_async/runs.py:364`）。
 - **无并发保护**（同 §9 #4）：通知 run 会与父 run 并发写同一 thread，aegra 不拦。`POST /threads/{tid}` 的 `GET /threads/{tid}` 响应含 `status`（`idle` / `busy` / `interrupted` / `error`，`models/threads.py:98`），可作为发通知前的忙闲判据。
-- **两份图文件**：`aegra.json` 实际加载 `./graphs/xlsx_process.py:graph`；`graphs/xlsx_process copy.py` 与它逐字节相同（`diff` 无输出），是备份，改它不生效。
+- **图文件**（方案变化过，以当前 `aegra.json` 为准）：现在注册 `supervisor`（`./graphs/deepagents_nodes.py:graph`）与三个领域子 agent（`./graphs/domain_agents.py:graph_cbam_reporting` / `graph_hybrid_bonding` / `graph_sbol3_synbio`）。旧的 `graphs/xlsx_process.py` 及备份 `graphs/xlsx_process copy.py` 已不再是活图，前者的工具栈由 `graphs/domain_agents.py::_domain_agent` 按 space 复用。
 
 ## 3. 端点契约
 

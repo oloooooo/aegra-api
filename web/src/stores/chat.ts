@@ -75,6 +75,9 @@ export const useChat = defineStore("chat", () => {
   }
 
   function logout() {
+    stopRun();
+    window.clearTimeout(pollTimer);
+    pollTimer = undefined;
     clearToken();
     identity.value = "";
     permissions.value = [];
@@ -100,6 +103,8 @@ export const useChat = defineStore("chat", () => {
 
   async function openThread(id: string) {
     stopRun();
+    window.clearTimeout(pollTimer);
+    pollTimer = undefined;
     threadId.value = id;
     streaming.value = "";
     error.value = "";
@@ -146,7 +151,7 @@ export const useChat = defineStore("chat", () => {
         }
       }
     } catch (e) {
-      if (!ctrl.signal.aborted) t_note(id, e);
+      if (!ctrl.signal.aborted) fail(e);
     } finally {
       tasks[id] && (tasks[id].subscribed = false);
       try {
@@ -156,10 +161,6 @@ export const useChat = defineStore("chat", () => {
         /* 状态刷新失败不影响展示 */
       }
     }
-  }
-
-  function t_note(id: string, e: unknown) {
-    if (tasks[id]) tasks[id].events.push(String((e as Error).message ?? e).slice(0, 120));
   }
 
   function lastMessage(data: unknown): { id?: string; content?: string } | null {
@@ -206,12 +207,13 @@ export const useChat = defineStore("chat", () => {
         handleEvent(ev);
       }
     } catch (e) {
-      if (!(e instanceof DOMException && e.name === "AbortError")) error.value = (e as Error).message;
+      if (!(e instanceof DOMException && e.name === "AbortError")) fail(e);
     } finally {
       running.value = false;
+      // 先拉权威状态再清流式草稿，否则会先清空、后重填（闪一下）
+      await refreshState().catch(fail);
       streaming.value = "";
-      await refreshState().catch(() => {});
-      await loadThreads().catch(() => {});
+      await loadThreads().catch(fail);
       if (activeTasks.value.length) schedulePoll();
     }
   }
@@ -246,10 +248,10 @@ export const useChat = defineStore("chat", () => {
     try {
       await api.cancelRun(threadId.value, currentRun.value);
     } catch (e) {
-      error.value = (e as Error).message;
+      fail(e);
     }
     stopRun();
-    await refreshState().catch(() => {});
+    await refreshState().catch(fail);
   }
 
   async function removeThread(id: string) {
@@ -267,13 +269,23 @@ export const useChat = defineStore("chat", () => {
   function schedulePoll() {
     window.clearTimeout(pollTimer);
     pollTimer = window.setTimeout(async () => {
-      await refreshState().catch(() => {});
-      if (activeTasks.value.length) schedulePoll();
+      await refreshState().catch(fail);
+      if (threadId.value && activeTasks.value.length) schedulePoll();
     }, 4000);
   }
 
   function isAuthError(e: unknown) {
     return e instanceof ApiError && e.status === 401;
+  }
+
+  /** 统一错误出口：401 直接登出回登录页，其它错误写进 chat.error。 */
+  function fail(e: unknown) {
+    if (isAuthError(e)) {
+      logout();
+      error.value = "登录已过期，请重新登录";
+      return;
+    }
+    error.value = (e as Error).message ?? String(e);
   }
 
   return {

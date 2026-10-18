@@ -22,7 +22,6 @@ spaces 解析见 ``space_access.allowed_spaces``：无鉴权上下文（本地 d
 
 from __future__ import annotations
 
-import fnmatch
 from pathlib import Path
 
 import structlog
@@ -160,7 +159,7 @@ class SpaceBackend(FilesystemBackend):
             # ripgrep 子进程用系统 locale 编码解码 stdout（Windows 下是 GBK），
             # 扫到 space 里的 xlsx/图片等二进制就抛；改用 Python 扫描兜底。
             logger.warning("ripgrep_decode_failed_python_fallback", pattern=pattern, path=path)
-            return self._py_grep(pattern, path, glob, max_count, spaces)
+            return self._py_grep(pattern, path, glob, max_count, spaces, context_lines)
         if result.matches is None:
             return result
         result.matches = [m for m in result.matches if self._visible(m["path"], spaces)]
@@ -173,29 +172,29 @@ class SpaceBackend(FilesystemBackend):
         glob_pattern: str | None,
         max_count: int | None,
         spaces: frozenset[str],
+        context_lines: int = 0,
     ) -> GrepResult:
-        """纯 Python 字面匹配兜底（与基类 Python 搜索同语义，按 spaces 过滤）。"""
-        root = self.cwd / (path or "").strip("/") if path else self.cwd
-        if not root.exists():
-            return GrepResult(error=f"路径不存在：{path}", matches=[])
+        """ripgrep 解码失败时的兜底：复用基类的 Python 搜索与 context 附加。
+
+        不自己 walk 文件树：基类的 `_python_search` 用 `compile_grep_include_glob`
+        匹配**相对路径**（与 ripgrep `-g` 同语义，`**/*.xlsx` 能命中），并自带
+        max_count、超时与读失败上报；`_apply_grep_context` 负责 `context_lines`。
+        """
+        base_full = self._resolve_path(path or ".")
+        results, truncated, partial_error = self._python_search(
+            pattern, base_full, glob_pattern, max_count=max_count
+        )
         matches: list[dict] = []
-        files = [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
-        for f in files:
-            vpath = "/" + f.relative_to(self.cwd).as_posix()
-            if not self._visible(vpath, spaces):
+        for fpath, items in results.items():
+            if not self._visible(fpath, spaces):
                 continue
-            if glob_pattern and not fnmatch.fnmatch(f.name, glob_pattern):
-                continue
-            try:
-                text = f.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            for line_no, line in enumerate(text.splitlines(), 1):
-                if pattern in line:
-                    matches.append({"path": vpath, "line": line_no, "text": line})
-                    if max_count is not None and len(matches) >= max_count:
-                        return GrepResult(matches=matches, truncated=True)
-        return GrepResult(matches=matches)
+            for line_num, text in items:
+                matches.append({"path": fpath, "line": int(line_num), "text": text})
+        if context_lines:
+            partial_error = self._apply_grep_context(
+                matches, context_lines, partial_error, pattern, newline=None
+            )
+        return GrepResult(error=partial_error, matches=matches, truncated=truncated)
 
     def _visible(self, vpath: str, spaces: frozenset[str]) -> bool:
         if _is_internal(vpath):
