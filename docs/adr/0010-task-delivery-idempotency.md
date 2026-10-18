@@ -61,12 +61,61 @@ DELETE /custom/tasks/{task_id}/deliver-claim?parent_thread_id=&run_id=
 | 同一任务被重试/双 hook 投递 | 第二次拿到 `delivered` | 只投一次 |
 | `update_async_task` 后的新 run | 新 `run_id` → 新主键 → 再投一次 | 有意为之 |
 
-### 过期窗口为什么是 90 秒
+### 三个时间参数与「怎么调」
 
-`_STALE_SECONDS` 必须大于「一次正常投递可能占用的全部时间」，否则正常投过的结果会在
-notifier 的延迟复查里被当成"认领过期"再投一次。当前上界是：
-重试 `0.5+1+1.5s` + 延迟复查 `5+10+20s` ≈ 38 秒；实际的投递动作（插认领 + 建 run）
-是毫秒级，90 秒留了 2 倍余量。崩溃场景下最多损失 90 秒。
+| 参数 | 位置 | 当前值 | 作用 |
+|---|---|---|---|
+| `_STALE_SECONDS` | `custom/delivery_api.py:47` | 90s | 认领多久算"过期、允许重投"。**它决定崩溃后结果最多晚多久到达** |
+| `_IN_FLIGHT_SECONDS` | `custom/delivery_api.py:46` | 8s | 同一父线程上，刚认领后的让路窗口；防止两个投递 run 同时写一个线程 |
+| `_RECHECK_DELAYS` | `custom/middlewares/completion_notifier.py:78` | (5, 10, 20) | 父线程忙时的延迟复查节奏；三者之和 = 复查总时长 |
+
+**必须守住的不变式**：
+
+```
+_STALE_SECONDS  >  重试总时长 + 复查总时长
+                  （重试：0.5+1+1.5 ≈ 3s；复查：5+10+20 = 35s）≈ 38s
+```
+
+守不住会怎样：一个结果正常投完，notifier 的延迟复查发现"认领已过期"→ **再投一遍**。
+所以这两个值必须成对改，不能只调小 `_STALE_SECONDS`。
+
+#### 方案 A：一起收紧（零结构改动）
+
+同时改两个常量，保持 `_STALE_SECONDS ≈ 2 × (重试 + 复查总和)`：
+
+| 目标 | `_RECHECK_DELAYS` | 最小 `_STALE_SECONDS` | 说明 |
+|---|---|---|---|
+| 90s（当前） | (5, 10, 20) = 35s | 90 | 2 倍余量 |
+| 45s | (3, 6, 12) = 21s | 45 | 换来的代价：父 run 收尾超过 21s 就不再等，改由主管边界注入兜住 |
+| 20s | (2, 4, 8) = 14s | 20 | 几乎只覆盖"父 run 正常收尾"，超过就交给注入 |
+
+改完必须验证：跑 `PYTHONPATH=. PYTHONUTF8=1 uv run python scripts/check_task_delivery.py`
+（其中有用例覆盖"过期前 → delivered、过期后 → reclaimed"）。
+
+#### 方案 B：两阶段认领（能把窗口压到 ~15s）
+
+现在认领行只记"谁领了票"，不知道票有没有兑现；过期时间不得不同时覆盖"崩溃"和"正常投递"。
+加一列即可把两者拆开：
+
+1. **迁移**：`async_task_delivery` 增 `delivery_run_id VARCHAR(64) NULL`（新 alembic 版本）。
+2. **接口**：把投递 run 的 id 回填进来——`runs.create` 成功后调一次
+   `PATCH /custom/tasks/{task_id}/deliver-claim {run_id, delivery_run_id}`（或复用 POST 带
+   `delivered: true`）。
+3. **判定**：
+   - `delivery_run_id IS NOT NULL` → 永远 `delivered`（票已兑现）；
+   - `delivery_run_id IS NULL` 且 `claimed_at` 超过 15s → `reclaimed`（领了票没兑现，崩了）；
+   - `delivery_run_id IS NULL` 且未超 15s → `delivered`（正在投，别抢）。
+4. 这时 `_STALE_SECONDS` 只覆盖"崩溃检测"，可以设 15s；`_RECHECK_DELAYS` 仍要满足
+   "复查总时长 > 0" 的普通语义，但不再受过期窗口约束。
+
+代价：多一次回填请求、多一列、多一份迁移；收益是崩溃后最多等 15s 而不是 90s。
+
+#### 不要这样做
+
+- **只把 `_STALE_SECONDS` 调小**：会让正常投递的结果在复查时被重复投递。
+- **把 `_RECHECK_DELAYS` 调大却不动 `_STALE_SECONDS`**：复查尾延迟可能越过过期窗口，同样重复。
+- **把 `_IN_FLIGHT_SECONDS` 调得比一次 `runs.create` 还短**：两个并发完成的任务可能各开一个 run，
+  回到修这条 ADR 之前的状态。
 
 ## Considered Options
 

@@ -312,7 +312,8 @@ supervisor = create_deep_agent(
 7. **任务投递的三个边界**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md#consequences)）：
    同线程 8 秒 `in_flight` 窗口内后到的任务不开 run、改由主管边界注入（延迟一个 step，不丢）；
    认领行随任务数线性增长且当前没有清理任务（按 `claimed_at` 定期删旧行即可）；
-   认领后崩溃时该结果 90 秒内不投（过期后允许重投）。
+   认领后崩溃时该结果 90 秒内不投（过期后允许重投）。调参方法与不变式见
+   [adr/0010 §怎么调](./adr/0010-task-delivery-idempotency.md#三个时间参数与怎么调)。
 
 ## 10. 测试清单（e2e，真 PG）
 
