@@ -117,7 +117,8 @@ _Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态�
 （不打断、不开新 run）；② 主管已空闲 —— `CompletionNotifier` 开一轮新 run 投递。
 两条路都靠服务端认领表 `async_task_delivery(task_id, run_id)` 判重（同一任务被 `update_async_task`
 重跑会产生新结果）；主管在等人工回答（HITL interrupt）时一律不投递，留到用户答完后的下一轮由 ① 补齐。
-同一 `(task, run)` 至多投递一条消息，同一父线程同一时刻至多一个投递 run（见 ADR-0010）。
+同一 `(task, run)` 至多投递一条消息，同一父线程同一时刻至多一个投递 run；认领表与接口在
+`async_task_delivery` / `custom/delivery_api.py`（见 ADR-0010）。
 _Avoid_: 把投递说成"通知"（通知是手段，可用注入或回写）；把它当成同步等待（主管从不被阻塞）
 
 **Task proxy（任务代理）**:

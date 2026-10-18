@@ -281,7 +281,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 两条路不重复：投递前先向服务端**认领** `(task_id, run_id)`（`async_task_delivery` 表，
 接口 `POST /custom/tasks/{id}/deliver-claim`），只有抢到的那方才有资格投递；投递 run 创建失败会撤回认领。
 判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run，只认 task_id 会把更新后的第二次结果当成重复丢掉。
-用表而不是读 state 判重，是因为跨进程才原子，而且不用为了查一个标记把整份对话读回来。同一个 task 只处理一次，主 prompt 也要求模型对重复通知只更新 todo。
+用表而不是读 state 判重，是因为跨进程才原子，而且不用为了查一个标记把整份对话读回来。主 prompt 另外要求模型对重复通知只更新 todo。
 
 ### 多个子任务同时完成会怎样
 

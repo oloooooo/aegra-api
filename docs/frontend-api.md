@@ -4,6 +4,10 @@
 
 实现位置：`custom/frontend_api.py`（路由前缀 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
 
+另有 **2 个内部接口**（前端不调用，供主管侧拦截层与子 agent 的完成中间件做投递认领）：
+`POST /custom/tasks/{task_id}/deliver-claim` 与 `DELETE` 同名接口。
+它们的鉴权只允许父线程属主或服务身份，语义见 [adr/0010](./adr/0010-task-delivery-idempotency.md)。
+
 ## 1. 为什么需要这一层
 
 | 原生接口的问题 | 本层怎么解 |
@@ -143,7 +147,8 @@ agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null
 ### 5.3 子 agent 的结果不是用户消息
 
 子 agent 完成后，父线程会多一条 **`human`** 消息，内容以 `[Async subagent 'cbam_reporting' has completed] Result: ...`
-开头，末尾带一行 `task_id: <id>`。它有两种来源，**格式完全一致**，前端不需要区分：
+开头，末尾带 `task_id: <id>` 与 `run_id: <id>`。它有两种来源，**格式完全一致**，前端不需要区分
+（判重在服务端做，见 `POST /custom/tasks/{id}/deliver-claim`）：
 
 - 主管当时还在跑 → `AsyncTaskGuard.abefore_model` 在下一次模型调用前注入（同一个 run 内，不开新 run）；
 - 主管已答完（线程 `idle`）→ `CompletionNotifierMiddleware` 现铸父身份 token 写回（ADR-0006）。

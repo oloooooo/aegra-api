@@ -15,6 +15,12 @@ spec 里的静态服务 token 建 thread/run，并附上：
   ``status`` 会停在 ``running``，不核实就会把 3 个已成功的任务当活跃，永久卡死名额。
 
 check/cancel/list 不创建 run，直接放行给内置 handler。
+
+另外负责**把后台任务的结果送进主管上下文**（`before_model` / `abefore_model`）：
+每次模型调用前核对非终态任务的真实状态（5s TTL），转终态就在本次请求里追加一条
+``[Async subagent '<name>' has completed] …`` 消息，不打断当前步骤、不另开 run。
+投递前先向服务端认领 ``(task_id, run_id)``（`custom/delivery_api.py`）——
+跨进程只投一次、同一父线程同时只允许一个投递在途；认领服务不可用时放行（宁可多一条，不丢结果）。
 """
 
 from __future__ import annotations

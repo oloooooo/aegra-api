@@ -23,6 +23,16 @@ hook 内用 ``get_config()`` 读到它们后：
 
 **不转发父上下文 = 不回写**（本地直跑 demo、或没走拦截层的部署），只是安静跳过。
 
+## 什么时候投递、怎么保证只投一次
+
+按父线程状态三态分派：`busy` → 不插队（主管会在下一个模型调用前通过
+`AsyncTaskGuard.abefore_model` 注入结果），只安排延迟复查；`interrupted` → 一律不动
+（否则会把用户正等着回答的答案顶掉）；`idle` / `error` → 开一轮新 run 投递。
+
+判重交给服务端的认领表（`custom/delivery_api.py`，主键 `(task_id, run_id)`）：
+抢到认领才投，创建 run 失败撤回答领，同线程 8 秒内已有认领则让路。
+所以本中间件既不需要读 thread state 判重，也不依赖进程内状态——多进程部署同样成立。
+
 ## 兼容官方 factory 模式
 
 官方例子（graphs/official_researcher.py）用 graph factory 把父 id 从 config 传进

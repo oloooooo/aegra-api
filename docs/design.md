@@ -102,8 +102,9 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 （仅在投递尝试时）。
 
 **成本**：guard 每次模型调用最多 3 次 `runs.get`（带 5s TTL；工具路径原本就会核实状态）；
-任务进入终态后不再查。中间件只在真正要投递时才多取一次 `GET /threads/{tid}/state`；
-`busy` 时只看状态并安排复查，不产生 run、也不读快照。
+任务进入终态后不再查。投递判重是一次主键查询（认领表），**不读 thread state**——
+只有 `interrupted` 分支需要读一次快照来判断挂的是哪种中断；`busy` 时只看状态并安排复查，
+不产生 run、也不读快照。
 
 **并发与幂等**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md)）：
 
