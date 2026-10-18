@@ -15,6 +15,7 @@
 | [adr/0005-spaces-forwarded-via-run-config.md](./adr/0005-spaces-forwarded-via-run-config.md) | 用户 spaces 经 run config 转发，由拦截层塞入 `start_async_task` |
 | [adr/0006-completion-notify-mints-parent-token.md](./adr/0006-completion-notify-mints-parent-token.md) | 完成通知回写父线程：现铸短时父身份 token，不用服务 token |
 | [adr/0007-frontend-access-to-async-tasks.md](./adr/0007-frontend-access-to-async-tasks.md) | 子 agent 的流与状态经 `custom/` 代理暴露（不放开 ownership）；派活前核实 `async_tasks` 真实状态 |
+| [adr/0008-active-task-limit-is-per-process.md](./adr/0008-active-task-limit-is-per-process.md) | `MAX_ACTIVE_TASKS` 靠进程内账本 + 锁保证原子；多 worker 部署下上限按进程各算（已知边界与升级方案） |
 
 其他相关文档：
 

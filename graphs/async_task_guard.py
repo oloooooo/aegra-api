@@ -58,6 +58,8 @@ class AsyncTaskGuard(AgentMiddleware):
         # 并发派活的原子占位：ToolNode 对同一批 tool_call 用 gather / 线程池并发执行，
         # state 在整批执行完才落盘，所以两个并发 start 会看到同一份旧 state 而双双放行。
         # 这里用一个进程内 ledger 记「已预留但尚未写进 state」的任务，锁内判上限+占位。
+        # 边界：ledger 只在单个进程内共享，多 worker / 多副本部署时上限按进程各算，
+        # 详见 docs/adr/0008-active-task-limit-is-per-process.md。
         self._mu = threading.Lock()
         self._ledger: dict[str, dict[str, dict[str, Any]]] = {}
 
