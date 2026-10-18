@@ -225,5 +225,57 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 3. 右侧「任务」面板出现一张卡：状态从 `running` → `success`，卡片里能看到子 agent 的实时输出与工具步骤（`xlsx_info` / `xlsx_query`）。
 4. 子 agent 跑完会**主动回写**父线程（`CompletionNotifierMiddleware`），主管被唤醒并把结果转达给你——所以不用手动催「跑完了吗」。
 
+## 10. 父子 agent 之间的信息流通
+
+父（主管）与子（领域 agent）跑在**两个不同的 Thread** 上，记忆互不相通。它们之间只有下面 5 条通道，没有任何其它隐式共享。
+
+```
+┌─────────────────────── 主管 Thread（父，supervisor）───────────────────────┐
+│  state.messages[]        对话历史（子 agent 看不到）                          │
+│  state.async_tasks{}     task_id → {agent_name, thread_id, run_id, status}   │
+│  工具：start / check / update / cancel / list_async_task、write_todos        │
+└───┬──────────────────────────────────────────────────────────▲─────────────┘
+    │ ① 任务描述（消息，单向给出）                                │ ③ 完成回写（消息，单向推回）
+    │  runs.create(thread_id=子线程,                              │  runs.create(thread_id=父线程,
+    │    input={messages:[{role:user, content:description}]})     │    input={messages:[{role:user, content:
+    │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"}]})
+    │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
+    │ ② config.configurable（元数据，不进消息）                   │  身份：现铸父身份短时 token（300s）
+    │  user_spaces = [ 本任务的那一个 space ]                      │
+    │  parent_thread_id / parent_assistant_id                     │ ④ 拉取（工具调用，非推送）
+    │  parent_user_identity / notify_url                          │  check_async_task → runs.get → status + result
+    │  ❗服务端注入的 user_spaces 收窄成单空间，越权由后端拒绝         │  顺带把 state.async_tasks 改成真实状态
+    ▼                                                            │
+┌─────────────────────── 子 Thread（cbam_reporting 等）──────────────────────┐
+│  自己的 messages[]、自己的 checkpoint、自己的 space 可见范围                 │
+│  收尾钩子：CompletionNotifierMiddleware.aafter_agent → 触发 ③                │
+│  出错时：awrap_model_call 推一条 "… encountered an error" 同样走 ③          │
+└──────────────────────────────┬────────────────────────────────────────────┘
+                               │ ⑤ 实时旁路（前端直连，不经过父 agent）
+                               ▼
+         GET /custom/tasks/{task_id}/stream?parent_thread_id=…
+         服务 token 订阅子 run 的 messages/custom → 转成 SSE 给浏览器
+```
+
+| # | 方向 | 载体 | 谁写 | 代码位置 | 失败时 |
+|---|---|---|---|---|---|
+| ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
+| ② | 父 → 子 | `config.configurable` | 拦截层 | 同上 `_config_for()` | 无权限时直接拒绝派活 |
+| ③ | 子 → 父 | 父线程里一条 `user` 消息 | 子 agent 的中间件 | `custom/middlewares/completion_notifier.py` | 缺父上下文 → 静默跳过并告警 |
+| ④ | 子 → 父 | 工具返回值 + state 更新 | 主管主动调用 | `deepagents/…/async_subagents.py::_build_check_result` | 返回 `Failed to get run status` |
+| ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/frontend_api.py::stream_task` | 发 `error` 帧后 `end` |
+
+`update_async_task(task_id, message)` 是 ① 的复用：往**同一个**子线程追加一条 `user` 消息并开新 run（`multitask_strategy="interrupt"` 顶掉旧 run）。
+
+### 明确**不**流通的东西
+
+- **父对话历史**：子 agent 只拿到 `description`，看不到用户之前问了什么。所以派活时要把路径、问题、约束一次写清。
+- **子 agent 的 token 流 / 工具事件**：不会回到父的 SSE。想在界面上看，只能走 ⑤ 的代理。
+- **其它任务的信息**：子 agent 只知道自己的 space，`GET /custom/tasks` 也只放行本父线程下的 task。
+- **权限的外溢**：② 里下发的是 `[本任务 space]` 而不是用户全部空间；子 agent 的 `SpaceBackend` 和 xlsx 工具都按这个列表判定。
+- **记忆的延续**：子 agent 的 checkpoint 在自己的 thread 上；父线程只存 task 句柄，不存子 agent 的中间状态。
+
+---
+
 更多接口与流式细节见 [`docs/frontend-api.md`](docs/frontend-api.md)、[`docs/streaming.md`](docs/streaming.md)；
 术语见 [`CONTEXT.md`](CONTEXT.md)。
