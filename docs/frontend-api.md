@@ -140,15 +140,21 @@ if (text.length > printed[msg.id] ?? 0) { render(text.slice(printed[msg.id] ?? 0
 渲染成选项卡片 → 用户点选 → `POST /threads/{id}/runs` `{"command":{"resume":"<label>"}}`。
 agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null}`。一次回答后它可能接着问下一个问题，要支持连续中断。
 
-### 5.3 子 agent 的回写不是用户消息
+### 5.3 子 agent 的结果不是用户消息
 
-子 agent 完成后，父线程会多一条 **`human`** 消息，内容以 `[Async subagent 'cbam_reporting' has completed] Result: ...` 开头。
-这是 `CompletionNotifierMiddleware` 现铸父身份 token 写回的通知（ADR-0006），**渲染成「子任务返回结果」区块**，不要当作用户输入。
+子 agent 完成后，父线程会多一条 **`human`** 消息，内容以 `[Async subagent 'cbam_reporting' has completed] Result: ...`
+开头，末尾带一行 `task_id: <id>`。它有两种来源，**格式完全一致**，前端不需要区分：
+
+- 主管当时还在跑 → `AsyncTaskGuard.abefore_model` 在下一次模型调用前注入（同一个 run 内，不开新 run）；
+- 主管已答完（线程 `idle`）→ `CompletionNotifierMiddleware` 现铸父身份 token 写回（ADR-0006）。
+
+两种都**渲染成「子任务返回结果」区块**，不要当作用户输入。主管在等用户回答（线程 `interrupted`）时
+不会投递，结果会等用户答完后补上——前端不要为此做特殊处理。
 
 ### 5.4 状态可能滞后
 
-父 state 的 `async_tasks.status` 只在主管调用 `check_async_task` 时才更新；走回写路径时不更新。
-要展示状态就用 `GET /custom/tasks/{id}`。
+父 state 的 `async_tasks.status` 只在主管调用 `check_async_task`、或者在 guard 的模型/工具边界
+核实后更新；`idle` 回写路径不更新。要展示状态就用 `GET /custom/tasks/{id}`。
 
 ## 6. 定时任务
 

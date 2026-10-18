@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from collections import deque
 from typing import Any
@@ -56,8 +57,55 @@ _PARENT_TOKEN_TTL = 300
 _NOTIFIED_MAX = 4096
 
 
-class _ParentBusy(Exception):
-    """父线程正忙：让回写走退避重试，而不是与用户 run 并发写同一线程。"""
+# 允许 resume 的中断白名单。**现在为空**：① 方案下父 run 不会为等任务而挂起，
+# 所以 notifier 一个 interrupted 线程都不碰（HITL 提问、未知中断都交给 ① 兜底）。
+# 将来做"协作式挂起"时，把那种中断的 kind 加进来即可。
+_RESUMABLE_KINDS: frozenset[str] = frozenset()
+
+# 父线程正忙：不插队，等父 run 结束后再确认一次"① 是否已经投递过"
+_RECHECK_DELAYS = (8, 20, 45)
+
+# 后台任务结果消息里的投递标记（与 graphs/async_task_guard.py 共用同一格式）
+_TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
+
+# 延迟复查的 task 需要留引用，否则可能被 GC（asyncio 只持弱引用）
+_RECHECK_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _text_of(msg: Any) -> str:
+    """消息内容 → 纯文本（state 里既可能是 dict，也可能是消息对象）。"""
+    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+    return str(content) if content is not None else ""
+
+
+def _already_delivered(snapshot: dict[str, Any], task_id: str) -> bool:
+    """父线程的 state 里是否已经有这个任务的**投递**记录（① 注入或本中间件回写）。
+
+    只认 `[Async subagent …` 开头的消息：派活工具消息同样带 `task_id:`，
+    不区分会把"待投递"误判成"已投递"。
+    """
+    values = (snapshot or {}).get("values") or {}
+    for msg in values.get("messages") or []:
+        text = _text_of(msg)
+        if text.startswith("[Async subagent") and task_id in _TASK_ID_RE.findall(text):
+            return True
+    return False
+
+
+def _interrupt_kinds(snapshot: dict[str, Any]) -> set[str]:
+    """待恢复中断的判别字段（我们自己的 ask 用 value.tool 标识）。"""
+    kinds: set[str] = set()
+    for item in (snapshot or {}).get("interrupts") or []:
+        value = item.get("value") if isinstance(item, dict) else getattr(item, "value", None)
+        if isinstance(value, dict):
+            kinds.add(str(value.get("kind") or value.get("tool") or "unknown"))
+        else:
+            kinds.add("unknown")
+    return kinds
 
 
 def _mint_parent_token(identity: str) -> str:
@@ -132,67 +180,131 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         conf = self._config().get("configurable") or {}
         return str(conf.get("run_id") or conf.get("thread_id") or "unknown-run")
 
-    # ---------- 回写 ----------
+    # ---------- 回写（四态分派） ----------
 
-    async def _send_notification(self, message: str) -> None:
+    async def _send_notification(self, message: str, task_id: str | None = None) -> None:
+        """按父线程此刻的状态决定怎么投递（不再是"一律开一个 run"）。
+
+        - busy：父 run 还在跑 → 不插队，①（before_model 注入）会在它的下一个边界
+          把结果送进去；这里只安排延迟复查，兜住"父 run 正好在收尾"的缺口。
+        - interrupted：图在等某个 resume 值（HITL 提问等）→ 一律不动，否则会把
+          用户要回答的答案顶掉；用户答完后 ① 会在下一轮补上。
+        - idle / error：线程空着 → 用 input 开新一轮投递（已经是消息就跳过）。
+        """
         parent = self._resolve_parent()
         if parent is None:
             return
         run_key = self._run_key()
         if not self._mark_once(run_key):
             return
-
         thread_id, assistant_id, identity, url = parent
-        for attempt in (1, 2, 3):
-            try:
-                token = _mint_parent_token(identity)
-                client = get_client(url=url, headers={"Authorization": f"Bearer {token}"})
-                # 父线程正在跑另一个 run 时不硬撞（aegra 不拦并发写），等它空闲再唤醒
-                if await self._parent_busy(client, thread_id):
-                    raise _ParentBusy(thread_id)
-                await client.runs.create(
-                    thread_id=thread_id,
-                    assistant_id=assistant_id,
-                    input={"messages": [{"role": "user", "content": message}]},
-                )
-                logger.info(
-                    "completion_notify_sent",
-                    parent_thread_id=thread_id,
-                    subagent=self.subagent_name,
-                    run_key=run_key,
-                    attempt=attempt,
-                )
+        task_id = task_id or str((self._config().get("configurable") or {}).get("thread_id") or thread_id)
+        # 末尾带 task_id：主管侧与这里的判重都靠这个标记（两边投递只留一份）
+        message = f"{message}\n\ntask_id: {task_id}"
+        ctx = (thread_id, assistant_id, identity, url, message, task_id, run_key)
+        await self._deliver(ctx)
+
+    async def _deliver(self, ctx: tuple[str, str, str, str, str, str, str], attempt: int = 1, recheck: int = 0) -> None:
+        thread_id, assistant_id, identity, url, message, task_id, run_key = ctx
+        try:
+            client = get_client(url=url, headers={"Authorization": f"Bearer {_mint_parent_token(identity)}"})
+            status, snapshot = await self._thread_view(client, thread_id)
+
+            if status == "busy":
+                self._defer(ctx, recheck)
                 return
-            except Exception as e:  # noqa: BLE001 —— 通知是尽力而为，失败要留痕不能吞
-                if attempt == 3:
-                    # 放弃时释放占位，让后续 hook（同一 run 的其它阶段）还能重试
-                    self._notified_runs.discard(run_key)
-                    logger.warning(
-                        "completion_notify_failed",
+            if status == "interrupted":
+                kinds = _interrupt_kinds(snapshot)
+                if not (kinds & _RESUMABLE_KINDS):
+                    logger.info(
+                        "completion_notify_skipped_interrupted",
                         parent_thread_id=thread_id,
                         subagent=self.subagent_name,
-                        error=str(e),
-                        attempt=attempt,
-                        exc_info=True,
+                        interrupt_kinds=sorted(kinds) or ["none"],
                     )
                     return
+                # 白名单命中（目前为空）：将来做协作式挂起时走这里
+                await client.runs.create(
+                    thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
+                )
+                logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
+                return
+            if status == "unknown":
+                raise RuntimeError("parent thread unreachable")
+            if _already_delivered(snapshot, task_id):
                 logger.info(
-                    "completion_notify_retry",
+                    "completion_notify_skipped_delivered",
                     parent_thread_id=thread_id,
                     subagent=self.subagent_name,
-                    attempt=attempt,
-                    error=str(e),
+                    task_id=task_id,
                 )
-                await asyncio.sleep(0.5 * attempt)
+                return
+
+            await client.runs.create(
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                input={"messages": [{"role": "user", "content": message}]},
+            )
+            logger.info(
+                "completion_notify_sent",
+                parent_thread_id=thread_id,
+                subagent=self.subagent_name,
+                task_id=task_id,
+                attempt=attempt,
+            )
+        except Exception as e:  # noqa: BLE001 —— 通知是尽力而为，失败要留痕不能吞
+            if attempt >= 3:
+                self._notified_runs.discard(run_key)  # 释放占位，后续 hook 还能再试
+                logger.warning(
+                    "completion_notify_failed",
+                    parent_thread_id=thread_id,
+                    subagent=self.subagent_name,
+                    error=str(e),
+                    attempt=attempt,
+                    exc_info=True,
+                )
+                return
+            logger.info(
+                "completion_notify_retry",
+                parent_thread_id=thread_id,
+                subagent=self.subagent_name,
+                attempt=attempt,
+                error=str(e),
+            )
+            await asyncio.sleep(0.5 * attempt)
+            await self._deliver(ctx, attempt + 1, recheck)
+
+    def _defer(self, ctx: tuple[str, str, str, str, str, str, str], recheck: int) -> None:
+        """父线程忙：过一会儿再确认。1 ① 已经注入 → 跳过；2 父 run 收尾没注入 → 补投。"""
+        if recheck >= len(_RECHECK_DELAYS):
+            logger.info(
+                "completion_notify_gave_up_busy",
+                parent_thread_id=ctx[0],
+                subagent=self.subagent_name,
+            )
+            return
+        delay = _RECHECK_DELAYS[recheck]
+        task = asyncio.create_task(self._recheck(ctx, recheck + 1, delay))
+        _RECHECK_TASKS.add(task)
+        task.add_done_callback(_RECHECK_TASKS.discard)
+
+    async def _recheck(self, ctx: tuple[str, str, str, str, str, str, str], recheck: int, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await self._deliver(ctx, 1, recheck)
 
     @staticmethod
-    async def _parent_busy(client: Any, thread_id: str) -> bool:
-        """父线程是否正在跑别的 run（aegra 对非 interrupt 策略不拦并发写）。"""
+    async def _thread_view(client: Any, thread_id: str) -> tuple[str, dict[str, Any]]:
+        """(线程状态, 最新 state 快照)。查不到返回 ("unknown", {})。"""
         try:
-            state = await client.threads.get(thread_id)
-        except Exception:  # noqa: BLE001 —— 查不到就不阻塞通知
-            return False
-        return str(state.get("status") or "") == "busy"
+            thread = await client.threads.get(thread_id)
+        except Exception:  # noqa: BLE001
+            return "unknown", {}
+        status = str((thread or {}).get("status") or "idle")
+        try:
+            snapshot = await client.threads.get_state(thread_id) or {}
+        except Exception:  # noqa: BLE001 —— 拿不到快照就当没有投递记录
+            snapshot = {}
+        return status, snapshot
 
     def _mark_once(self, run_key: str) -> bool:
         """首次见到这个 run_key 返回 True；重复返回 False。
@@ -221,11 +333,15 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         content = content if content is not None else str(last)
         return content[:500] if isinstance(content, str) else str(content)[:500]
 
+    def _task_id(self) -> str | None:
+        """子 run 的 thread_id 就是父侧记的 task_id（guard 建任务时两者相同）。"""
+        return str((self._config().get("configurable") or {}).get("thread_id") or "") or None
+
     async def aafter_agent(self, state: dict[str, Any], runtime: Runtime) -> dict[str, Any] | None:
-        """成功完成时：推结果摘要给父线程。"""
+        """成功完成时：把结果摘要交给父线程（忙/挂起不插队，详见 _send_notification）。"""
         summary = self._extract_last_message(state)
         await self._send_notification(
-            f"[Async subagent '{self.subagent_name}' has completed] Result: {summary}"
+            f"[Async subagent '{self.subagent_name}' has completed] Result: {summary}", self._task_id()
         )
         return None
 
@@ -235,7 +351,8 @@ class CompletionNotifierMiddleware(AgentMiddleware):
             return await handler(request)
         except Exception as e:  # noqa: BLE001
             await self._send_notification(
-                f"[Async subagent '{self.subagent_name}' encountered an error] Error: {e!s}"
+                f"[Async subagent '{self.subagent_name}' encountered an error] Error: {e!s}",
+                self._task_id(),
             )
             raise
 

@@ -111,6 +111,14 @@ _Avoid_: 把它当成通用 xlsx agent、把子 agent 的数量写成固定值�
 `check_async_task` 或拦截层核实刷新，不保证实时。
 _Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态查 `GET /custom/tasks/{id}`）
 
+**Task delivery（任务结果投递）**:
+把子 agent 的结果送进主管上下文的动作，有两条路且**只该发生一次**：
+① 主管还在跑 —— `AsyncTaskGuard.abefore_model` 在下一次模型调用前把它作为一条消息注入
+（不打断、不开新 run）；② 主管已空闲 —— `CompletionNotifier` 开一轮新 run 投递。
+两条路都靠消息末尾的 `task_id:` 标记判重；主管在等人工回答（HITL interrupt）时一律不投递，
+留到用户答完后的下一轮由 ① 补齐。
+_Avoid_: 把投递说成"通知"（通知是手段，可用注入或回写）；把它当成同步等待（主管从不被阻塞）
+
 **Task proxy（任务代理）**:
 `custom/frontend_api.py` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread
 属主是服务账号，终端用户直接读会被 ownership 过滤挡成 404，所以必须经代理。

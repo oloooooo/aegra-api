@@ -223,7 +223,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 1. 在中间输入框问：「CBAM 默认排放因子里铝的因子是多少？」
 2. 主管先 `write_todos` 拆任务 → `start_async_task` 派给 `cbam_reporting` → 回你一句「已派给 CBAM 领域 agent（task_id: …）」。
 3. 右侧「任务」面板出现一张卡：状态从 `running` → `success`，卡片里能看到子 agent 的实时输出与工具步骤（`xlsx_info` / `xlsx_query`）。
-4. 子 agent 跑完会**主动回写**父线程（`CompletionNotifierMiddleware`），主管被唤醒并把结果转达给你——所以不用手动催「跑完了吗」。
+4. 子 agent 跑完，结果会被送到主管面前：主管当时还在干活就直接出现在它的下一次思考里（`AsyncTaskGuard.abefore_model` 注入，不打断、不开新 run）；主管已经答完则 `CompletionNotifierMiddleware` 开一轮新 run 把它叫醒。所以你不用手动催「跑完了吗」。
 
 ## 10. 父子 agent 之间的信息流通
 
@@ -235,10 +235,10 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 │  state.async_tasks{}     task_id → {agent_name, thread_id, run_id, status}   │
 │  工具：start / check / update / cancel / list_async_task、write_todos        │
 └───┬──────────────────────────────────────────────────────────▲─────────────┘
-    │ ① 任务描述（消息，单向给出）                                │ ③ 完成回写（消息，单向推回）
-    │  runs.create(thread_id=子线程,                              │  runs.create(thread_id=父线程,
-    │    input={messages:[{role:user, content:description}]})     │    input={messages:[{role:user, content:
-    │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"}]})
+    │ ① 任务描述（消息，单向给出）                                │ ③ 结果投递（消息，单向送回）
+    │  runs.create(thread_id=子线程,                              │  主管还在跑 → before_model 注入一条消息
+    │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → runs.create 开新一轮
+    │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"
     │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
     │ ② config.configurable（元数据，不进消息）                   │  身份：现铸父身份短时 token（300s）
     │  user_spaces = [ 本任务的那一个 space ]                      │
@@ -261,11 +261,29 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 |---|---|---|---|---|---|
 | ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
 | ② | 父 → 子 | `config.configurable` | 拦截层 | 同上 `_config_for()` | 无权限时直接拒绝派活 |
-| ③ | 子 → 父 | 父线程里一条 `user` 消息 | 子 agent 的中间件 | `custom/middlewares/completion_notifier.py` | 缺父上下文 → 静默跳过并告警 |
+| ③ | 子 → 父 | 父线程里一条消息（注入或新 run） | 主管侧 guard / 子 agent 中间件 | `async_task_guard.py::abefore_model`（主管在跑）/ `completion_notifier.py`（主管空闲） | 两条路都缺席则靠前端轮询与 `check_async_task` 兜底 |
 | ④ | 子 → 父 | 工具返回值 + state 更新 | 主管主动调用 | `deepagents/…/async_subagents.py::_build_check_result` | 返回 `Failed to get run status` |
 | ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/frontend_api.py::stream_task` | 发 `error` 帧后 `end` |
 
 `update_async_task(task_id, message)` 是 ① 的复用：往**同一个**子线程追加一条 `user` 消息并开新 run（`multitask_strategy="interrupt"` 顶掉旧 run）。
+
+### ③ 结果什么时候真正到达主管
+
+主管**从不等待**后台任务：派完继续干自己的活，结果到达时再插进来。两条投递路径按父线程当时的
+状态分工（`Thread.status`：`busy` / `interrupted` / `idle` / `error`）：
+
+| 父线程当时 | 谁投递 | 行为 |
+|---|---|---|
+| `busy`（主管的 run 还在跑） | 主管侧 guard（`abefore_model`） | 下一次调用模型前把结果作为一条消息注入；**不打断**当前步骤、不另开 run。子 agent 侧只安排一次延迟复查，兜住「主管正好在收尾」的情况 |
+| `interrupted`（图在等某个 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，主管恢复后的下一轮由 guard 自动补上 |
+| `idle` / `error`（主管已经答完） | `CompletionNotifier`（子 agent 侧） | 用父身份开一轮新 run 投递（就是上一轮对话里看到的那条「子 agent 返回」） |
+
+两条路不重复：消息末尾都带 `task_id: <id>`，投递前先查父线程 state 里有没有这个标记；
+已有就跳过。同一个 task 只处理一次，主 prompt 也要求模型对重复通知只更新 todo。
+
+**仍然存在的空隙**：子 agent 恰好在主管「正在生成最终答案」的那一刻完成时，那轮答案里不包含它，
+会落到 `idle` 那条路补答一轮（用户看到先答一版、再补一段）。要消除它只能硬杀主管的 run，
+代价是丢掉当前步骤并可能重复工具副作用，目前不做。
 
 ### 明确**不**流通的东西
 
@@ -462,7 +480,7 @@ uv run python custom_test.py "某个 bio-lab 领域的问题"
 |---|---|
 | 只能读本 space 的文件（含 ls/grep/glob 过滤） | `graphs/space_backend.py::SpaceBackend` |
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
-| 完成/出错自动回写父线程 | `CompletionNotifierMiddleware(subagent_name=name)` |
+| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管在跑时注入）+ `CompletionNotifierMiddleware`（主管空闲时回写唤醒） |
 | 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
 | 同时最多 3 个后台任务 + 僵尸状态核实 | `AsyncTaskGuard`（`MAX_ACTIVE_TASKS`） |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |

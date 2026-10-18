@@ -74,9 +74,36 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 - **`multitask_strategy` 被静默忽略**：`RunCreate` 接收该字段并存进 `RunJob.behavior`，但执行层没有任何消费。
 - **三处 wire 形状缺口**：`GET /threads/{tid}` 无 `values`（只有线程元数据）；`Run` 响应只有 `error_message`、无 `error`；`Run` 无 `interrupted_by`。
 
-### 2.4 子 agent 主动汇报（completion notification）现状（已核实）
+### 2.4 子 agent 结果投递（task delivery）
 
-> 背景：`custom/middlewares/completion_notifier.py` 想在子 agent 跑完时往 supervisor 的 thread 推一条 run，让 supervisor 不必等被问就汇报。以下为核实过的事实，**尚未接线**。
+> 背景：子 agent 跑完后要把结果送回 supervisor 的 thread，让它不必被问就汇报。**已接线**，
+> 当前实现是两条路：主管还在跑 → 拦截层在下一次模型调用前注入；主管已空闲 → 中间件开新 run 回写。
+
+**为什么不是一条路**：LangGraph 没有向运行中的图投递消息的 API；从外部能做的只有读状态、
+杀 run（`runs/cancel`）、另开 run。所以「主管一边干活一边拿到结果」只能由主管自己在
+`before_model` 边界上拿，而「主管早已答完」只能靠另开一个 run 叫醒。
+
+**投递规则**（`graphs/async_task_guard.py::abefore_model` + `custom/middlewares/completion_notifier.py`）：
+
+| 父线程当时 | 谁投递 | 行为 |
+|---|---|---|
+| `busy` | 主管侧 guard | 注入一条带 `task_id:` 标记的消息；不打断、不开新 run。子 agent 侧只安排延迟复查（8s/20s/45s）兜住「主管正好在收尾」 |
+| `interrupted` | 谁都不动 | 硬 resume 会把用户正等着回答的答案顶掉（同 §9 #1）；用户答完后下一轮 guard 自动补上。白名单 `_RESUMABLE_KINDS` 为空，将来做协作式挂起时再加 |
+| `idle` / `error` | `CompletionNotifier` | 以父身份开新 run 投递 |
+
+**去重**：两条路的消息都以 `[Async subagent '<name>' …] Result: …` 开头（前端 `toView`
+靠此前缀识别成「子 agent 返回」），并以 `task_id: <id>` 结尾；投递前先查父线程 state
+是否已有该标记。主管侧从 `state.messages` 查（零成本），中间件查 `GET /threads/{tid}/state`
+（仅在投递尝试时）。
+
+**成本**：guard 每次模型调用最多 3 次 `runs.get`（带 5s TTL；工具路径原本就会核实状态）；
+任务进入终态后不再查。中间件在 `busy` 时只安排复查，不产生 run。
+
+**仍存在的空隙**：子 agent 恰好在主管生成最终答案的那一刻完成时，那一轮答不到，会由
+`idle` 路径补一轮（用户看到先答一版、再补一段）。消除它只能硬杀主管的 run（丢当前步骤 +
+可能重复工具副作用），当前不做。
+
+以下为接线前核实过的事实，仍然适用：
 
 - **stock 派活不传父上下文**：`deepagents/middleware/async_subagents.py` 的四处 `runs.create`（264、304、499、538 行）只发 `thread_id` / `assistant_id` / `input`（update 路径多一个 `multitask_strategy="interrupt"`），全包 grep `parent_thread_id` / `parent_assistant_id` 零命中。父 ID 必须由 supervisor 侧显式带过去。
 - **aegra 照单接收 `config.configurable`**：`RunCreate.config`（`models/runs.py:46`）→ `run_preparation.py:328` 合并进 `assistant.config` → `create_run_config()`（`langgraph_service.py:717`）交给图；只强制覆盖 `thread_id` / `run_id`（同文件 721-722 行），其余键透传。所以 `parent_thread_id` 能原样到达子 agent 的**图工厂**。
@@ -263,7 +290,7 @@ supervisor = create_deep_agent(
 1. **HITL 子 agent 不能被 deepagents 续跑**：deepagents 没有 resume 工具，`update_async_task` 只会发新 input。而 LangGraph 1.2.14 的 `interrupt()` 只有 `Command(resume=...)` 才续跑；纯 input 打在被中断的线程上会让中断节点**从头重执行**，无 resume 值则再次中断——不续跑，且会重复一次模型调用。**子 agent 图不要配 `interrupt_on`**；需要人工审批的环节放在 supervisor 自己的图里。
 2. `action=rollback` 未实现（422）。
 3. 鉴权不在本期范围（默认 noop）。
-4. `multitask_strategy` 的 `reject` / `enqueue` / `rollback` 仍被忽略（同线程并发 run 可并存）。
+4. `multitask_strategy` 的 `reject` / `enqueue` / `rollback` 仍被忽略（同线程并发 run 可并存）。因此投递不会用 `multitask_strategy` 抢占，而是按父线程三态分派（见 §2.4）。
 5. `GET /threads/{tid}` 不返回 `interrupts`。
 6. 独立包 `aegra-protocol` 与根 `docs/` 保留不动，仅作历史参照。
 

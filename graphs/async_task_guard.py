@@ -19,14 +19,16 @@ check/cancel/list 不创建 run，直接放行给内置 handler。
 
 from __future__ import annotations
 
+import re
 import threading
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
@@ -39,6 +41,38 @@ logger = structlog.getLogger(__name__)
 MAX_ACTIVE_TASKS = 3
 
 _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
+
+# 结果投递（①）：子任务完成后，主管在下一次模型调用前把结果注入自己的上下文。
+# 注入文本与回写中间件保持**同一个前缀**，前端 toView 才会渲染成「子 agent 返回」；
+# 末尾的 ``task_id: <id>`` 是投递账本——两条投递路都靠它判重。
+_STATUS_TTL = 5.0  # 任务状态缓存秒数：状态的最小变化粒度是「一个 run 结束」
+_TASK_MARK = "task_id: "
+_TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
+
+
+def _message_text(msg: Any) -> str:
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return str(content) if content is not None else ""
+
+
+def _delivered_task_ids(messages: Any) -> set[str]:
+    """已经投递给主管的任务 id。
+
+    只认**投递消息**（`[Async subagent …` 前缀）：派活工具消息里也有 `task_id:`，
+    拿它当判据会把"还没投递"误判成"已投递"，结果永远不投。
+    """
+    out: set[str] = set()
+    for msg in messages or []:
+        text = _message_text(msg)
+        if text.startswith("[Async subagent"):
+            out.update(_TASK_ID_RE.findall(text))
+    return out
 
 
 def _now() -> str:
@@ -62,6 +96,8 @@ class AsyncTaskGuard(AgentMiddleware):
         # 详见 docs/adr/0008-active-task-limit-is-per-process.md。
         self._mu = threading.Lock()
         self._ledger: dict[str, dict[str, dict[str, Any]]] = {}
+        # 任务状态轮询缓存：task_id -> (monotonic 时间, status)
+        self._polled: dict[str, tuple[float, str]] = {}
 
     # ---------- 客户端（按 url+headers 缓存，与 deepagents _ClientCache 同键） ----------
 
@@ -199,6 +235,144 @@ class AsyncTaskGuard(AgentMiddleware):
             if status and status != task.get("status"):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out
+
+    # ---------- 结果投递：子任务完成后注入主管上下文（before_model） ----------
+
+    def _cached_status(self, task_id: str) -> str | None:
+        with self._mu:
+            hit = self._polled.get(task_id)
+        if hit and time.monotonic() - hit[0] < _STATUS_TTL:
+            return hit[1]
+        return None
+
+    def _cache_status(self, task_id: str, status: str) -> None:
+        with self._mu:
+            self._polled[task_id] = (time.monotonic(), status)
+            if len(self._polled) > 256:  # 任务数有上限，这里只为进程长跑不无限涨
+                oldest = min(self._polled, key=lambda k: self._polled[k][0])
+                self._polled.pop(oldest, None)
+
+    def _spec_of(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        spec = self._specs.get(task.get("agent_name", ""))
+        return spec if spec is not None and task.get("run_id") else None
+
+    def _poll_sync(self, task: dict[str, Any]) -> str | None:
+        task_id = task.get("task_id") or ""
+        cached = self._cached_status(task_id)
+        if cached is not None:
+            return cached
+        spec = self._spec_of(task)
+        if spec is None:
+            return None
+        try:
+            run = self._sync_client(spec).runs.get(task["thread_id"], task["run_id"])
+        except Exception:  # noqa: BLE001 — 查不到按原状态算，不阻断
+            return None
+        status = run.get("status") or task.get("status")
+        if status:
+            self._cache_status(task_id, status)
+        return status
+
+    async def _poll_async(self, task: dict[str, Any]) -> str | None:
+        task_id = task.get("task_id") or ""
+        cached = self._cached_status(task_id)
+        if cached is not None:
+            return cached
+        spec = self._spec_of(task)
+        if spec is None:
+            return None
+        try:
+            run = await self._async_client(spec).runs.get(task["thread_id"], task["run_id"])
+        except Exception:  # noqa: BLE001
+            return None
+        status = run.get("status") or task.get("status")
+        if status:
+            self._cache_status(task_id, status)
+        return status
+
+    @staticmethod
+    def _thread_summary(thread: Any) -> str:
+        messages = ((thread or {}).get("values") or {}).get("messages") or []
+        return (_message_text(messages[-1])[:500] or "(no output)") if messages else "(no output)"
+
+    def _summary_sync(self, task: dict[str, Any]) -> str:
+        spec = self._specs.get(task.get("agent_name", ""))
+        if spec is None or not task.get("thread_id"):
+            return "(no output)"
+        try:
+            return self._thread_summary(self._sync_client(spec).threads.get(task["thread_id"]))
+        except Exception:  # noqa: BLE001
+            return "(summary unavailable)"
+
+    async def _summary_async(self, task: dict[str, Any]) -> str:
+        spec = self._specs.get(task.get("agent_name", ""))
+        if spec is None or not task.get("thread_id"):
+            return "(no output)"
+        try:
+            return self._thread_summary(await self._async_client(spec).threads.get(task["thread_id"]))
+        except Exception:  # noqa: BLE001
+            return "(summary unavailable)"
+
+    @staticmethod
+    def _completion_text(task: dict[str, Any], status: str, summary: str) -> str:
+        name = task.get("agent_name", "subagent")
+        head = (
+            f"[Async subagent '{name}' has completed] Result: {summary}"
+            if status == "success"
+            else f"[Async subagent '{name}' has stopped ({status})] Result: {summary}"
+        )
+        return f"{head}\n\n{_TASK_MARK}{task['task_id']}"
+
+    @staticmethod
+    def _plan(
+        state: Any, fresh: dict[str, str | None]
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        """(状态更新, 待投递任务)。fresh 只含本轮查到的非终态任务新状态。"""
+        tasks = (state or {}).get("async_tasks") or {}
+        delivered = _delivered_task_ids((state or {}).get("messages") or [])
+        changed: dict[str, dict[str, Any]] = {}
+        pending: list[dict[str, Any]] = []
+        for task_id, task in tasks.items():
+            status = task.get("status")
+            if status not in _TERMINAL:
+                new = fresh.get(task_id)
+                if new and new != status:
+                    status = new
+                    changed[task_id] = {**task, "status": status, "last_checked_at": _now()}
+            # 工具路径可能已把 state 写成终态却没投递（_refreshed_* 只改状态），这里补投
+            if status in _TERMINAL and task_id not in delivered:
+                pending.append({**task, "status": status})
+        return changed, pending
+
+    @staticmethod
+    def _assemble(changed: dict[str, dict[str, Any]], texts: list[str]) -> dict[str, Any] | None:
+        if not changed and not texts:
+            return None
+        out: dict[str, Any] = {}
+        if changed:
+            out["async_tasks"] = changed
+        if texts:
+            out["messages"] = [HumanMessage(content=t) for t in texts]
+        return out
+
+    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        tasks = (state or {}).get("async_tasks") or {}
+        fresh = {tid: self._poll_sync(t) for tid, t in tasks.items() if t.get("status") not in _TERMINAL}
+        changed, pending = self._plan(state, fresh)
+        texts = [self._completion_text(t, t["status"], self._summary_sync(t)) for t in pending]
+        return self._assemble(changed, texts)
+
+    async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        tasks = (state or {}).get("async_tasks") or {}
+        fresh: dict[str, str | None] = {}
+        for task_id, task in tasks.items():
+            if task.get("status") not in _TERMINAL:
+                fresh[task_id] = await self._poll_async(task)
+        changed, pending = self._plan(state, fresh)
+        texts: list[str] = []
+        for task in pending:
+            texts.append(self._completion_text(task, task["status"], await self._summary_async(task)))
+        return self._assemble(changed, texts)
 
     # ---------- start ----------
 
