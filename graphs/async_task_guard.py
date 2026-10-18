@@ -10,7 +10,9 @@ spec 里的静态服务 token 建 thread/run，并附上：
   spec 无 space 绑定则回退全量快照；主管无鉴权上下文（本地 demo）时透传 null，
   子侧解析为不设限。
 - 并发上限：非终态任务 ≥ ``MAX_ACTIVE_TASKS``（3）时拒绝，返回错误文本让模型
-  自己等待/重试（Q3a：普通错误，不走 HITL）。
+  自己等待/重试（Q3a：普通错误，不走 HITL）。**判前先向子 run 核实真实状态**：
+  回写路径（CompletionNotifier → 唤醒主管）不经过 check_async_task，state 里的
+  ``status`` 会停在 ``running``，不核实就会把 3 个已成功的任务当活跃，永久卡死名额。
 
 check/cancel/list 不创建 run，直接放行给内置 handler。
 """
@@ -96,15 +98,54 @@ class AsyncTaskGuard(AgentMiddleware):
             "Wait for one to finish or cancel it before launching another."
         )
 
-    def _start_args(self, request: ToolCallRequest) -> tuple[dict[str, Any] | None, str | None]:
-        """返回 (spec, error_msg)。"""
+    def _start_args(
+        self, request: ToolCallRequest, refreshed: dict[str, dict[str, Any]]
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """返回 (spec, error_msg)。refreshed 是刚核实过的任务状态（覆盖 state 里的）。"""
         args = request.tool_call.get("args") or {}
         agent_type = args.get("subagent_type", "")
         if err := self._validate(agent_type):
             return None, err
-        if self._active_count(request.state) >= MAX_ACTIVE_TASKS:
+        tasks = {**((request.state or {}).get("async_tasks") or {}), **refreshed}
+        if self._active_count({"async_tasks": tasks}) >= MAX_ACTIVE_TASKS:
             return None, self._over_limit(request.state)
         return self._specs[agent_type], None
+
+    # ---------- 状态核实（防僵尸 running 卡死名额） ----------
+
+    def _refreshed_sync(self, request: ToolCallRequest) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for task in ((request.state or {}).get("async_tasks") or {}).values():
+            if task.get("status") in _TERMINAL:
+                continue
+            spec = self._specs.get(task.get("agent_name", ""))
+            if spec is None or not task.get("run_id"):
+                continue
+            try:
+                run = self._sync_client(spec).runs.get(task["thread_id"], task["run_id"])
+            except Exception:  # noqa: BLE001 — 查不到就按原状态算，不阻断派活
+                continue
+            status = run.get("status")
+            if status and status != task.get("status"):
+                out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
+        return out
+
+    async def _refreshed_async(self, request: ToolCallRequest) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for task in ((request.state or {}).get("async_tasks") or {}).values():
+            if task.get("status") in _TERMINAL:
+                continue
+            spec = self._specs.get(task.get("agent_name", ""))
+            if spec is None or not task.get("run_id"):
+                continue
+            try:
+                run = await self._async_client(spec).runs.get(task["thread_id"], task["run_id"])
+            except Exception:  # noqa: BLE001
+                continue
+            status = run.get("status")
+            if status and status != task.get("status"):
+                out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
+        return out
 
     # ---------- start ----------
 
@@ -184,17 +225,20 @@ class AsyncTaskGuard(AgentMiddleware):
             "last_updated_at": now,
         }
 
-    def _launched(self, request: ToolCallRequest, task: dict[str, Any]) -> Command[Any]:
+    def _launched(
+        self, request: ToolCallRequest, task: dict[str, Any], refreshed: dict[str, dict[str, Any]] | None = None
+    ) -> Command[Any]:
         msg = f"Launched async subagent. task_id: {task['task_id']}"
         return Command(
             update={
                 "messages": [ToolMessage(msg, tool_call_id=request.runtime.tool_call_id)],
-                "async_tasks": {task["task_id"]: task},
+                "async_tasks": {**(refreshed or {}), task["task_id"]: task},
             }
         )
 
     def _start_sync(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
-        spec, err = self._start_args(request)
+        refreshed = self._refreshed_sync(request)
+        spec, err = self._start_args(request, refreshed)
         if err:
             return self._err(request, err)
         assert spec is not None
@@ -209,15 +253,20 @@ class AsyncTaskGuard(AgentMiddleware):
                 thread_id=thread["thread_id"],
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": args.get("description", "")}]},
+                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
+                stream_mode=["messages", "custom"],
                 config=config,
             )
         except Exception as e:  # noqa: BLE001 — SDK 异常无类型，回给模型
             logger.warning("failed_to_launch_async_subagent", error=str(e))
             return self._err(request, f"Failed to launch async subagent: {e}")
-        return self._launched(request, self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"]))
+        return self._launched(
+            request, self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"]), refreshed
+        )
 
     async def _astart(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
-        spec, err = self._start_args(request)
+        refreshed = await self._refreshed_async(request)
+        spec, err = self._start_args(request, refreshed)
         if err:
             return self._err(request, err)
         assert spec is not None
@@ -232,12 +281,16 @@ class AsyncTaskGuard(AgentMiddleware):
                 thread_id=thread["thread_id"],
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": args.get("description", "")}]},
+                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
+                stream_mode=["messages", "custom"],
                 config=config,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("failed_to_launch_async_subagent", error=str(e))
             return self._err(request, f"Failed to launch async subagent: {e}")
-        return self._launched(request, self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"]))
+        return self._launched(
+            request, self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"]), refreshed
+        )
 
     # ---------- update（新 run 同样要带 config，否则子 agent 中途丢 spaces） ----------
 
@@ -275,6 +328,8 @@ class AsyncTaskGuard(AgentMiddleware):
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
                 multitask_strategy="interrupt",
+                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
+                stream_mode=["messages", "custom"],
                 config=config,
             )
         except Exception as e:  # noqa: BLE001
@@ -298,6 +353,8 @@ class AsyncTaskGuard(AgentMiddleware):
                 assistant_id=spec["graph_id"],
                 input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
                 multitask_strategy="interrupt",
+                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
+                stream_mode=["messages", "custom"],
                 config=config,
             )
         except Exception as e:  # noqa: BLE001

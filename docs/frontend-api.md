@@ -1,0 +1,179 @@
+# 前端接口参考
+
+前端（独立仓库，Vue 3 + Vite）对接本服务时的接口契约。全部结论来自**实测**（真起服务、跑 supervisor 与三个领域子 agent）。
+
+实现位置：`custom/frontend_api.py`（路由前缀 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
+
+## 1. 为什么需要这一层
+
+| 原生接口的问题 | 本层怎么解 |
+| - | - |
+| `GET /assistants` 返回全部历史 assistant（实测 14 条），含已删除的图与示例图 | `GET /custom/graphs` 只回 `aegra.json` 里注册的图 |
+| 子 agent 跑在独立 thread，属主是服务身份 `subagent_service`，终端用户 `GET /threads/{子线程}/state` 被 ownership 过滤挡成 **404** | `GET /custom/tasks/{id}` 与 `/stream` 做带鉴权的代理（ADR-0007） |
+| Space 内容没有任何接口暴露 | `GET /custom/spaces`、`/spaces/{name}/files` |
+| 成员管理只有「建 / 分配」，没有查 / 移除 | `GET/DELETE /custom/spaces/{name}/users` |
+
+## 2. 鉴权
+
+所有接口都要 `Authorization: Bearer <token>`，token 来自：
+
+```http
+POST /custom/login
+{"identity": "root", "password": "1234"}
+
+200 {"access_token": "...", "token_type": "bearer", "expires_in": 3600}
+```
+
+- token **1 小时**过期（`ACCESS_TOKEN_TTL`），没有 refresh token；前端收到 401 就回登录页。
+- `permissions` 含 `write` 表示超级用户（`user_tables.is_super`），能建 Space、分配用户、看全部 Space。
+- 当前身份：`GET /custom/whoami`；自己的空间：`GET /custom/user/spaces`。
+
+## 3. 本层接口
+
+### 3.1 `GET /custom/graphs`
+
+前端可选的助手。
+
+```json
+{"graphs": ["cbam_reporting", "hybrid_bonding", "sbol3_synbio", "supervisor"],
+ "identity": "root", "permissions": ["read", "write"]}
+```
+
+`graph_id` 可以直接当 `assistant_id` 用（见 `CONTEXT.md` 的 Graph key 词条）。
+
+### 3.2 `GET /custom/spaces`
+
+```json
+{"is_super": true, "spaces": [
+  {"name": "cbam-reporting", "path": "graphs/okf/cbam-reporting", "accessible": true, "file_count": 6}
+]}
+```
+
+`accessible` 已合并超管判定（超管对全部 Space 为 `true`）。
+
+### 3.3 `GET /custom/spaces/{space_name}/files`
+
+```json
+{"space": "cbam-reporting", "root": "graphs/okf/cbam-reporting", "files": [
+  {"path": "/cn_goods_rules.xlsx", "size": 7332, "modified": "2026-10-18T03:50:49+00:00", "ext": ".xlsx"}
+]}
+```
+
+无权限 → `403`。路径为 Space 内相对路径，直接拼 `/空间名/相对路径` 就是给 agent 用的虚拟路径。
+
+### 3.4 `GET /custom/spaces/{space_name}/users` / `DELETE .../users/{identity}`
+
+```json
+{"space": "cbam-reporting", "users": ["root"]}
+```
+
+删除成功 → `{"space": ..., "removed": "..."}`；不在空间里 → `404`；非超管 → `403`。
+
+### 3.5 `GET /custom/tasks/{task_id}?parent_thread_id={父线程}`
+
+异步子任务状态。`task_id` 即父线程 state 里 `async_tasks` 的键（同时就是子线程 id）。
+
+```json
+{"task_id": "fe2bb1b4-...", "thread_id": "fe2bb1b4-...", "run_id": "e1c957e1-...",
+ "agent_name": "hybrid_bonding", "status": "running",
+ "created_at": "...", "last_checked_at": "...", "message_count": 7}
+```
+
+- `status` 是**向子 run 核实过的**真实状态，不要读父线程 state 里的 `async_tasks.status`（会滞后，见 ADR-0007）。
+- 授权：父线程必须属于当前用户，且它的 `async_tasks` 里确实有这个 `task_id`；否则 `404`。
+
+### 3.6 `GET /custom/tasks/{task_id}/stream?parent_thread_id={父线程}`
+
+把子 agent 的 run 事件转成 SSE。SSE 帧格式与主对话流一致（`event:` + `data:`），前端可复用同一个解析器。
+
+帧序列：
+
+```
+event: metadata   data: {"task_id": "...", "thread_id": "..."}
+event: values     data: {"messages": [...]}          ← 连接前的快照（补齐历史）
+event: messages/partial | custom | messages/complete ← 实时
+event: end        data: {"status": "success"}
+```
+
+实测一次子 agent 执行的事件量：`messages/partial ×3418`、`custom ×18`（工具 start/done）、`messages/complete ×9`、`end ×1`。
+**必须节流**：`messages/partial` 是逐 token 全量文本，直接渲染会卡。
+
+- 任务已结束时：只发 `metadata` + `values` + `end`，不发实时帧。
+- `stream_mode` 查询参数可覆盖，默认 `messages,custom`；`values` 每步都是整态快照，量大，要才加。
+
+前置条件：子 run 创建时必须声明 `stream_mode=["messages","custom"]`（`graphs/async_task_guard.py` 已声明）。若不声明，aegra 默认只产 `values`，代理订阅不到 token 流。
+
+## 4. 直接用的原生接口
+
+| 用途 | 接口 | 备注 |
+| - | - | - |
+| 会话列表 / 建 / 删 | `POST /threads/search`、`POST /threads`、`DELETE /threads/{id}` | 已按 `user_id` 隔离；删除不可恢复 |
+| 发消息 + 流式 | `POST /threads/{id}/runs/stream` | `stream_mode=["messages","custom","updates","values"]` |
+| 追问恢复 | `POST /threads/{id}/runs` | body `{"command": {"resume": "<选项 label>"}}` |
+| 停止 | `POST /threads/{id}/runs/{run_id}/cancel` | |
+| 历史 / 状态 | `GET /threads/{id}/history`、`GET /threads/{id}/state` | |
+| 定时任务 | `POST /threads/{id}/runs/crons`、`POST /runs/crons/search`、`PATCH/DELETE /runs/crons/{id}` | 见 §6 |
+
+用不到的：`/store/*`、`/runs/crons` 之外的 stateless runs、`/assistants/*/subgraphs`、checkpoint 回放。
+
+## 5. 前端必须处理的四个契约
+
+### 5.1 `messages/partial` 要自己算增量
+
+aegra 推的每条 `messages/partial` 都是「该消息到目前为止的**完整内容**」，不是新增片段：
+
+```js
+if (text.length > printed[msg.id] ?? 0) { render(text.slice(printed[msg.id] ?? 0)); printed[msg.id] = text.length }
+```
+
+### 5.2 追问（HITL）
+
+`updates` 流里出现：
+
+```json
+{"__interrupt__": [{"id": "6dbb...", "value": {
+  "tool": "ask_user_question", "header": "选表",
+  "question": "\"那个表\"指哪一个？",
+  "options": [{"label": "键合工艺DOE.xlsx", "description": "..."}]}}]}
+```
+
+渲染成选项卡片 → 用户点选 → `POST /threads/{id}/runs` `{"command":{"resume":"<label>"}}`。
+agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null}`。一次回答后它可能接着问下一个问题，要支持连续中断。
+
+### 5.3 子 agent 的回写不是用户消息
+
+子 agent 完成后，父线程会多一条 **`human`** 消息，内容以 `[Async subagent 'cbam_reporting' has completed] Result: ...` 开头。
+这是 `CompletionNotifierMiddleware` 现铸父身份 token 写回的通知（ADR-0006），**渲染成「子任务返回结果」区块**，不要当作用户输入。
+
+### 5.4 状态可能滞后
+
+父 state 的 `async_tasks.status` 只在主管调用 `check_async_task` 时才更新；走回写路径时不更新。
+要展示状态就用 `GET /custom/tasks/{id}`。
+
+## 6. 定时任务
+
+```http
+POST /threads/{thread_id}/runs/crons
+{"assistant_id": "supervisor", "schedule": "* * * * *", "timezone": "Asia/Shanghai",
+ "input": {"messages": [{"role": "user", "content": "每日巡检"}]}}
+```
+
+实测行为：
+
+- **创建即先跑一次**，之后按 cron 重复；返回的是一次 Run，`status` 从 `pending` 开始。
+- cron 触发的 run **带完整用户身份**：派子 agent、完成回写、Space 权限全部正常（`completion_notify_sent` 正常打出）。
+- `POST /runs/crons/search` 返回 `next_run_date` / `enabled` / `payload`；`PATCH` 可改 schedule 或 `{"enabled": false}` 暂停。
+- **删除线程会级联删除它的 cron**，不会留孤儿。
+- 没有「执行历史」接口：每次触发的 run 就在该线程的 `/threads/{id}/runs` 里。
+
+## 7. 会话删除
+
+`DELETE /threads/{id}` → `200`；之后 `GET /threads/{id}` → `404`，`/threads/{id}/runs` → `[]`。
+无软删除、无回收站，前端必须二次确认。
+
+## 8. 已知限制
+
+- 代理接口是**单次 Run 订阅**：子 agent 若被 `update_async_task` 再跑一轮，前端要按新的 `run_id` 重新连。
+- `service_token()` 是 10 年期长期 token（沿用 ADR-0004 的 shortcut），只在服务端使用，不下发浏览器。
+- 没有文件上传接口：用户目前无法把文件写进自己的 Space。
+- 没有 refresh token。

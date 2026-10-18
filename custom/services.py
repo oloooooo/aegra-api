@@ -30,6 +30,29 @@ def _create_access_token(identity: str) -> str:
     return jwt.encode(payload, os.environ["JWT_SECRET"], algorithm="HS256")
 
 
+# 内部服务账号（async subagent / 前端代理读取子线程用）
+SERVICE_IDENTITY = os.environ.get("SERVICE_IDENTITY", "subagent_service")
+_service_token_cache: str | None = None
+
+
+def service_token() -> str:
+    """服务身份的长期 token（进程级缓存）。
+
+    custom_auth 对 SERVICE_IDENTITY 免 DB 直接放行；子 agent 的 thread 属主就是它，
+    所以只有它能读子线程/订阅子 run。shortcut: 10 年有效、与服务同生共死；
+    要轮换时改 env 或改成启动时铸造。
+    """
+    global _service_token_cache
+    if _service_token_cache is None:
+        now = int(time.time())
+        _service_token_cache = jwt.encode(
+            {"sub": SERVICE_IDENTITY, "iat": now, "exp": now + 10 * 365 * 24 * 3600},
+            os.environ["JWT_SECRET"],
+            algorithm="HS256",
+        )
+    return _service_token_cache
+
+
 def _decode_access_token(token: str) -> str:
     """
     接收access token

@@ -22,6 +22,7 @@ spaces 解析见 ``space_access.allowed_spaces``：无鉴权上下文（本地 d
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 
 import structlog
@@ -153,11 +154,48 @@ class SpaceBackend(FilesystemBackend):
                 return GrepResult(error=f"无权搜索内部目录 {path}", matches=[])
             if err := self._check_read(path):
                 return GrepResult(error=err, matches=[])
-        result = super().grep(pattern, path, glob, max_count=max_count, context_lines=context_lines)
+        try:
+            result = super().grep(pattern, path, glob, max_count=max_count, context_lines=context_lines)
+        except UnicodeDecodeError:
+            # ripgrep 子进程用系统 locale 编码解码 stdout（Windows 下是 GBK），
+            # 扫到 space 里的 xlsx/图片等二进制就抛；改用 Python 扫描兜底。
+            logger.warning("ripgrep_decode_failed_python_fallback", pattern=pattern, path=path)
+            return self._py_grep(pattern, path, glob, max_count, spaces)
         if result.matches is None:
             return result
         result.matches = [m for m in result.matches if self._visible(m["path"], spaces)]
         return result
+
+    def _py_grep(
+        self,
+        pattern: str,
+        path: str | None,
+        glob_pattern: str | None,
+        max_count: int | None,
+        spaces: frozenset[str],
+    ) -> GrepResult:
+        """纯 Python 字面匹配兜底（与基类 Python 搜索同语义，按 spaces 过滤）。"""
+        root = self.cwd / (path or "").strip("/") if path else self.cwd
+        if not root.exists():
+            return GrepResult(error=f"路径不存在：{path}", matches=[])
+        matches: list[dict] = []
+        files = [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
+        for f in files:
+            vpath = "/" + f.relative_to(self.cwd).as_posix()
+            if not self._visible(vpath, spaces):
+                continue
+            if glob_pattern and not fnmatch.fnmatch(f.name, glob_pattern):
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if pattern in line:
+                    matches.append({"path": vpath, "line": line_no, "text": line})
+                    if max_count is not None and len(matches) >= max_count:
+                        return GrepResult(matches=matches, truncated=True)
+        return GrepResult(matches=matches)
 
     def _visible(self, vpath: str, spaces: frozenset[str]) -> bool:
         if _is_internal(vpath):

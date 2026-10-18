@@ -117,10 +117,39 @@ async for ev in stream:
 1. **子 agent 的流不会回传到父线程。** 异步子图跑在独立 run/thread
    （`graphs/async_task_guard.py` 建的），主管的流里**只有
    `start_async_task` / `check_async_task` 两次工具调用**；子图的 token / 工具 / `custom`
-   进度全在**子图自己的 thread** 上。前端要实时显示子图进度，得拿 `task_id`
-   （即子线程 id，存在 `async_tasks` 里）**再开一条 `client.stream`** 订阅它。
-   deepagents `middleware/async_subagents.py` 里没有任何流转发（已 grep 确认）。
+   进度全在**子图自己的 thread** 上。deepagents `middleware/async_subagents.py` 里没有任何流转发（已 grep 确认）。
+   要订閲子图必须先拿到 `task_id`（即子线程 id，存在 `async_tasks` 里），但它是服务身份的
+   thread，终端用户直接读会被 ownership 过滤挡成 404 —— 走 `custom/frontend_api.py` 的
+   `GET /custom/tasks/{task_id}/stream` 代理（见 §8），不要绕着开原生流。
 2. **`custom` 只在代码调 `runtime.stream_writer` 时才有**——主管的 `ls/read_file` 不打
    （实测主管 `custom ×0`），`graphs/xlsx_tools.py` 打（16 条）。想在主管侧也看到工具进度，
    需去 `graphs/` 给对应工具补 `stream_writer`。
-3. `values` 里带 `async_tasks`（后台任务注册表），正好给前端渲染任务列表用。
+3. `values` 里带 `async_tasks`（后台任务注册表），正好给前端渲染任务列表用——但
+   `status` 会滞后（见 §8.2），要真实状态查 `GET /custom/tasks/{id}`。
+
+## 8. 子 agent 的流：代理与两个前提
+
+### 8.1 代理接口
+
+`GET /custom/tasks/{task_id}/stream?parent_thread_id=...`（`custom/frontend_api.py`）把子 run 的
+事件转成同样的 SSE 帧（`event:` + `data:`）转发给浏览器。授权靠「父线程属于当前用户 +
+父 state 的 `async_tasks` 里确实有这个 task_id」，服务 token 只在服务端内部使用。
+
+帧序列：`metadata` → `values`（连接前的快照，补齐历史）→ `messages/partial` | `custom` |
+`messages/complete` → `end`。任务已结束则只发 `metadata` + `values` + `end`。
+
+实测一次子 agent 执行：`messages/partial ×3418`、`custom ×18`、`messages/complete ×9`、`end ×1`
+——前端必须节流，`messages/partial` 是逐 token 全量文本。
+
+### 8.2 两个前提（都已落地）
+
+1. **子 run 必须声明流模式**：拦截层 `runs.create(..., stream_mode=["messages", "custom"])`。
+   不声明时 aegra 默认只产 `values`（`run_executor._resolve_stream_modes` 缺省 `["values"]`），
+   代理再订閲 `messages/custom` 也拿不到东西。
+2. **`async_tasks.status` 会僵尸**：它只由 `check_async_task` 更新；走完成回写路径
+   （`CompletionNotifier` → 唤醒主管 → 直接转达）时不更新，state 里的 `status` 永远停在 `running`。
+   拦截层现在派活前会向子 run 核实真实状态并回写（`_refreshed_sync/_refreshed_async`），
+   否则 `MAX_ACTIVE_TASKS=3` 的名额会被 3 个已成功的任务永久占满。见 ADR-0007。
+
+前端对接全文（接口清单、SSE 帧、interrupt/resume、定时任务、删除）见
+[`frontend-api.md`](./frontend-api.md)。

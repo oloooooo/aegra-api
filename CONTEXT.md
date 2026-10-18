@@ -99,3 +99,19 @@ _Avoid_: 把它当成绝对路径或 URL、把这一列当成访问控制的依�
 **Service account（服务账号）**:
 async subagent 的运行身份。它不是登录账号，没有关联 Space，子 agent 运行期间以它通过鉴权。
 _Avoid_: 把它当成普通用户、把子 agent 当成终端用户本人
+
+**Domain subagent（领域子 agent）**:
+固定绑一个 Space 与一份领域 prompt 的异步子 agent（当前为 `cbam_reporting` / `hybrid_bonding` /
+`sbol3_synbio`）。它不是通用表格 agent：能看哪些文件由派活时下发的那个 Space 决定。
+_Avoid_: 把它当成通用 xlsx agent、把子 agent 的数量写成固定值（它随 Space 增加）
+
+**Async task（异步任务）**:
+主管经 `start_async_task` 派出的一个后台子 agent 执行。在主管 state 的 `async_tasks` 里登记，
+键是 `task_id`，值同时就是子执行所在的 thread id。它的 `status` 是**快照**，只由
+`check_async_task` 或拦截层核实刷新，不保证实时。
+_Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态查 `GET /custom/tasks/{id}`）
+
+**Task proxy（任务代理）**:
+`custom/frontend_api.py` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread
+属主是服务账号，终端用户直接读会被 ownership 过滤挡成 404，所以必须经代理。
+_Avoid_: 把它当成转发层（它同时是授权层：要求父线程属于当前用户且其 `async_tasks` 里有该 task）
