@@ -71,6 +71,16 @@ _TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
 # 延迟复查的 task 需要留引用，否则可能被 GC（asyncio 只持弱引用）
 _RECHECK_TASKS: set[asyncio.Task[Any]] = set()
 
+# 投递的进程内串行化：两个子 agent 同时完成时，避免两边都在「state 还没有标记」
+# 的时间窗里各开一个 run。跨进程的同一窗口靠 state 标记兜（后到的那次会看到标记）。
+_DELIVERY_LOCK = asyncio.Lock()
+
+# 本进程已经投递过的 (父线程, task)：state 标记要等投递 run 落 checkpoint 才可见，
+# 这个集合补上"刚刚发出去"的那一段空白期。有界，重启即清空。
+_DELIVERED_LOCAL: set[tuple[str, str]] = set()
+_DELIVERED_ORDER: deque[tuple[str, str]] = deque()
+_DELIVERED_MAX = 4096
+
 
 def _text_of(msg: Any) -> str:
     """消息内容 → 纯文本（state 里既可能是 dict，也可能是消息对象）。"""
@@ -94,6 +104,17 @@ def _already_delivered(snapshot: dict[str, Any], task_id: str) -> bool:
         if text.startswith("[Async subagent") and task_id in _TASK_ID_RE.findall(text):
             return True
     return False
+
+
+def _remember_delivered(thread_id: str, task_id: str) -> None:
+    """记下本进程刚投递过的 (父线程, task)；有界，淘汰最旧。"""
+    key = (thread_id, task_id)
+    if key in _DELIVERED_LOCAL:
+        return
+    _DELIVERED_LOCAL.add(key)
+    _DELIVERED_ORDER.append(key)
+    while len(_DELIVERED_ORDER) > _DELIVERED_MAX:
+        _DELIVERED_LOCAL.discard(_DELIVERED_ORDER.popleft())
 
 
 def _interrupt_kinds(snapshot: dict[str, Any]) -> set[str]:
@@ -208,43 +229,54 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         thread_id, assistant_id, identity, url, message, task_id, run_key = ctx
         try:
             client = get_client(url=url, headers={"Authorization": f"Bearer {_mint_parent_token(identity)}"})
-            status, snapshot = await self._thread_view(client, thread_id)
+            status = await self._thread_status(client, thread_id)
 
             if status == "busy":
                 self._defer(ctx, recheck)
                 return
-            if status == "interrupted":
-                kinds = _interrupt_kinds(snapshot)
-                if not (kinds & _RESUMABLE_KINDS):
-                    logger.info(
-                        "completion_notify_skipped_interrupted",
-                        parent_thread_id=thread_id,
-                        subagent=self.subagent_name,
-                        interrupt_kinds=sorted(kinds) or ["none"],
-                    )
-                    return
-                # 白名单命中（目前为空）：将来做协作式挂起时走这里
-                await client.runs.create(
-                    thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
-                )
-                logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
-                return
             if status == "unknown":
                 raise RuntimeError("parent thread unreachable")
-            if _already_delivered(snapshot, task_id):
-                logger.info(
-                    "completion_notify_skipped_delivered",
-                    parent_thread_id=thread_id,
-                    subagent=self.subagent_name,
-                    task_id=task_id,
-                )
-                return
 
-            await client.runs.create(
-                thread_id=thread_id,
-                assistant_id=assistant_id,
-                input={"messages": [{"role": "user", "content": message}]},
-            )
+            # 判重 + 创建放在同一把进程内锁里：多个子 agent 同时完成时，
+            # 后到的那个能看到前一个的本地认领，不会各开一个 run。
+            async with _DELIVERY_LOCK:
+                status = await self._thread_status(client, thread_id)  # 锁内复查，防止刚变忙
+                if status == "busy":
+                    self._defer(ctx, recheck)
+                    return
+                snapshot = await self._thread_state(client, thread_id)
+                if status == "interrupted":
+                    kinds = _interrupt_kinds(snapshot)
+                    if not (kinds & _RESUMABLE_KINDS):
+                        logger.info(
+                            "completion_notify_skipped_interrupted",
+                            parent_thread_id=thread_id,
+                            subagent=self.subagent_name,
+                            interrupt_kinds=sorted(kinds) or ["none"],
+                        )
+                        return
+                    # 白名单命中（目前为空）：将来做协作式挂起时走这里
+                    await client.runs.create(
+                        thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
+                    )
+                    _remember_delivered(thread_id, task_id)
+                    logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
+                    return
+                if (thread_id, task_id) in _DELIVERED_LOCAL or _already_delivered(snapshot, task_id):
+                    logger.info(
+                        "completion_notify_skipped_delivered",
+                        parent_thread_id=thread_id,
+                        subagent=self.subagent_name,
+                        task_id=task_id,
+                    )
+                    return
+
+                await client.runs.create(
+                    thread_id=thread_id,
+                    assistant_id=assistant_id,
+                    input={"messages": [{"role": "user", "content": message}]},
+                )
+                _remember_delivered(thread_id, task_id)
             logger.info(
                 "completion_notify_sent",
                 parent_thread_id=thread_id,
@@ -293,18 +325,20 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         await self._deliver(ctx, 1, recheck)
 
     @staticmethod
-    async def _thread_view(client: Any, thread_id: str) -> tuple[str, dict[str, Any]]:
-        """(线程状态, 最新 state 快照)。查不到返回 ("unknown", {})。"""
+    async def _thread_status(client: Any, thread_id: str) -> str:
+        """父线程状态；查不到返回 "unknown"。busy 时不必再花一次请求取 state。"""
         try:
             thread = await client.threads.get(thread_id)
         except Exception:  # noqa: BLE001
-            return "unknown", {}
-        status = str((thread or {}).get("status") or "idle")
+            return "unknown"
+        return str((thread or {}).get("status") or "idle")
+
+    @staticmethod
+    async def _thread_state(client: Any, thread_id: str) -> dict[str, Any]:
         try:
-            snapshot = await client.threads.get_state(thread_id) or {}
+            return await client.threads.get_state(thread_id) or {}
         except Exception:  # noqa: BLE001 —— 拿不到快照就当没有投递记录
-            snapshot = {}
-        return status, snapshot
+            return {}
 
     def _mark_once(self, run_key: str) -> bool:
         """首次见到这个 run_key 返回 True；重复返回 False。

@@ -184,10 +184,41 @@ async def notifier_checks() -> None:
     check("投递消息带 task_id 标记", "task_id: t4" in sent)
 
     # 4b. 派活工具消息里的 task_id 不算"已投递"（回归：曾因此永不投递）
+    notifier_mod._DELIVERED_LOCAL.clear()
+    notifier_mod._DELIVERED_ORDER.clear()
     launch = {"values": {"messages": [{"type": "tool", "content": "Launched async subagent. task_id: t4"}]}}
     mw, client = make_notifier("idle", launch)
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t4")
     check("派活消息不算已投递 → 仍会投递", len(client.runs.created) == 1, str(client.runs.created))
+
+    # 4c. 两个子 agent 同时完成（父线程 idle）：只允许开出 1 个投递 run
+    notifier_mod._DELIVERED_LOCAL.clear()
+    notifier_mod._DELIVERED_ORDER.clear()
+    mw_a, client_a = make_notifier("idle", {"values": {"messages": []}})
+    # 两个中间件共用同一个假客户端，模拟同一父线程上的两次并发投递
+    mw_b = notifier_mod.CompletionNotifierMiddleware(subagent_name="hybrid_bonding")
+    for attr in ("parent_thread_id", "parent_assistant_id", "parent_user_identity", "notify_url"):
+        setattr(mw_b, attr, getattr(mw_a, attr))
+    notifier_mod.get_client = lambda url, headers: client_a  # type: ignore[assignment]
+    await asyncio.gather(
+        mw_a._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t6a"),
+        mw_b._send_notification("[Async subagent 'hybrid_bonding' has completed] Result: B", "t6b"),
+    )
+    check("并发完成：两个不同任务各投递一次", len(client_a.runs.created) == 2, str(len(client_a.runs.created)))
+
+    # 4d. 同一个任务被并发投递两次（重投/双 hook）：只允许 1 个 run
+    notifier_mod._DELIVERED_LOCAL.clear()
+    notifier_mod._DELIVERED_ORDER.clear()
+    mw_c, client_c = make_notifier("idle", {"values": {"messages": []}})
+    mw_d = notifier_mod.CompletionNotifierMiddleware(subagent_name="cbam_reporting")
+    for attr in ("parent_thread_id", "parent_assistant_id", "parent_user_identity", "notify_url"):
+        setattr(mw_d, attr, getattr(mw_c, attr))
+    notifier_mod.get_client = lambda url, headers: client_c  # type: ignore[assignment]
+    await asyncio.gather(
+        mw_c._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t7"),
+        mw_d._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t7"),
+    )
+    check("同一任务并发投递：只开 1 个 run", len(client_c.runs.created) == 1, str(len(client_c.runs.created)))
 
     # 5. 未知中断 → 不碰
     mw, client = make_notifier("interrupted", {"interrupts": [{"value": {"kind": "some_future_thing"}}]})
