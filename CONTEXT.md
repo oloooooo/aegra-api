@@ -115,7 +115,7 @@ _Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态�
 把子 agent 的结果送进主管上下文的动作，有两条路且**只该发生一次**：
 ① 主管还在跑 —— `AsyncTaskGuard.abefore_model` 在下一次模型调用前把它作为一条消息注入
 （不打断、不开新 run）；② 主管已空闲 —— `CompletionNotifier` 开一轮新 run 投递。
-两条路都靠消息末尾的 `task_id:` 标记判重；主管在等人工回答（HITL interrupt）时一律不投递，
+两条路都靠消息末尾的 `(task_id, run_id)` 标记判重（同一任务被 `update_async_task` 重跑会产生新结果）；主管在等人工回答（HITL interrupt）时一律不投递，
 留到用户答完后的下一轮由 ① 补齐。同一 `(父线程, task)` 至多投递一条消息；多进程并发收尾时
 仍有一个窄重复窗口（见 ADR-0010）。
 _Avoid_: 把投递说成"通知"（通知是手段，可用注入或回写）；把它当成同步等待（主管从不被阻塞）

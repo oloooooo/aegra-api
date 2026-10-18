@@ -92,8 +92,9 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 | `idle` / `error` | `CompletionNotifier` | 以父身份开新 run 投递 |
 
 **去重**：两条路的消息都以 `[Async subagent '<name>' …] Result: …` 开头（前端 `toView`
-靠此前缀识别成「子 agent 返回」），并以 `task_id: <id>` 结尾；投递前先查父线程 state
-是否已有该标记。主管侧从 `state.messages` 查（零成本），中间件查 `GET /threads/{tid}/state`
+靠此前缀识别成「子 agent 返回」），结尾带 `task_id: <id>` 与 `run_id: <id>`；判重键是
+**(task_id, run_id)** —— `update_async_task` 会给同一任务开新 run，只认 task_id 会吞掉更新后的结果。
+投递前先查父线程 state 是否已有该二元组。主管侧从 `state.messages` 查（零成本），中间件查 `GET /threads/{tid}/state`
 （仅在投递尝试时）。
 
 **成本**：guard 每次模型调用最多 3 次 `runs.get`（带 5s TTL；工具路径原本就会核实状态）；

@@ -67,6 +67,7 @@ _RECHECK_DELAYS = (8, 20, 45)
 
 # 后台任务结果消息里的投递标记（与 graphs/async_task_guard.py 共用同一格式）
 _TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
+_RUN_ID_RE = re.compile(r"run_id: ([0-9a-zA-Z_-]+)")
 
 # 延迟复查的 task 需要留引用，否则可能被 GC（asyncio 只持弱引用）
 _RECHECK_TASKS: set[asyncio.Task[Any]] = set()
@@ -77,8 +78,8 @@ _DELIVERY_LOCK = asyncio.Lock()
 
 # 本进程已经投递过的 (父线程, task)：state 标记要等投递 run 落 checkpoint 才可见，
 # 这个集合补上"刚刚发出去"的那一段空白期。有界，重启即清空。
-_DELIVERED_LOCAL: set[tuple[str, str]] = set()
-_DELIVERED_ORDER: deque[tuple[str, str]] = deque()
+_DELIVERED_LOCAL: set[tuple[str, str, str]] = set()  # (父线程, task_id, run_id)
+_DELIVERED_ORDER: deque[tuple[str, str, str]] = deque()
 _DELIVERED_MAX = 4096
 
 
@@ -92,7 +93,7 @@ def _text_of(msg: Any) -> str:
     return str(content) if content is not None else ""
 
 
-def _already_delivered(snapshot: dict[str, Any], task_id: str) -> bool:
+def _already_delivered(snapshot: dict[str, Any], task_id: str, run_id: str) -> bool:
     """父线程的 state 里是否已经有这个任务的**投递**记录（① 注入或本中间件回写）。
 
     只认 `[Async subagent …` 开头的消息：派活工具消息同样带 `task_id:`，
@@ -101,14 +102,18 @@ def _already_delivered(snapshot: dict[str, Any], task_id: str) -> bool:
     values = (snapshot or {}).get("values") or {}
     for msg in values.get("messages") or []:
         text = _text_of(msg)
-        if text.startswith("[Async subagent") and task_id in _TASK_ID_RE.findall(text):
+        if not text.startswith("[Async subagent"):
+            continue
+        tasks = _TASK_ID_RE.findall(text)
+        runs = _RUN_ID_RE.findall(text)
+        if task_id in tasks and run_id in runs:
             return True
     return False
 
 
-def _remember_delivered(thread_id: str, task_id: str) -> None:
-    """记下本进程刚投递过的 (父线程, task)；有界，淘汰最旧。"""
-    key = (thread_id, task_id)
+def _remember_delivered(thread_id: str, task_id: str, run_id: str) -> None:
+    """记下本进程刚投递过的 (父线程, task, run)；有界，淘汰最旧。"""
+    key = (thread_id, task_id, run_id)
     if key in _DELIVERED_LOCAL:
         return
     _DELIVERED_LOCAL.add(key)
@@ -221,7 +226,7 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         thread_id, assistant_id, identity, url = parent
         task_id = task_id or str((self._config().get("configurable") or {}).get("thread_id") or thread_id)
         # 末尾带 task_id：主管侧与这里的判重都靠这个标记（两边投递只留一份）
-        message = f"{message}\n\ntask_id: {task_id}"
+        message = f"{message}\n\ntask_id: {task_id}\nrun_id: {run_key}"
         ctx = (thread_id, assistant_id, identity, url, message, task_id, run_key)
         await self._deliver(ctx)
 
@@ -259,10 +264,12 @@ class CompletionNotifierMiddleware(AgentMiddleware):
                     await client.runs.create(
                         thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
                     )
-                    _remember_delivered(thread_id, task_id)
+                    _remember_delivered(thread_id, task_id, run_key)
                     logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
                     return
-                if (thread_id, task_id) in _DELIVERED_LOCAL or _already_delivered(snapshot, task_id):
+                if (thread_id, task_id, run_key) in _DELIVERED_LOCAL or _already_delivered(
+                    snapshot, task_id, run_key
+                ):
                     logger.info(
                         "completion_notify_skipped_delivered",
                         parent_thread_id=thread_id,
@@ -276,7 +283,7 @@ class CompletionNotifierMiddleware(AgentMiddleware):
                     assistant_id=assistant_id,
                     input={"messages": [{"role": "user", "content": message}]},
                 )
-                _remember_delivered(thread_id, task_id)
+                _remember_delivered(thread_id, task_id, run_key)
             logger.info(
                 "completion_notify_sent",
                 parent_thread_id=thread_id,

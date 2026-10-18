@@ -11,9 +11,12 @@
 [Async subagent '<name>' has completed] Result: …
 <空行>
 task_id: <id>
+run_id: <完成这次执行的 run id>
 ```
 
-判重规则：**只认以 `[Async subagent` 开头且含该 `task_id` 的消息**。派活工具返回的
+判重键是 **(task_id, run_id) 二元组**，且**只认以 `[Async subagent` 开头的消息**。
+用二元组而不是 `task_id` 单键，是因为 `update_async_task` 会给同一个任务开新 run，
+只认 `task_id` 会把更新后的第二次结果当成重复丢掉。派活工具返回的
 `Launched async subagent. task_id: …` 同样带 `task_id:`，不排除会把"待投递"误判成"已投递"
 （实现时踩过，自检里有回归用例）。
 

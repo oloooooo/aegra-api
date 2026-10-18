@@ -80,7 +80,7 @@ async def guard_checks() -> None:
     check("running→success 会注入", bool(msgs))
     text = msgs[0].content if msgs else ""
     check("注入文本以 [Async subagent 开头（前端认它是子 agent 返回）", text.startswith("[Async subagent 'cbam_reporting'"))
-    check("注入文本带 task_id 标记", "task_id: t1" in text)
+    check("注入文本带 task_id/run_id 标记", "task_id: t1" in text and "run_id: run-t1" in text)
     check("注入文本带结果摘要", "12.3" in text)
     check("同时把 state 里的状态刷成 success", (out or {}).get("async_tasks", {}).get("t1", {}).get("status") == "success")
 
@@ -170,7 +170,7 @@ async def notifier_checks() -> None:
 
     # 3. idle 且 state 里已有投递记录 → 跳过
     delivered = "[Async subagent 'cbam_reporting' has completed] Result: 结果" + chr(10) * 2
-    delivered += "task_id: t3"
+    delivered += "task_id: t3" + chr(10) + "run_id: unknown-run"
     snapshot = {"values": {"messages": [{"type": "human", "content": delivered}]}}
     mw, client = make_notifier("idle", snapshot)
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t3")
@@ -219,6 +219,18 @@ async def notifier_checks() -> None:
         mw_d._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t7"),
     )
     check("同一任务并发投递：只开 1 个 run", len(client_c.runs.created) == 1, str(len(client_c.runs.created)))
+
+    # 4e. update_async_task 后同一任务的新 run：新结果必须再投递一次
+    #     （判重键是 (task_id, run_id)，只认 task_id 会把更新后的结果吞掉）
+    notifier_mod._DELIVERED_LOCAL.clear()
+    notifier_mod._DELIVERED_ORDER.clear()
+    first = "[Async subagent 'cbam_reporting' has completed] Result: 旧结果" + chr(10) * 2
+    first += "task_id: t8" + chr(10) + "run_id: run-old"
+    mw, client = make_notifier("idle", {"values": {"messages": [{"type": "human", "content": first}]}})
+    old_snapshot = notifier_mod._already_delivered({"values": {"messages": [{"type": "human", "content": first}]}}, "t8", "run-old")
+    new_snapshot = notifier_mod._already_delivered({"values": {"messages": [{"type": "human", "content": first}]}}, "t8", "run-new")
+    check("旧的 run 已投递 → 判为已投递", old_snapshot is True)
+    check("同一任务的新 run → 判为未投递（会再投）", new_snapshot is False)
 
     # 5. 未知中断 → 不碰
     mw, client = make_notifier("interrupted", {"interrupts": [{"value": {"kind": "some_future_thing"}}]})

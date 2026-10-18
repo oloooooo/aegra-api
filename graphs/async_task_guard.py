@@ -48,6 +48,9 @@ _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"
 _STATUS_TTL = 5.0  # 任务状态缓存秒数：状态的最小变化粒度是「一个 run 结束」
 _TASK_MARK = "task_id: "
 _TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
+# 判重键是 (task_id, run_id)：update_async_task 会给同一任务开新 run，
+# 只认 task_id 会把"更新后的第二次结果"当成重复丢掉。
+_RUN_ID_RE = re.compile(r"run_id: ([0-9a-zA-Z_-]+)")
 
 
 def _message_text(msg: Any) -> str:
@@ -61,17 +64,21 @@ def _message_text(msg: Any) -> str:
     return str(content) if content is not None else ""
 
 
-def _delivered_task_ids(messages: Any) -> set[str]:
-    """已经投递给主管的任务 id。
+def _delivered_pairs(messages: Any) -> set[tuple[str, str]]:
+    """已经投递给主管的 (task_id, run_id)。
 
     只认**投递消息**（`[Async subagent …` 前缀）：派活工具消息里也有 `task_id:`，
     拿它当判据会把"还没投递"误判成"已投递"，结果永远不投。
     """
-    out: set[str] = set()
+    out: set[tuple[str, str]] = set()
     for msg in messages or []:
         text = _message_text(msg)
-        if text.startswith("[Async subagent"):
-            out.update(_TASK_ID_RE.findall(text))
+        if not text.startswith("[Async subagent"):
+            continue
+        task = _TASK_ID_RE.search(text)
+        run = _RUN_ID_RE.search(text)
+        if task and run:
+            out.add((task.group(1), run.group(1)))
     return out
 
 
@@ -321,7 +328,7 @@ class AsyncTaskGuard(AgentMiddleware):
             if status == "success"
             else f"[Async subagent '{name}' has stopped ({status})] Result: {summary}"
         )
-        return f"{head}\n\n{_TASK_MARK}{task['task_id']}"
+        return f"{head}\n\n{_TASK_MARK}{task['task_id']}\nrun_id: {task.get('run_id') or ''}"
 
     @staticmethod
     def _plan(
@@ -329,7 +336,7 @@ class AsyncTaskGuard(AgentMiddleware):
     ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
         """(状态更新, 待投递任务)。fresh 只含本轮查到的非终态任务新状态。"""
         tasks = (state or {}).get("async_tasks") or {}
-        delivered = _delivered_task_ids((state or {}).get("messages") or [])
+        delivered = _delivered_pairs((state or {}).get("messages") or [])
         changed: dict[str, dict[str, Any]] = {}
         pending: list[dict[str, Any]] = []
         for task_id, task in tasks.items():
@@ -340,7 +347,7 @@ class AsyncTaskGuard(AgentMiddleware):
                     status = new
                     changed[task_id] = {**task, "status": status, "last_checked_at": _now()}
             # 工具路径可能已把 state 写成终态却没投递（_refreshed_* 只改状态），这里补投
-            if status in _TERMINAL and task_id not in delivered:
+            if status in _TERMINAL and (task_id, task.get("run_id")) not in delivered:
                 pending.append({**task, "status": status})
         return changed, pending
 
