@@ -150,7 +150,7 @@ async for ev in stream:
    （主管侧注入 / `CompletionNotifier` 唤醒）时，如果主管之后没再跑过模型调用，
    state 里的 `status` 会停在 `running`。
    拦截层现在派活前会向子 run 核实真实状态并回写（`_refreshed_sync/_refreshed_async`），
-   否则 `MAX_ACTIVE_TASKS=3` 的名额会被 3 个已成功的任务永久占满。见 ADR-0007。
+   否则 `MAX_ACTIVE_TASKS`（默认 3）的名额会被已成功的任务永久占满。见 ADR-0007。
 
 前端对接全文（接口清单、SSE 帧、interrupt/resume、定时任务、删除）见
 [`frontend-api.md`](./frontend-api.md)。

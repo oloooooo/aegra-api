@@ -25,6 +25,7 @@
 | Python | ≥ 3.12 | `pyproject.toml` 的 `requires-python` |
 | [uv](https://docs.astral.sh/uv/) | 最新 | 依赖与虚拟环境 |
 | PostgreSQL | 13+ | 持久化 thread/run/checkpoint，**必须有** |
+| Redis | 6+ | `.env` 开了 `REDIS_BROKER_ENABLED=true` 就需要（默认配置就是开）：跨进程取消 + worker 队列。没有 Redis 就把该开关设回 `false` 并**只用单进程**启动（ADR-0009） |
 | Node.js | ≥ 18（实测 24） | 只有前端需要 |
 
 ```bash
@@ -180,6 +181,16 @@ PYTHONPATH=. uv run uvicorn aegra_api.main:app --port 2026 --reload \
 > Windows 必须显式 `--loop "asyncio:SelectorEventLoop"`（psycopg/asyncpg 不兼容默认的 Proactor 循环）；
 > `src/aegra_api/main.py` 里已经处理好了，所以直接用它最省心。
 
+### 6.1 单进程 vs 多 worker
+
+| 形态 | 启动方式 | 影响 |
+|---|---|---|
+| 单进程（默认） | `python src/aegra_api/main.py` | 一切语义严格：取消、并发上限都准确 |
+| 多 worker | `uvicorn aegra_api.main:app --host 127.0.0.1 --port 2026 --workers 2 --loop asyncio:SelectorEventLoop`（需 Redis） | 吞吐上来，但**派活上限按进程各算**（最坏 `N × MAX_ACTIVE_TASKS`），见 [adr/0008](./docs/adr/0008-active-task-limit-is-per-process.md) |
+
+两者都依赖 `REDIS_BROKER_ENABLED`：开了走 Redis worker 队列（可多进程、跨进程取消可靠），
+关了走进程内执行器（只能单进程，多进程下取消约 50% 失效，见 [adr/0009](./docs/adr/0009-worker-mode-requires-redis-broker.md)）。
+
 > **改了 `aegra.json` 一定要重启**：图注册表在启动时读取一次。
 
 ---
@@ -219,6 +230,9 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 改了 `graphs/` 下的图或 `aegra.json` 但没生效 | 后端启动时只读一次注册表，**重启服务** |
 | 子 agent 一直显示 `running` | 父 state 里的状态是快照（只在 check 时更新）。看真实状态用 `GET /custom/tasks/{id}` |
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
+| 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：`docker start redis6`（或本地 redis），或把该开关设回 `false` 并只用单进程启动 |
+| 取消后 run 还在继续跑 | 多进程启动但没开 Redis：取消信号跨不了进程（ADR-0009）。开 Redis 或改单进程 |
+| 同时出现的后台任务超过 `MAX_ACTIVE_TASKS` | 多 worker 部署下上限按进程各算（ADR-0008），最坏 `N × 上限`；要严格就单进程启动 |
 
 ---
 
