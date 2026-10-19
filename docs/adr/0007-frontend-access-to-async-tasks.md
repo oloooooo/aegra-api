@@ -49,6 +49,10 @@ async_tasks: {'d9eb5ea6': 'running'}   ← 子 run 早已 success，父 state �
 `AsyncTaskGuard._active_count` 把非终态都算活跃，因此 3 个已成功的任务会**永久占满**
 `MAX_ACTIVE_TASKS=3` 的名额，第 4 次派活直接被拒。
 
+> 注：名额机制已于 2026-10-19 删除（[ADR-0012](./0012-thread-quota-replaces-task-limit.md)），
+> 本文剩下的结论仍然成立：**子 run 的真实状态必须向服务端核实**，否则 state 里的快照会一直停在
+> `running`。现在这个核实服务于任务结果投递（`_deliver` 靠它判断是否已终态），不再用于计名额。
+
 **选中的做法**：`_start_sync` / `_astart` 在判上限前先 `_refreshed_sync` / `_refreshed_async`
 ——对每个非终态任务用 spec 的客户端查一次子 run 的真实 `status`，把变化写回 state 参与计数，
 并随本次 `Command` 一起落库。查询失败时保持原状态（不阻断派活）。

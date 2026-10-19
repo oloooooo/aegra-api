@@ -1,19 +1,23 @@
-"""自检：后台任务结果投递（① 注入 + notifier 四态分派）不依赖 LLM。
+"""自检：后台任务结果投递（主管 hook 写 state + notifier 空闲回写）不依赖 LLM。
 
 跑法：``PYTHONPATH=. PYTHONUTF8=1 uv run python scripts/check_task_delivery.py``
 
-覆盖三件事：
-1. guard 的 before_model：终态未投递才注入、投递过不再注入、工具路径已写终态要补投；
-2. 注入文本与回写共用 `[Async subagent ...]` 前缀 + `task_id:` 标记（前端才认得出）；
-3. notifier 的四种父线程状态：busy 不插队、interrupted 不碰（HITL）、已投递跳过、idle 才投递。
+覆盖四件事：
+1. guard 的 before_agent / after_agent：终态未投递才写、投递过不再写、工具路径已写终态要补投；
+2. 判重键是 `(task_id, run_id)`，且 check 过的任务（delivered_run_id）不再重复投；
+3. 投递文本与回写共用 `[Async subagent ...]` 前缀 + `task_id:` / `run_id:` 标记，
+   摘要超长时带截断标记（前端与模型都靠这些认）；
+4. notifier 只在父线程 idle/error 时投一次：busy / interrupted 都不碰。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 
 from langchain_core.messages import HumanMessage
+from langgraph.types import Command
 
 from custom.middlewares import completion_notifier as notifier_mod
 from graphs.async_task_guard import AsyncTaskGuard
@@ -64,6 +68,7 @@ def make_guard(
     guard = AsyncTaskGuard({"cbam_reporting": {"url": "http://fake", "graph_id": "cbam_reporting"}})
     client = FakeClient(statuses, texts)
     guard._async_client = lambda spec: client  # type: ignore[method-assign]
+    guard._parent_thread_id = lambda: "parent"  # type: ignore[method-assign]
 
     async def claim(task: dict, parent: str) -> bool:
         return claimed
@@ -83,56 +88,98 @@ def task(task_id: str, status: str) -> dict:
 
 
 async def guard_checks() -> None:
-    # 1. running → success：注入一次，且带 task_id 标记与前缀
+    # 1. running → success：写一次，且带前缀 / task_id / run_id
     guard, _ = make_guard({"run-t1": "success"}, {"t1": "76011000 = 12.3"})
     state = {"async_tasks": {"t1": task("t1", "running")}, "messages": []}
-    out = await guard.abefore_model(state, None)
+    out = await guard.abefore_agent(state, None)
     msgs = (out or {}).get("messages") or []
-    check("running→success 会注入", bool(msgs))
+    check("running→success 会写结果", bool(msgs))
     text = msgs[0].content if msgs else ""
-    check("注入文本以 [Async subagent 开头（前端认它是子 agent 返回）", text.startswith("[Async subagent 'cbam_reporting'"))
-    check("注入文本带 task_id/run_id 标记", "task_id: t1" in text and "run_id: run-t1" in text)
-    check("注入文本带结果摘要", "12.3" in text)
-    check("同时把 state 里的状态刷成 success", (out or {}).get("async_tasks", {}).get("t1", {}).get("status") == "success")
+    check("投递文本以 [Async subagent 开头（前端认它是子 agent 返回）", text.startswith("[Async subagent 'cbam_reporting'"))
+    check("投递文本带 task_id/run_id 标记", "task_id: t1" in text and "run_id: run-t1" in text)
+    check("投递文本带结果摘要", "12.3" in text)
+    updated = (out or {}).get("async_tasks", {}).get("t1", {})
+    check("同时把 state 里的状态刷成 success", updated.get("status") == "success")
+    check("并在 task 上记 delivered_run_id", updated.get("delivered_run_id") == "run-t1")
 
-    # 2. 再把注入后的 state 喂回去：不应重复注入
-    state2 = {
-        "async_tasks": {(out or {})["async_tasks"].get("t1", state["async_tasks"]["t1"])["task_id"]: task("t1", "success")},
-        "messages": [HumanMessage(content=text)],
-    }
-    check("已投递过 → 不再注入", await guard.abefore_model(state2, None) is None)
+    # 2. 消息已被丢弃、只剩 delivered_run_id：仍不重复投（判重不靠扫消息）
+    state2 = {"async_tasks": {"t1": {**task("t1", "success"), "delivered_run_id": "run-t1"}}, "messages": []}
+    check("delivered_run_id 已记 → 不再写", await guard.aafter_agent(state2, None) is None)
 
-    # 3. 工具路径已把 state 写成终态但没投递 → 补投
+    # 3. 投递消息在对话里 → 不再写（跨进程/跨 run 的判据）
     guard3, _ = make_guard({}, {})
-    state3 = {"async_tasks": {"t3": task("t3", "success")}, "messages": []}
-    out3 = await guard3.abefore_model(state3, None)
-    check("state 已是终态但未投递 → 补投", bool((out3 or {}).get("messages")))
+    delivered = (
+        "[Async subagent 'cbam_reporting' has completed] Result: x\n\ntask_id: t3\nrun_id: run-t3"
+    )
+    state3 = {"async_tasks": {"t3": task("t3", "success")}, "messages": [HumanMessage(content=delivered)]}
+    check("消息里已有投递记录 → 不再写", await guard3.aafter_agent(state3, None) is None)
 
-    # 4. 还在跑 → 什么都不做
-    guard4, _ = make_guard({"run-t4": "running"}, {})
-    check("running → 不动", await guard4.abefore_model({"async_tasks": {"t4": task("t4", "running")}}, None) is None)
+    # 4. 工具路径已把 state 写成终态但没投递 → 补投
+    guard4, _ = make_guard({}, {})
+    state4 = {"async_tasks": {"t4": task("t4", "success")}, "messages": []}
+    check("state 已是终态但未投递 → 补投", bool(((await guard4.aafter_agent(state4, None)) or {}).get("messages")))
 
-    # 5. TTL 缓存：同一任务连续两次 before_model 只查一次服务端
-    guard5, client5 = make_guard({"run-t5": "running"}, {})
-    state5 = {"async_tasks": {"t5": task("t5", "running")}, "messages": []}
-    await guard5.abefore_model(state5, None)
-    await guard5.abefore_model(state5, None)
-    check("TTL 缓存生效（两次检查只查 1 次）", client5.runs.calls == 1, f"calls={client5.runs.calls}")
+    # 5. 还在跑 → 什么都不做
+    guard5, _ = make_guard({"run-t5": "running"}, {})
+    check("running → 不动", await guard5.abefore_agent({"async_tasks": {"t5": task("t5", "running")}}, None) is None)
+
+    # 6. 摘要超长 → 带截断标记（模型才知道该去 check 取全文）
+    guard6, _ = make_guard({"run-t6": "success"}, {"t6": "表" * 900})
+    out6 = await guard6.abefore_agent({"async_tasks": {"t6": task("t6", "running")}, "messages": []}, None)
+    text6 = (out6 or {})["messages"][0].content
+    check("超长摘要带截断标记", "结果已截断" in text6 and "check_async_task" in text6, text6[-60:])
+
+    # 7. 模型自己 check 到终态结果 → 记 delivered_run_id，之后不再重复投
+    guard7, _ = make_guard({"run-t7": "success"}, {"t7": "x"})
+    checked = Command(update={"messages": [], "async_tasks": {"t7": {**task("t7", "success")}}})
+    request = type("Req", (), {"tool_call": {"args": {"task_id": "t7"}}, "state": {"async_tasks": {"t7": task("t7", "running")}}})()
+    guard7._mark_checked(request, checked)
+    check(
+        "check 到终态结果 → 记 delivered_run_id",
+        (checked.update["async_tasks"]["t7"]).get("delivered_run_id") == "run-t7",
+    )
+    check(
+        "check 过之后不再补投",
+        await guard7.aafter_agent({"async_tasks": checked.update["async_tasks"], "messages": []}, None) is None,
+    )
+
+    # 8. 认领失败（另一条路已投）→ 不写投递消息
+    guard8, _ = make_guard({"run-t8": "success"}, {"t8": "x"}, claimed=False)
+    out8 = await guard8.abefore_agent({"async_tasks": {"t8": task("t8", "running")}, "messages": []}, None)
+    check("认领失败 → 不写投递消息", not (out8 or {}).get("messages"), str(out8))
+    check(
+        "认领失败 → 不记 delivered_run_id",
+        not (out8 or {}).get("async_tasks", {}).get("t8", {}).get("delivered_run_id"),
+        str(out8),
+    )
+
+    # 9. 认领成功但写 state 失败 → 撤销认领（否则结果被永久锁成已投递）
+    guard9, _ = make_guard({"run-t9": "success"}, {"t9": "x"})
+    releases: list[str] = []
+
+    async def release(task_: dict, parent: str) -> None:
+        releases.append(task_["task_id"])
+
+    guard9._release_async = release  # type: ignore[method-assign]
+
+    async def broken_summary(task_: dict) -> str:
+        raise RuntimeError("summary failed")
+
+    guard9._summary_async = broken_summary  # type: ignore[method-assign]
+    with contextlib.suppress(RuntimeError):
+        await guard9.abefore_agent({"async_tasks": {"t9": task("t9", "running")}, "messages": []}, None)
+    check("写 state 失败 → 撤销认领", releases == ["t9"], str(releases))
 
 
 # ---------- 假客户端：notifier 侧 ----------
 
 
 class FakeThreadView:
-    def __init__(self, status: str, snapshot: dict) -> None:
+    def __init__(self, status: str) -> None:
         self.status = status
-        self.snapshot = snapshot
 
     async def get(self, thread_id: str) -> dict:
         return {"thread_id": thread_id, "status": self.status}
-
-    async def get_state(self, thread_id: str) -> dict:
-        return self.snapshot
 
 
 class FakeRunCreate:
@@ -145,8 +192,8 @@ class FakeRunCreate:
 
 
 class FakeNotifierClient:
-    def __init__(self, status: str, snapshot: dict) -> None:
-        self.threads = FakeThreadView(status, snapshot)
+    def __init__(self, status: str) -> None:
+        self.threads = FakeThreadView(status)
         self.runs = FakeRunCreate()
 
 
@@ -171,7 +218,6 @@ class FakeClaim:
 
 def make_notifier(
     status: str,
-    snapshot: dict,
     claims: FakeClaim | None = None,
     run_key: str | None = None,
 ) -> tuple[notifier_mod.CompletionNotifierMiddleware, FakeNotifierClient, FakeClaim]:
@@ -182,7 +228,7 @@ def make_notifier(
     mw.notify_url = "http://fake"
     if run_key is not None:
         mw._run_key = lambda: run_key  # type: ignore[method-assign]
-    client = FakeNotifierClient(status, snapshot)
+    client = FakeNotifierClient(status)
     claims = claims or FakeClaim()
     notifier_mod.get_client = lambda url, headers: client  # type: ignore[assignment]
     notifier_mod._mint_parent_token = lambda identity: "tok"  # type: ignore[assignment]
@@ -192,32 +238,27 @@ def make_notifier(
 
 
 async def notifier_checks() -> None:
-    # 1. 父线程 busy → 不插队
-    mw, client, claims = make_notifier("busy", {})
+    # 1. 父线程 busy → 不投、不认领（结果由主管 hook 负责）
+    mw, client, claims = make_notifier("busy")
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t1")
     check("busy → 不投递", client.runs.created == [])
-    check("busy → 不认领（让给主管侧注入）", claims.keys == set())
-    check("busy → 安排了延迟复查", len(notifier_mod._RECHECK_TASKS) == 1)
-    for t in list(notifier_mod._RECHECK_TASKS):
-        t.cancel()
-    await asyncio.sleep(0)
-    notifier_mod._RECHECK_TASKS.clear()
+    check("busy → 不认领（让给主管 hook）", claims.keys == set())
 
-    # 2. interrupted（HITL 提问）→ 不碰
-    mw, client, claims = make_notifier("interrupted", {"interrupts": [{"value": {"tool": "ask_user_question"}}]})
+    # 2. interrupted（HITL 提问）→ 不碰，绝不用 resume 顶掉用户待答的问题
+    mw, client, claims = make_notifier("interrupted")
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t2")
-    check("interrupted(ask) → 不 resume 也不投递", client.runs.created == [])
-    check("interrupted(ask) → 没有安排复查", len(notifier_mod._RECHECK_TASKS) == 0)
+    check("interrupted → 不投递", client.runs.created == [])
+    check("interrupted → 不认领", claims.keys == set())
 
-    # 3. 认领失败（别的路径已投递）→ 跳过
+    # 3. 认领失败（另一条路已投）→ 跳过
     claims = FakeClaim()
     claims.keys.add(("parent", "t3", "unknown-run"))
-    mw, client, _ = make_notifier("idle", {"values": {"messages": []}}, claims)
+    mw, client, _ = make_notifier("idle", claims)
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t3")
     check("认领失败（已投递/在投）→ 跳过", client.runs.created == [])
 
     # 4. idle 且认领成功 → 开新一轮投递
-    mw, client, claims = make_notifier("idle", {"values": {"messages": []}})
+    mw, client, claims = make_notifier("idle")
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t4")
     check("idle 且抢到认领 → 投递一次", len(client.runs.created) == 1, str(client.runs.created))
     sent = (client.runs.created[0].get("input") or {}).get("messages", [{}])[0].get("content", "")
@@ -225,8 +266,8 @@ async def notifier_checks() -> None:
 
     # 5. 两个不同任务并发完成 → 各投一次
     shared = FakeClaim()
-    mw_a, client_a, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
-    mw_b, _, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
+    mw_a, client_a, _ = make_notifier("idle", shared)
+    mw_b, _, _ = make_notifier("idle", shared)
     notifier_mod.get_client = lambda url, headers: client_a  # type: ignore[assignment]
     await asyncio.gather(
         mw_a._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t6a"),
@@ -236,8 +277,8 @@ async def notifier_checks() -> None:
 
     # 6. 同一任务并发投递两次 → 只投一次
     shared = FakeClaim()
-    mw_c, client_c, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
-    mw_d, _, _ = make_notifier("idle", {"values": {"messages": []}}, shared)
+    mw_c, client_c, _ = make_notifier("idle", shared)
+    mw_d, _, _ = make_notifier("idle", shared)
     notifier_mod.get_client = lambda url, headers: client_c  # type: ignore[assignment]
     await asyncio.gather(
         mw_c._send_notification("[Async subagent 'cbam_reporting' has completed] Result: A", "t7"),
@@ -247,27 +288,31 @@ async def notifier_checks() -> None:
 
     # 7. update_async_task 后的新 run → 新结果再投一次（判重键含 run_id）
     shared = FakeClaim()
-    mw_e, client_e, _ = make_notifier("idle", {"values": {"messages": []}}, shared, run_key="run-old")
-    mw_f, _, _ = make_notifier("idle", {"values": {"messages": []}}, shared, run_key="run-new")
+    mw_e, client_e, _ = make_notifier("idle", shared, run_key="run-old")
+    mw_f, _, _ = make_notifier("idle", shared, run_key="run-new")
     notifier_mod.get_client = lambda url, headers: client_e  # type: ignore[assignment]
     await mw_e._send_notification("[Async subagent 'cbam_reporting' has completed] Result: 旧", "t8")
     await mw_f._send_notification("[Async subagent 'cbam_reporting' has completed] Result: 新", "t8")
     check("同一任务的新 run → 再投一次", len(client_e.runs.created) == 2, str(len(client_e.runs.created)))
 
-    # 8. 开 run 失败 → 撤销认领（否则这次结果会被永久判为已投递）
-    mw, client, claims = make_notifier("idle", {"values": {"messages": []}})
+    # 8. 开 run 失败 → 撤销认领且只试一次（否则结果被永久判为已投递）
+    mw, client, claims = make_notifier("idle")
     client.runs.create = _boom  # type: ignore[method-assign]
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t9")
     check(
-        "投递失败（重试 3 次）→ 每次都撤销认领，最终认领为空",
-        len(claims.releases) == 3 and claims.keys == set(),
+        "投递失败 → 只试一次，撤销认领",
+        len(claims.releases) == 1 and claims.keys == set(),
         f"{claims.releases!r} keys={claims.keys!r}",
     )
 
-    # 9. 未知中断 → 不碰
-    mw, client, claims = make_notifier("interrupted", {"interrupts": [{"value": {"kind": "some_future_thing"}}]})
+    # 9. 未知线程状态 → 不碰（交给主管 hook 兜底）
+    mw, client, claims = make_notifier("unknown")
     await mw._send_notification("[Async subagent 'cbam_reporting' has completed] Result: x", "t5")
-    check("未知中断 → 不碰", client.runs.created == [])
+    check("未知状态 → 不投递", client.runs.created == [])
+
+    # 10. 子 agent 的摘要超长同样带截断标记
+    long_summary = notifier_mod._extract_last_message({"messages": [HumanMessage(content="表" * 900)]})
+    check("子 agent 摘要超长带截断标记", "结果已截断" in long_summary, long_summary[-40:])
 
 
 async def main() -> None:

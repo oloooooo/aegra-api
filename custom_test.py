@@ -1,13 +1,11 @@
 """端到端测试：supervisor(deepagents_nodes) 按领域把活派给子 agent 对话。
 
-前置：aegra.json 已注册 supervisor + 3 个领域子 agent，且 **后端要重启**（图注册表在启动时读）：
+前置：aegra.json 只注册两个图（都是工厂图，spaces 决定子 agent 名单）：
     uv run python -u src/aegra_api/main.py
 {
   "graphs": {
     "supervisor": "./graphs/deepagents_nodes.py:graph",
-    "cbam_reporting": "./graphs/domain_agents.py:graph_cbam_reporting",
-    "hybrid_bonding": "./graphs/domain_agents.py:graph_hybrid_bonding",
-    "sbol3_synbio": "./graphs/domain_agents.py:graph_sbol3_synbio"
+    "domain_agent": "./graphs/domain_agents.py:graph"
   }
 }
 
@@ -17,8 +15,8 @@
     uv run python custom_test.py          # 进入交互，直接回车用默认问题
     uv run python custom_test.py "问题"   # 带首个问题启动
 
-预期：supervisor 选领域子 agent（如 CBAM 表 → cbam_reporting），子 agent 跑完
-经 CompletionNotifierMiddleware 主动回写，这里能流式看到过程与最终回答。
+预期：supervisor 按空间描述选子 agent（如 CBAM 表 → cbam-reporting），子 agent 跑完
+经 CompletionNotifierMiddleware / guard 的 run 首尾 hook 把结果送回，这里能流式看到过程与最终回答。
 """
 
 import os

@@ -1,5 +1,12 @@
 # 异步派活的并发上限只在单进程内成立
 
+> **Status: Superseded by [ADR-0012](./0012-thread-quota-replaces-task-limit.md)（2026-10-19）**
+>
+> 业务改成「不再限制一个主管派多少子 agent，改成限制一个用户拥有多少会话（thread）」。
+> `MAX_ACTIVE_TASKS`、进程内账本（`_LEDGER` / `_LEDGER_LOCK`）、派活前的名额判定与
+> `graphs/limits.py` 已全部删除。本文保留作历史记录：它描述的问题（`ToolNode` 并发、
+> state 落盘时机、跨进程不共享内存）依然成立，只是不再用名额限制解决。
+
 `MAX_ACTIVE_TASKS`（默认 3，可用环境变量覆盖，见下方「怎么改这个上限」）是业务约束
 （用户要求「一个主 agent 最多 N 个后台子 agent」）。实现它需要
 「读活跃数 → 判上限 → 占名额」这一步原子，而这一步天然要和并发打架。
@@ -25,9 +32,10 @@
 - `_settle()`：创建成功用真实 task 替换占位；失败则直接退位（名额立刻归还）；
 - 账本里已被 state 记账、或已终态的条目自动退位（state 是权威）。
 
-前提：同一进程内所有 run 共用**同一个** guard 实例。本仓库的图是静态图，aegra 缓存编译结果
-（`langgraph_service.py:75 _base_graph_cache`），所以这个前提当前成立。若将来把 supervisor 改成
-factory 式图（按 run 重建），账本会变成每次请求一本空账，**连单进程都不成立**。
+前提：同一进程内所有 run 共用**同一本账**。原先靠「图是静态图、guard 实例共享」满足；
+supervisor 改成工厂图之后（ADR-0011，每 run 重建一次 guard），账本**已改为模块级**
+（`graphs/async_task_guard.py` 的 `_LEDGER` / `_LEDGER_LOCK`），前提重新成立，且不再依赖
+"图被缓存"这个巧合。
 
 ## 本期决定：不改（记于 2026-10-18）
 

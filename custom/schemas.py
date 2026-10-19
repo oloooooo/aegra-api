@@ -38,7 +38,8 @@ class ListUserSpaceResponse(MessagesBaseModel):
 
 class CreateSpaceInput(BaseModel):
     space_name: str
-    path: str
+    # 已废弃：目录由 space_name 派生（见 graphs/space_agents.py），此字段仅为老客户端兼容
+    path: str = ""
 
 
 class CreateSpaceResponse(MessagesBaseModel):

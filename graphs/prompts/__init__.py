@@ -3,14 +3,11 @@
 文件布局（与包同目录）::
 
     graphs/prompts/
-    ├── main.md                    主 agent（supervisor）system prompt
-    ├── researcher.md              researcher 子 agent system prompt
-    ├── cbam.md                    CBAM 申报子 agent system prompt
-    ├── cbam_description.md        CBAM 子 agent 描述
-    ├── hybrid_bonding.md          混合键合工艺子 agent system prompt
-    ├── hybrid_bonding_description.md  混合键合子 agent 描述
-    ├── sbol3.md                   SBOL3 本体子 agent system prompt
-    └── sbol3_description.md       SBOL3 子 agent 描述
+    ├── main.md        主 agent（supervisor）system prompt
+    └── researcher.md  researcher 子 agent system prompt
+
+领域子 agent 的 prompt 不在这里——它们跟着知识空间走（``graphs/okf/<space>/AGENT.md``），
+见 ``graphs/space_agents.py``。一个空间一个文件，增删空间不用改代码。
 
 用法::
 
@@ -27,8 +24,6 @@ from functools import lru_cache
 from pathlib import Path
 
 from langchain_core.prompts import PromptTemplate
-
-from graphs.limits import MAX_ACTIVE_TASKS as _MAX_ACTIVE_TASKS
 
 _PROMPT_DIR = Path(__file__).resolve().parent
 
@@ -71,25 +66,12 @@ def render_prompt(name: str, **kwargs: object) -> str:
 
 
 # 模块级常量：图 import 时直接取，调用方不必关心加载方式。
-# main.md 里的 {max_active_tasks} 用常量替换（不走 PromptTemplate，避免别的花括号被当变量）。
-MAIN_SYSTEM_PROMPT = load_prompt("main").replace("{max_active_tasks}", str(_MAX_ACTIVE_TASKS))
+MAIN_SYSTEM_PROMPT = load_prompt("main")
 RESEARCHER_SYSTEM_PROMPT = load_prompt("researcher")
-CBAM_SYSTEM_PROMPT = load_prompt("cbam")
-CBAM_SUBAGENT_DESCRIPTION = load_prompt("cbam_description")
-HYBRID_BONDING_SYSTEM_PROMPT = load_prompt("hybrid_bonding")
-HYBRID_BONDING_SUBAGENT_DESCRIPTION = load_prompt("hybrid_bonding_description")
-SBOL3_SYSTEM_PROMPT = load_prompt("sbol3")
-SBOL3_SUBAGENT_DESCRIPTION = load_prompt("sbol3_description")
 
 __all__ = [
-    "CBAM_SUBAGENT_DESCRIPTION",
-    "CBAM_SYSTEM_PROMPT",
-    "HYBRID_BONDING_SUBAGENT_DESCRIPTION",
-    "HYBRID_BONDING_SYSTEM_PROMPT",
     "MAIN_SYSTEM_PROMPT",
     "RESEARCHER_SYSTEM_PROMPT",
-    "SBOL3_SUBAGENT_DESCRIPTION",
-    "SBOL3_SYSTEM_PROMPT",
     "get_prompt",
     "list_prompts",
     "load_prompt",

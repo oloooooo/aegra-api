@@ -100,26 +100,44 @@ _Avoid_: 把它当成绝对路径或 URL、把这一列当成访问控制的依�
 async subagent 的运行身份。它不是登录账号，没有关联 Space，子 agent 运行期间以它通过鉴权。
 _Avoid_: 把它当成普通用户、把子 agent 当成终端用户本人
 
-**Domain subagent（领域子 agent）**:
-固定绑一个 Space 与一份领域 prompt 的异步子 agent（当前为 `cbam_reporting` / `hybrid_bonding` /
-`sbol3_synbio`）。它不是通用表格 agent：能看哪些文件由派活时下发的那个 Space 决定。
-_Avoid_: 把它当成通用 xlsx agent、把子 agent 的数量写成固定值（它随 Space 增加）
+**Space agent（空间子 agent）**:
+一个 Space 对应的异步子 agent，名字就是 space 名（如 `cbam-reporting`）。它的两份内容都在该空间文件夹里：
+`<space>/AGENT.md` 的 frontmatter `description` 决定主管何时派给它，正文就是它的 system prompt。
+**没有固定名单**：用户拥有哪些 space 就有哪些子 agent，名单每次 run 现算；
+所有 space agent 共用同一个图 `domain_agent`，space 经 run config 绑定。
+删除 Space 不影响已派出任务：那些任务保留当时授权的 space，结果照常投递；新任务不会再选到它。
+_Avoid_: 把子 agent 的数量或名字写成固定值、把 prompt 写在代码里（它与文档同目录才有单一来源）
 
 **Async task（异步任务）**:
 主管经 `start_async_task` 派出的一个后台子 agent 执行。在主管 state 的 `async_tasks` 里登记，
-键是 `task_id`，值同时就是子执行所在的 thread id。它的 `status` 是**快照**，只由
-`check_async_task` 或拦截层核实刷新，不保证实时。
+键是 `task_id`，值同时就是子执行所在的 thread id；`agent_name` 是当时的 space 名。
+它的 `status` 是**快照**，只由
+`check_async_task`、派活前的核实或 run 首尾的投递节点刷新，不保证实时。
+`delivered_run_id` 记的是“这个 run 的结果已经进过主管上下文”。
+一个主管能派多少个并发异步任务**没有业务上限**，它们会在服务端排队（见 Thread quota）。
 _Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态查 `GET /custom/tasks/{id}`）
 
+**Thread quota（会话配额）**:
+一个账号最多拥有多少个 thread（`MAX_THREADS_PER_USER`）。子线程也计数，但计入它所属的
+主管：子线程建时带 metadata `owner_identity`（终端用户）与 `parent_thread_id`，
+计数只统计 `parent_thread_id` 为空的那批。超额时 `POST /threads` 返回 403。
+删主管线程会连带删它的子线程，否则子线程（属主是服务账号）会成为永久孤儿。
+它取代了旧的“一个主管最多 N 个并发子 agent”的限制（ADR-0012）。
+_Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销由 worker 队列承接）；
+按 `thread.user_id` 数子线程（它们是服务账号）
+
 **Task delivery（任务结果投递）**:
-把子 agent 的结果送进主管上下文的动作，有两条路且**只该发生一次**：
-① 主管还在跑 —— `AsyncTaskGuard.abefore_model` 在下一次模型调用前把它作为一条消息注入
-（不打断、不开新 run）；② 主管已空闲 —— `CompletionNotifier` 开一轮新 run 投递。
-两条路都靠服务端认领表 `async_task_delivery(task_id, run_id)` 判重（同一任务被 `update_async_task`
-重跑会产生新结果）；主管在等人工回答（HITL interrupt）时一律不投递，留到用户答完后的下一轮由 ① 补齐。
-同一 `(task, run)` 至多投递一条消息，同一父线程同一时刻至多一个投递 run；认领表与接口在
-`async_task_delivery` / `custom/delivery_api.py`（见 ADR-0010）。
-_Avoid_: 把投递说成"通知"（通知是手段，可用注入或回写）；把它当成同步等待（主管从不被阻塞）
+把子 agent 的结果送进主管上下文的动作，有两条路且尽力只发生一次：
+① 主管自己的 run 里 —— `AsyncTaskGuard.abefore_agent` / `aafter_agent` 在 run 首尾把结果写进
+state（不另开 run，模型在这些消息之后的下一次模型调用时看到）；② 主管已空闲（`idle` / `error`）——
+`CompletionNotifier` 开一轮新 run 投递。`busy` 与 `interrupted` 一律不投：前者归 ①，
+后者不能顶掉用户正等着回答的答案。
+两条路都以 `(task_id, run_id)` 为键、先向认领表 `async_task_delivery` 抢票，抢不到就不投；
+投过的任务在 state 里留 `delivered_run_id`，模型自己 `check_async_task` 拿到终态结果的也算已投。
+投递消息只带前 500 字摘要与截断标记，**全文只从 `check_async_task` 取**。
+认领表与接口在 `async_task_delivery` / `custom/delivery_api.py`（见 ADR-0010）。
+_Avoid_: 把投递说成“通知”（通知是手段，投递是结果进上下文）；把它当成同步等待（主管从不被阻塞）；
+把投递摘要当全文（被截断了就去 check）
 
 **Task proxy（任务代理）**:
 `custom/frontend_api.py` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread

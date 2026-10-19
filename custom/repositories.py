@@ -1,10 +1,11 @@
 from typing import Optional
 
 from openai import organization
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aegra_api.core.orm import Thread as ThreadORM
 from custom.models import Space, UserSpace, UserTables
 
 
@@ -158,3 +159,37 @@ class UserSpaceRepository:
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.rowcount > 0  # pyright: ignore[reportAttributeAccessIssue]
+
+class ThreadQuotaRepository:
+    """主管线程的配额与级联清理（ADR-0012）。
+
+    子线程的属主是服务账号，所以"一个用户占了多少会话"不能按 `thread.user_id` 算：
+    子线程建的时候带了 metadata ``owner_identity``（见 graphs/async_task_guard.py），
+    这里按它计数。只统计主管线程（`parent_thread_id` 为空），子线程跟着父线程走。
+    """
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def count_owned(self, identity: str) -> int:
+        """该用户当前拥有的主管线程数。"""
+        stmt = select(func.count()).select_from(ThreadORM).where(
+            ThreadORM.metadata_json["owner_identity"].astext == identity,
+            ThreadORM.metadata_json["parent_thread_id"].astext.is_(None),
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def delete_children(self, parent_thread_id: str) -> list[str]:
+        """删掉某个主管线程下所有已认领的子线程，返回被删的 thread_id。
+
+        不删的话：子线程归服务账号，用户看不见也删不掉，会永久占着配额与存储。
+        调用方负责先删这些线程的 checkpoint（同 aegra 的 delete_thread 顺序）。
+        """
+        stmt = select(ThreadORM.thread_id).where(
+            ThreadORM.metadata_json["parent_thread_id"].astext == parent_thread_id
+        )
+        children = list((await self.session.execute(stmt)).scalars())
+        if children:
+            await self.session.execute(delete(ThreadORM).where(ThreadORM.thread_id.in_(children)))
+            await self.session.commit()
+        return children

@@ -39,11 +39,12 @@ POST /custom/login
 前端可选的助手。
 
 ```json
-{"graphs": ["cbam_reporting", "hybrid_bonding", "sbol3_synbio", "supervisor"],
+{"graphs": ["domain_agent", "supervisor"],
  "identity": "root", "permissions": ["read", "write"]}
 ```
 
 `graph_id` 可以直接当 `assistant_id` 用（见 `CONTEXT.md` 的 Graph key 词条）。
+现在只有两个图：所有领域子 agent 共用 `domain_agent`，space 经 run config 绑定（ADR-0011）。
 
 ### 3.2 `GET /custom/spaces`
 
@@ -79,9 +80,11 @@ POST /custom/login
 
 ```json
 {"task_id": "fe2bb1b4-...", "thread_id": "fe2bb1b4-...", "run_id": "e1c957e1-...",
- "agent_name": "hybrid_bonding", "status": "running",
+ "agent_name": "hybrid-bonding", "status": "running",
  "created_at": "...", "last_checked_at": "...", "message_count": 7}
 ```
+
+`agent_name` 是**空间名**（即用户创建的那个 Space，见 ADR-0011）。
 
 - `status` 是**向子 run 核实过的**真实状态，不要读父线程 state 里的 `async_tasks.status`（会滞后，见 ADR-0007）。
 - 授权：父线程必须属于当前用户，且它的 `async_tasks` 里确实有这个 `task_id`；否则 `404`。
@@ -111,7 +114,7 @@ event: end        data: {"status": "success"}
 
 | 用途 | 接口 | 备注 |
 | - | - | - |
-| 会话列表 / 建 / 删 | `POST /threads/search`、`POST /threads`、`DELETE /threads/{id}` | 已按 `user_id` 隔离；删除不可恢复 |
+| 会话列表 / 建 / 删 | `POST /threads/search`、`POST /threads`、`DELETE /threads/{id}` | 已按 `user_id` 隔离；删除不可恢复。**建会话有配额（超额 403）**，删会话会连带删子线程，见 §7 |
 | 发消息 + 流式 | `POST /threads/{id}/runs/stream` | `stream_mode=["messages","custom","updates","values"]` |
 | 追问恢复 | `POST /threads/{id}/runs` | body `{"command": {"resume": "<选项 label>"}}` |
 | 停止 | `POST /threads/{id}/runs/{run_id}/cancel` | |
@@ -146,20 +149,24 @@ agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null
 
 ### 5.3 子 agent 的结果不是用户消息
 
-子 agent 完成后，父线程会多一条 **`human`** 消息，内容以 `[Async subagent 'cbam_reporting' has completed] Result: ...`
+子 agent 完成后，父线程会多一条 **`human`** 消息，内容以 `[Async subagent 'cbam-reporting' has completed] Result: ...`
 开头，末尾带 `task_id: <id>` 与 `run_id: <id>`。它有两种来源，**格式完全一致**，前端不需要区分
 （判重在服务端做，见 `POST /custom/tasks/{id}/deliver-claim`）：
 
-- 主管当时还在跑 → `AsyncTaskGuard.abefore_model` 在下一次模型调用前注入（同一个 run 内，不开新 run）；
+- 主管的 run 首尾 → `AsyncTaskGuard.abefore_agent` / `aafter_agent` 写进自己的 state（不开新 run）；
 - 主管已答完（线程 `idle`）→ `CompletionNotifierMiddleware` 现铸父身份 token 写回（ADR-0006）。
 
 两种都**渲染成「子任务返回结果」区块**，不要当作用户输入。主管在等用户回答（线程 `interrupted`）时
 不会投递，结果会等用户答完后补上——前端不要为此做特殊处理。
 
+结果可能被截断：摘要上限 500 字，超长时末尾带 `…[结果已截断（仅前 500 字），调 check_async_task 取全文]`。
+前端直接原样展示即可（全文由主管调工具取，不会进这条消息）。
+
 ### 5.4 状态可能滞后
 
-父 state 的 `async_tasks.status` 只在主管调用 `check_async_task`、或者在 guard 的模型/工具边界
-核实后更新；`idle` 回写路径不更新。要展示状态就用 `GET /custom/tasks/{id}`。
+父 state 的 `async_tasks.status` 只在主管调用 `check_async_task`、或者主管 run 首尾
+（`AsyncTaskGuard.abefore_agent` / `aafter_agent`）核实时更新；即使子 agent 已完成、
+线程已 `idle` 也没人改它。要展示实时状态就用 `GET /custom/tasks/{id}`（内部会向子 run 核实）。
 
 ## 6. 定时任务
 
@@ -181,6 +188,22 @@ POST /threads/{thread_id}/runs/crons
 
 `DELETE /threads/{id}` → `200`；之后 `GET /threads/{id}` → `404`，`/threads/{id}/runs` → `[]`。
 无软删除、无回收站，前端必须二次确认。
+
+**服务端会级联删子线程**（ADR-0012）：子 agent 的线程属主是服务账号，用户看不见也删不掉，
+所以删主管会话时一并清理它们（含 checkpoint）。后果：一次删除可能比过去慢（每个子线程一次
+`adelete_thread`），前端不要假定删除请求毫秒级返回。
+
+### 建会话的配额
+
+`POST /threads` 每个账号最多 `MAX_THREADS_PER_USER`（默认 200）个会话（子线程计到所属主管上）。
+超额返回：
+
+```http
+403 {"error": "forbidden", "message": "会话数已达上限（200），请先删除不用的会话再新建", "details": null}
+```
+
+前端拿 `message` 直接提示即可（`client.ts::errorText` 已优先读它），不要当成登录失效。
+超管（`permissions` 含 `write`）不受限。删掉一个会话就能再建一个（级联删子线程后名额释放）。
 
 ## 8. 已知限制
 

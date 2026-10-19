@@ -1,11 +1,10 @@
 from typing import Annotated
 
+import asyncio
+
 from deepagents import AsyncSubAgent, create_deep_agent
 from deepagents.middleware import FilesystemPermission
 import dotenv
-import os
-
-from pathlib import Path
 
 import structlog
 
@@ -26,13 +25,10 @@ from langchain.tools import InjectedToolArg, tool, ToolRuntime
 from langgraph.graph.state import RunnableConfig
 from langchain.agents.middleware import TodoListMiddleware
 from graphs.async_task_guard import AsyncTaskGuard
+from graphs.space_access import allowed_spaces
+from graphs.space_agents import KNOWLEDGE_ROOT, list_spaces, load_agent_spec, space_dir
 from graphs.space_backend import SpaceBackend
-from graphs.prompts import (
-    MAIN_SYSTEM_PROMPT,
-    CBAM_SUBAGENT_DESCRIPTION,
-    HYBRID_BONDING_SUBAGENT_DESCRIPTION,
-    SBOL3_SUBAGENT_DESCRIPTION,
-)
+from graphs.prompts import MAIN_SYSTEM_PROMPT
 from graphs.tools import MAIN_TOOLS
 
 logger = structlog.getLogger(__name__)
@@ -69,63 +65,71 @@ async def get_user_data(
         return {"error": str(e)}
 
 
-# 和子 agent（graphs/domain_agents.py）同一份 okf 根，虚拟路径才对得上
-okf_dir = str(Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf"))
-
 # 静态服务 token：subagent 的 runs.create 不带终端用户 JWT（deepagents 不转发），
 # 用服务身份的长效 token（铸造在 custom/services.py::service_token，单一来源）；
 # custom_auth.py 对该 identity 免 DB 直接放行。
 _service_token = service_token()
 
-# 领域子 agent：(agent 名 = graph_id, 绑定 space, 描述)。
+# 领域子 agent：(agent 名 = space 名, 绑定同一个通用图)。
 # space 经拦截层单发给子 agent（guard._config_for），用户没有该 space 权限时
 # start 直接拒绝；绑定只在 guard spec 里，deepagents 不读多余键。
-_DOMAIN_SPECS = {
-    "cbam_reporting": {
-        "space": "cbam-reporting",
-        "description": CBAM_SUBAGENT_DESCRIPTION,
-    },
-    "hybrid_bonding": {
-        "space": "hybrid-bonding",
-        "description": HYBRID_BONDING_SUBAGENT_DESCRIPTION,
-    },
-    "sbol3_synbio": {
-        "space": "sbol3-synbio",
-        "description": SBOL3_SUBAGENT_DESCRIPTION,
-    },
-}
+#
+# **不在这里写名单**：可用子 agent = 当前这个主管自己拥有的 spaces（服务端注入的
+# langgraph_auth_user.user_spaces）。加一个 space 就多一个子 agent，删一个就少一个，
+# 代码不用动。
+_GRAPH_ID = "domain_agent"  # aegra.json 里那个唯一域子 agent 图的 key
+_SERVER_URL = "http://127.0.0.1:2026"
 
-_specs: dict[str, dict] = {
-    name: AsyncSubAgent(  # pyright: ignore[reportCallIssue]
-        name=name,
-        description=meta["description"],
-        graph_id=name,
-        url="http://127.0.0.1:2026",
-        headers={"Authorization": f"Bearer {_service_token}"},
-        space=meta["space"],  # type: ignore[typeddict-unknown-key]  guard 专用
+
+def domain_specs(config: RunnableConfig) -> dict[str, dict]:
+    """按本次 run 的 spaces 现算 AsyncSubAgent 列表（name = space 名 = 目录名）。
+
+    无鉴权上下文（本地 demo）时退到知识根下所有目录，否则只看自己拥有的 space。
+    """
+    spaces = allowed_spaces(config)
+    names = sorted(spaces) if spaces is not None else list_spaces()
+    specs: dict[str, dict] = {}
+    for name in names:
+        if not space_dir(name).is_dir():  # 表里有但目录没了：跳过，不让模型选到死链
+            logger.warning("space_dir_missing", space=name)
+            continue
+        description, _ = load_agent_spec(name)
+        specs[name] = AsyncSubAgent(  # pyright: ignore[reportCallIssue]
+            name=name,
+            description=description,
+            graph_id=_GRAPH_ID,
+            url=_SERVER_URL,
+            headers={"Authorization": f"Bearer {_service_token}"},
+            space=name,  # type: ignore[typeddict-unknown-key]  guard 专用
+        )
+    return specs
+
+
+def graph(config: RunnableConfig):  # noqa: ANN201 — 返回编译后的图
+    """主管图（工厂图）：子 agent 名单每次 run 现算，见 domain_specs。"""
+    specs = domain_specs(config)
+    return create_deep_agent(
+        model=model,
+        system_prompt=MAIN_SYSTEM_PROMPT,
+        tools=[*MAIN_TOOLS],
+        # 按空间隔离的 backend：8 个 fs 工具单点兜住 allowed_spaces（ADR-0005）
+        backend=SpaceBackend(root_dir=KNOWLEDGE_ROOT),
+        context_schema=deepAgentContext,
+        # 拆任务清单（write_todos）；guard 拦截 start/update_async_task：按 spec 绑定的
+        # space 经 run config 转发给子 agent（ADR-0005）+ 并发上限
+        middleware=[TodoListMiddleware(), AsyncTaskGuard(specs)],
+        subagents=[*specs.values()],
+        permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
     )
-    for name, meta in _DOMAIN_SPECS.items()
-}
 
-graph = create_deep_agent(
-    model=model,
-    system_prompt=MAIN_SYSTEM_PROMPT,
-    tools=[*MAIN_TOOLS],
-    # 按空间隔离的 backend：8 个 fs 工具单点兜住 allowed_spaces（ADR-0005）
-    backend=SpaceBackend(root_dir=okf_dir),
-    context_schema=deepAgentContext,
-    # tools=[get_user_data],
-    # 拆任务清单（write_todos）；guard 拦截 start/update_async_task：按 spec 绑定的
-    # space 经 run config 转发给子 agent（ADR-0005）+ 并发上限
-    middleware=[TodoListMiddleware(), AsyncTaskGuard(_specs)],
-    subagents=[* _specs.values()],
-    permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
-)
+
 if __name__ == "__main__":
     message = {
         "messages": [
             {"role": "user", "content": "hello,表格消融实验1.xlsx中的CER，最低的有哪些"}
         ]
     }
-    response = graph.invoke(message)  # pyright: ignore[reportArgumentType]
+    # guard 只实现 async hook（abefore_agent / aafter_agent），同步 invoke 会报
+    # "No synchronous function provided"；工厂图要先拿 config 建一次
+    response = asyncio.run(graph({}).ainvoke(message))  # pyright: ignore[reportArgumentType]
     print(response["messages"][-1]["content"])

@@ -1,34 +1,95 @@
-"""拦截 start/update_async_task：转发 spaces + 并发上限（ADR-0005、Q2/Q5 决议）。
+"""拦截 async subagent 的派活与结果投递：spaces 收窄、子线程归属、结果写回主管 state。
 
-deepagents 内置的 start/update 工具创建子 run 时不带任何 config（AsyncSubAgent
-spec 没有 config 字段，内置工具也没有关闭开关），因此这里短路 handler，自己用
-spec 里的静态服务 token 建 thread/run，并附上：
+===============================================================================
+一、它拦哪两个工具
+===============================================================================
 
-- ``config.configurable.user_spaces``：spec 绑定了 ``space`` 的子 agent 只转发
-  ``[space]``（仅本任务 space 收紧），且先校验主管此刻的 spaces（取自主管自己的
-  ``langgraph_auth_user``，服务端注入、客户端伪造不了）含该空间，否则拒绝启动；
-  spec 无 space 绑定则回退全量快照；主管无鉴权上下文（本地 demo）时透传 null，
-  子侧解析为不设限。
-- 并发上限：非终态任务 ≥ ``MAX_ACTIVE_TASKS``（3）时拒绝，返回错误文本让模型
-  自己等待/重试（Q3a：普通错误，不走 HITL）。**判前先向子 run 核实真实状态**：
-  回写路径（CompletionNotifier → 唤醒主管）不经过 check_async_task，state 里的
-  ``status`` 会停在 ``running``，不核实就会把 3 个已成功的任务当活跃，永久卡死名额。
+deepagents 内置的 `start_async_task` / `update_async_task` 建子 run 时不带任何 config
+（`AsyncSubAgent` spec 没有 config 字段，内置工具也没有关闭开关），所以我们短路
+handler，自己用 spec 里的静态服务 token 建 thread/run，把两样东西塞进去：
+权限（只给本任务的 space）与归属（哪个终端用户拥有这个子线程）。
 
-check/cancel/list 不创建 run，直接放行给内置 handler。
+check / cancel / list 不创建 run，直接放行给内置 handler；check 只额外记一笔
+"这个结果已经给过主管了"（见 `_mark_checked`）。
 
-另外负责**把后台任务的结果送进主管上下文**（`before_model` / `abefore_model`）：
-每次模型调用前核对非终态任务的真实状态（5s TTL），转终态就在本次请求里追加一条
-``[Async subagent '<name>' has completed] …`` 消息，不打断当前步骤、不另开 run。
-投递前先向服务端认领 ``(task_id, run_id)``（`custom/delivery_api.py`）——
-跨进程只投一次、同一父线程同时只允许一个投递在途；认领服务不可用时放行（宁可多一条，不丢结果）。
+===============================================================================
+二、派活路径
+===============================================================================
+
+    start_async_task(subagent_type="cbam-reporting", description="…")
+      │
+      │ 1. _prepare()        subagent_type -> spec（名单来自 aegra.json 的图 + space）
+      │ 2. _config_for()     what the child may read / who to notify
+      │      configurable.user_spaces = ["cbam-reporting"]     ← 只给本任务的那个
+      │      （spec 绑了 space 时还先校验主管有该 space，没有就拒绝）
+      │      configurable.parent_thread_id / parent_assistant_id /
+      │                   parent_user_identity / notify_url   ← 子 agent 收尾回写用
+      │ 3. _thread_meta()   what the child thread is owned by
+      │      metadata = {owner_identity: <终端用户>, parent_thread_id: <主管>}
+      │      （子线程属主是服务账号，配额与级联删除靠这两个字段，见 ADR-0012）
+      │ 4. POST /threads -> POST /threads/{tid}/runs
+      │      stream_mode=["messages","custom"]（前端代理要订阅子 agent 实时输出）
+      ▼
+    Command(update={messages: [ToolMessage("Launched … task_id: …")],
+                    async_tasks: {task_id: {...}}})
+
+**没有并发上限**：一个主管能派多少个子 agent 不受限制。规模由 thread 配额
+（ADR-0012）与 worker 队列（`N_JOBS_PER_WORKER`）承接，超额的子 run 在服务端排队。
+
+===============================================================================
+三、投递路径：把结果写进主管自己的 state
+===============================================================================
+
+子 agent 跑完，结果要进主管上下文。主管 run 中途没有任何 API 能往里塞消息，
+所以只有两个时刻：run 开始（before_agent）与 run 结束（after_agent），各一次。
+
+    before_agent / after_agent
+      │ 1. _refreshed_async()  向子 run 问真实状态（state 里的 status 只是快照）
+      │ 2. _plan()             谁已终态、且结果还没进过主管上下文
+      │ 3. POST /custom/tasks/{id}/deliver-claim   抢投递权（与 notifier 互斥）
+      │ 4. GET /threads/{child}                    取子 agent 最后一条消息当摘要
+      │ 5. 返回 {"messages": [HumanMessage("[Async subagent … ] Result: …")],
+      │          "async_tasks": {task_id: {..., delivered_run_id: run_id}}}
+      ▼
+    本次 run 的 checkpoint 里多一条 human 消息
+    （前端 `toView` 靠 `[Async subagent` 前缀渲染成「子 agent 返回」卡片）
+
+摘要截断到 500 字并带标记，**全文只有 check_async_task 能取**（那边不截断）。
+
+判重两个来源：messages 里的投递消息（跨 run/跨进程都看得见）与 task 上的
+`delivered_run_id`（模型自己 check 过也算已投，见 `_mark_checked`）。认领表
+`(task_id, run_id)` 负责与子 agent 侧的 notifier 互斥，抢不到就不写。
+
+===============================================================================
+四、多进程
+===============================================================================
+
+guard 自己不存任何跨请求状态（旧版的名额账本已随 ADR-0008 删除）。所有跨进程
+判重都落在两处服务端：
+  - `async_task_delivery(task_id, run_id)`：管"这次结果投没投过"（ADR-0010）；
+  - `thread.metadata_json`：管"这个子线程是谁的"（ADR-0012）。
+
+===============================================================================
+五、代码分区（改代码前先看这张表）
+===============================================================================
+
+  A. 文本与判重    _TERMINAL, _now(), _shorten(), _message_text(),
+                   _delivered_pairs(), _is_delivered(), _completion_text(),
+                   _thread_summary()
+  B. 派活          AsyncTaskGuard._key/_sync_client/_async_client, _prepare(),
+                   _config_for(), _thread_meta(), _task(), _launched(),
+                   _start_sync/_astart, _tracked(), _updated(),
+                   _update_sync/_aupdate, _err()
+  C. 投递          _spec_of(), _refresh_targets(), _refreshed_sync/_refreshed_async,
+                   _summary_async(), _claim_async/_release_async, _plan(),
+                   _deliver(), abefore_agent/aafter_agent, _mark_checked()
+  D. 接线          wrap_tool_call / awrap_tool_call
 """
 
 from __future__ import annotations
 
 import re
-import threading
-import time
-import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -42,27 +103,37 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
-from graphs import limits
 from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
 
-MAX_ACTIVE_TASKS = limits.MAX_ACTIVE_TASKS
-
 _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
 
-# 结果投递（①）：子任务完成后，主管在下一次模型调用前把结果注入自己的上下文。
-# 注入文本与回写中间件保持**同一个前缀**，前端 toView 才会渲染成「子 agent 返回」；
-# 末尾的 ``task_id: <id>`` 是投递账本——两条投递路都靠它判重。
-_STATUS_TTL = 5.0  # 任务状态缓存秒数：状态的最小变化粒度是「一个 run 结束」
+# 投递账本标记：与 notifier 用同一个前缀/字段，前端与判重都靠它
 _TASK_MARK = "task_id: "
 _TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
-# 判重键是 (task_id, run_id)：update_async_task 会给同一任务开新 run，
-# 只认 task_id 会把"更新后的第二次结果"当成重复丢掉。
+# 判重键含 run_id：update_async_task 会给同一任务开新 run，只认 task_id 会吞掉第二次结果
 _RUN_ID_RE = re.compile(r"run_id: ([0-9a-zA-Z_-]+)")
+
+# 摘要上限：投递消息只带开头，全文走 check_async_task（那边不截断）
+_SUMMARY_LIMIT = 500
+_TRUNCATED = f"…[结果已截断（仅前 {_SUMMARY_LIMIT} 字），调 check_async_task 取全文]"
+
+
+# ============================ A. 文本与判重（纯函数） ============================
+
+
+def _now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _shorten(text: str) -> str:
+    """截断摘要并显式留标记——静默硬切会让模型分不清「写完了」和「被切了」。"""
+    return text if len(text) <= _SUMMARY_LIMIT else text[:_SUMMARY_LIMIT] + _TRUNCATED
 
 
 def _message_text(msg: Any) -> str:
+    """消息正文：兼容 str / content 块列表 / dict 三种形态。"""
     content = getattr(msg, "content", None)
     if content is None and isinstance(msg, dict):
         content = msg.get("content")
@@ -74,7 +145,7 @@ def _message_text(msg: Any) -> str:
 
 
 def _delivered_pairs(messages: Any) -> set[tuple[str, str]]:
-    """已经投递给主管的 (task_id, run_id)。
+    """messages 里已投递过的 (task_id, run_id)。
 
     只认**投递消息**（`[Async subagent …` 前缀）：派活工具消息里也有 `task_id:`，
     拿它当判据会把"还没投递"误判成"已投递"，结果永远不投。
@@ -91,12 +162,36 @@ def _delivered_pairs(messages: Any) -> set[tuple[str, str]]:
     return out
 
 
-def _now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _is_delivered(task: dict[str, Any], pairs: set[tuple[str, str]]) -> bool:
+    """这个 run 的结果是否已经进过主管上下文。
+
+    两个来源：投递消息（跨 run/跨进程都看得见），以及 `delivered_run_id`
+    （模型自己 check 拿到终态结果时记下的，见 `_mark_checked`）。
+    """
+    run_id = task.get("run_id") or ""
+    return task.get("delivered_run_id") == run_id or (task["task_id"], run_id) in pairs
+
+
+def _completion_text(task: dict[str, Any], summary: str) -> str:
+    """投递消息正文：前端靠这个前缀与尾部两个标记识别/判重。"""
+    name = task.get("agent_name", "subagent")
+    status = task.get("status")
+    head = (
+        f"[Async subagent '{name}' has completed] Result: {summary}"
+        if status == "success"
+        else f"[Async subagent '{name}' has stopped ({status})] Result: {summary}"
+    )
+    return f"{head}\n\n{_TASK_MARK}{task['task_id']}\nrun_id: {task.get('run_id') or ''}"
+
+
+def _thread_summary(thread: Any) -> str:
+    """子 agent 的结论 = 它自己线程的最后一条消息（截断后）。"""
+    messages = ((thread or {}).get("values") or {}).get("messages") or []
+    return _shorten(_message_text(messages[-1])) if messages else "(no output)"
 
 
 class AsyncTaskGuard(AgentMiddleware):
-    """拦截 async subagent 的 run 创建，注入 user_spaces 并限制并发。"""
+    """拦截 async subagent 的 run 创建：注入 user_spaces、给子线程打归属标记。"""
 
     def __init__(self, specs: dict[str, dict[str, Any]], assistant_id: str = "supervisor") -> None:
         """specs: {agent_name: AsyncSubAgent spec}；assistant_id = 主管自己的 assistant
@@ -105,15 +200,8 @@ class AsyncTaskGuard(AgentMiddleware):
         self._assistant_id = assistant_id
         self._sync: dict[tuple, SyncLangGraphClient] = {}
         self._async: dict[tuple, LangGraphClient] = {}
-        # 并发派活的原子占位：ToolNode 对同一批 tool_call 用 gather / 线程池并发执行，
-        # state 在整批执行完才落盘，所以两个并发 start 会看到同一份旧 state 而双双放行。
-        # 这里用一个进程内 ledger 记「已预留但尚未写进 state」的任务，锁内判上限+占位。
-        # 边界：ledger 只在单个进程内共享，多 worker / 多副本部署时上限按进程各算，
-        # 详见 docs/adr/0008-active-task-limit-is-per-process.md。
-        self._mu = threading.Lock()
-        self._ledger: dict[str, dict[str, dict[str, Any]]] = {}
-        # 任务状态轮询缓存：task_id -> (monotonic 时间, status)
-        self._polled: dict[str, tuple[float, str]] = {}
+
+    # =========================== B. 派活 ===========================
 
     # ---------- 客户端（按 url+headers 缓存，与 deepagents _ClientCache 同键） ----------
 
@@ -133,115 +221,284 @@ class AsyncTaskGuard(AgentMiddleware):
             self._async[key] = get_client(url=spec["url"], headers=dict(spec.get("headers") or {}))
         return self._async[key]
 
-    # ---------- 共享判定 ----------
+    # ---------- 前置：校验 + 权限 + 归属 ----------
 
-    def _validate(self, agent_type: str) -> str | None:
-        if agent_type not in self._specs:
+    def _prepare(self, request: ToolCallRequest) -> tuple[str, dict[str, Any]] | str:
+        """(agent 名, spec) 或错误文本。名字要写进 task，供之后的 update/投递反查。"""
+        agent_type = (request.tool_call.get("args") or {}).get("subagent_type", "")
+        spec = self._specs.get(agent_type)
+        if spec is None:
             allowed = ", ".join(f"`{k}`" for k in self._specs)
             return f"Unknown async subagent type `{agent_type}`. Available types: {allowed}"
-        return None
+        return agent_type, spec
+
+    def _config_for(self, request: ToolCallRequest, spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+        """(子 run 的 configurable, 错误文本)：本任务 space + 父上下文（收尾回写用）。
+
+        spec 绑定了 ``space`` 的子 agent 只发 ``[space]``，并先校验主管有该空间权限；
+        没有 space 绑定时回退主管的全量快照。父上下文只在有鉴权上下文（非本地 demo）
+        时才转发，其中的 identity 取服务端注入的 `langgraph_auth_user`，客户端伪造不了。
+        """
+        cfg = request.runtime.config or {}
+        conf = cfg.get("configurable") or {}
+        space = spec.get("space")
+        if space:
+            spaces = allowed_spaces(cfg)
+            if spaces is not None and space not in spaces:
+                return None, f"用户没有空间 {space!r} 的权限，无法启动该子 agent（可用：{sorted(spaces)}）"
+            user_spaces: list[str] | None = [space]
+        else:
+            all_spaces = allowed_spaces(cfg)
+            user_spaces = None if all_spaces is None else sorted(all_spaces)
+        payload: dict[str, Any] = {"user_spaces": user_spaces}
+
+        parent_identity = current_identity(request.runtime.config)
+        parent_thread_id = conf.get("thread_id")
+        if parent_identity != "local" and parent_thread_id:
+            payload.update(
+                parent_thread_id=parent_thread_id,
+                parent_assistant_id=(
+                    conf.get("assistant_id") or (cfg.get("metadata") or {}).get("assistant_id") or self._assistant_id
+                ),
+                parent_user_identity=parent_identity,
+                # 子 run 与父 run 同一部署，用 spec 的 url（本部署即 aegra）
+                notify_url=spec.get("url"),
+            )
+        return {"configurable": payload}, None
 
     @staticmethod
-    def _active_count(state: Any) -> int:
-        tasks: dict[str, Any] = (state or {}).get("async_tasks") or {}
-        return sum(1 for t in tasks.values() if t.get("status") not in _TERMINAL)
+    def _thread_meta(request: ToolCallRequest) -> dict[str, Any]:
+        """子线程的归属标记：属主是服务账号，但配额与级联清理按终端用户算（ADR-0012）。"""
+        conf = (request.runtime.config or {}).get("configurable") or {}
+        identity = current_identity(request.runtime.config)
+        return {
+            "owner_identity": None if identity == "local" else identity,
+            "parent_thread_id": conf.get("thread_id"),
+        }
 
     @staticmethod
-    def _spaces_payload(config: Any) -> list[str] | None:
-        """主管当前 spaces：集合→list，None（无鉴权上下文）→None（透传 null）。"""
-        spaces = allowed_spaces(config)
-        return None if spaces is None else sorted(spaces)
+    def _task(task_id: str, agent_name: str, run_id: str) -> dict[str, Any]:
+        """新任务记录（thread_id == task_id：子线程就是任务句柄）。"""
+        now = _now()
+        return {
+            "task_id": task_id,
+            "agent_name": agent_name,
+            "thread_id": task_id,
+            "run_id": run_id,
+            "status": "running",
+            "created_at": now,
+            "last_checked_at": now,
+            "last_updated_at": now,
+        }
 
     @staticmethod
-    def _over_limit(state: Any) -> str:
-        return (
-            f"Too many active async tasks ({MAX_ACTIVE_TASKS}). "
-            "Wait for one to finish or cancel it before launching another."
+    def _launched(
+        request: ToolCallRequest, task: dict[str, Any], refreshed: dict[str, dict[str, Any]]
+    ) -> Command[Any]:
+        """派活成功的 state 更新：工具消息 + 新任务 + 顺手刷新的旧任务状态。"""
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        f"Launched async subagent. task_id: {task['task_id']}",
+                        tool_call_id=request.runtime.tool_call_id,
+                    )
+                ],
+                "async_tasks": {**refreshed, task["task_id"]: task},
+            }
         )
 
+    def _err(self, request: ToolCallRequest, msg: str) -> ToolMessage:
+        """普通错误回给模型（不走 HITL：它自己等一等或换个问法即可）。"""
+        return ToolMessage(content=msg, tool_call_id=request.runtime.tool_call_id, name=request.tool_call.get("name"))
+
+    # ---------- start（sync / async 只差 client 与 await） ----------
+
     def _start_args(
-        self, request: ToolCallRequest, refreshed: dict[str, dict[str, Any]], parent: str
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """返回 (spec, error_msg)。refreshed 是刚核实过的任务状态（覆盖 state 里的）。
+        self, request: ToolCallRequest, spec: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], str] | str:
+        """(子 run config, 子线程 metadata, description) 或错误文本。"""
+        config, err = self._config_for(request, spec)
+        if err:
+            return err
+        assert config is not None
+        return config, self._thread_meta(request), (request.tool_call.get("args") or {}).get("description", "")
 
-        调用方必须持 ``self._mu``。计数 = state + 核实结果 + 本进程已预留的任务。
-        """
+    def _start_sync(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
+        refreshed = self._refreshed_sync((request.state or {}).get("async_tasks") or {})
+        prepared = self._prepare(request)
+        if isinstance(prepared, str):
+            return self._err(request, prepared)
+        name, spec = prepared
+        args = self._start_args(request, spec)
+        if isinstance(args, str):
+            return self._err(request, args)
+        config, meta, description = args
+        try:
+            thread = self._sync_client(spec).threads.create(metadata=meta)
+            run = self._sync_client(spec).runs.create(
+                thread_id=thread["thread_id"],
+                assistant_id=spec["graph_id"],
+                input={"messages": [{"role": "user", "content": description}]},
+                stream_mode=["messages", "custom"],
+                config=config,
+            )
+        except Exception as e:  # noqa: BLE001 — SDK 异常无类型，回给模型
+            logger.warning("failed_to_launch_async_subagent", error=str(e))
+            return self._err(request, f"Failed to launch async subagent: {e}")
+        return self._launched(request, self._task(thread["thread_id"], name, run["run_id"]), refreshed)
+
+    async def _astart(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
+        refreshed = await self._refreshed_async((request.state or {}).get("async_tasks") or {})
+        prepared = self._prepare(request)
+        if isinstance(prepared, str):
+            return self._err(request, prepared)
+        name, spec = prepared
+        args = self._start_args(request, spec)
+        if isinstance(args, str):
+            return self._err(request, args)
+        config, meta, description = args
+        client = self._async_client(spec)
+        try:
+            thread = await client.threads.create(metadata=meta)
+            run = await client.runs.create(
+                thread_id=thread["thread_id"],
+                assistant_id=spec["graph_id"],
+                input={"messages": [{"role": "user", "content": description}]},
+                stream_mode=["messages", "custom"],
+                config=config,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("failed_to_launch_async_subagent", error=str(e))
+            return self._err(request, f"Failed to launch async subagent: {e}")
+        return self._launched(request, self._task(thread["thread_id"], name, run["run_id"]), refreshed)
+
+    # ---------- update（新 run 同样要带 config，否则子 agent 中途丢 spaces） ----------
+
+    @staticmethod
+    def _tracked(request: ToolCallRequest) -> tuple[dict[str, Any], str] | str:
+        """(被更新的任务, 追加给子 agent 的消息) 或错误文本。"""
         args = request.tool_call.get("args") or {}
-        agent_type = args.get("subagent_type", "")
-        if err := self._validate(agent_type):
-            return None, err
-        state_tasks: dict[str, Any] = (request.state or {}).get("async_tasks") or {}
-        ledger = self._ledger.setdefault(parent, {})
-        # ledger 已被 state 记账（或已终态）的条目退位，state 为准
-        for tid in [t for t in ledger if t in state_tasks or ledger[t].get("status") in _TERMINAL]:
-            ledger.pop(tid, None)
-        tasks = {**state_tasks, **refreshed, **ledger}
-        if self._active_count({"async_tasks": tasks}) >= MAX_ACTIVE_TASKS:
-            return None, self._over_limit(request.state)
-        return self._specs[agent_type], None
+        task_id = str(args.get("task_id") or "").strip()
+        tracked = ((request.state or {}).get("async_tasks") or {}).get(task_id)
+        if not tracked:
+            return f"No tracked task found for task_id: {task_id!r}"
+        return tracked, args.get("message", "")
 
-    def _parent_key(self, request: ToolCallRequest) -> str:
-        conf = (request.runtime.config or {}).get("configurable") or {}
-        return str(conf.get("thread_id") or "local")
+    def _update_ready(
+        self, request: ToolCallRequest
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str] | str:
+        """(任务, spec, 子 run config, 追加消息) 或错误文本——update 的前置合并成一处。"""
+        tracked = self._tracked(request)
+        if isinstance(tracked, str):
+            return tracked
+        task, message = tracked
+        spec = self._specs.get(task["agent_name"])
+        if spec is None:
+            return f"Unknown agent for task: {task['task_id']!r}"
+        config, err = self._config_for(request, spec)
+        if err:
+            return err
+        assert config is not None
+        return task, spec, config, message
 
-    def _reserve(
-        self, request: ToolCallRequest, refreshed: dict[str, dict[str, Any]], parent: str
-    ) -> tuple[dict[str, Any] | None, str | None, str | None]:
-        """锁内完成「判上限 + 占位」，返回 (spec, 占位 key, 错误)。
-
-        锁内不能有 await：并发来自 asyncio gather 与 ToolNode 的线程池两条路，
-        所以用 threading.Lock；网络创建放在锁外，靠占位保证名额不被重复使用。
-        """
-        with self._mu:
-            spec, err = self._start_args(request, refreshed, parent)
-            if err:
-                return None, None, err
-            assert spec is not None
-            key = f"pending-{uuid.uuid4()}"
-            self._ledger.setdefault(parent, {})[key] = {
-                "task_id": key,
-                "agent_name": spec_name(spec, self._specs),
-                "status": "pending",
-                "created_at": _now(),
+    @staticmethod
+    def _updated(request: ToolCallRequest, task: dict[str, Any], run_id: str) -> Command[Any]:
+        """update 成功的 state 更新：任务换新 run、回到 running。"""
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        f"Updated async subagent. task_id: {task['task_id']}",
+                        tool_call_id=request.runtime.tool_call_id,
+                    )
+                ],
+                "async_tasks": {
+                    task["task_id"]: {**task, "run_id": run_id, "status": "running", "last_updated_at": _now()}
+                },
             }
-            return spec, key, None
+        )
 
-    def _settle(self, parent: str, key: str, task: dict[str, Any] | None = None) -> None:
-        """创建成功后用真实任务替掉占位；失败则直接退位（名额释放）。"""
-        with self._mu:
-            ledger = self._ledger.get(parent)
-            if ledger is None:
-                return
-            ledger.pop(key, None)
-            if task is not None:
-                ledger[task["task_id"]] = task
+    def _update_sync(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
+        ready = self._update_ready(request)
+        if isinstance(ready, str):
+            return self._err(request, ready)
+        task, spec, config, message = ready
+        try:
+            run = self._sync_client(spec).runs.create(
+                thread_id=task["thread_id"],
+                assistant_id=spec["graph_id"],
+                input={"messages": [{"role": "user", "content": message}]},
+                multitask_strategy="interrupt",
+                stream_mode=["messages", "custom"],
+                config=config,
+            )
+        except Exception as e:  # noqa: BLE001
+            return self._err(request, f"Failed to update async subagent: {e}")
+        return self._updated(request, task, run["run_id"])
 
-    # ---------- 状态核实（防僵尸 running 卡死名额） ----------
+    async def _aupdate(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
+        ready = self._update_ready(request)
+        if isinstance(ready, str):
+            return self._err(request, ready)
+        task, spec, config, message = ready
+        try:
+            run = await self._async_client(spec).runs.create(
+                thread_id=task["thread_id"],
+                assistant_id=spec["graph_id"],
+                input={"messages": [{"role": "user", "content": message}]},
+                multitask_strategy="interrupt",
+                stream_mode=["messages", "custom"],
+                config=config,
+            )
+        except Exception as e:  # noqa: BLE001
+            return self._err(request, f"Failed to update async subagent: {e}")
+        return self._updated(request, task, run["run_id"])
 
-    def _refreshed_sync(self, request: ToolCallRequest) -> dict[str, dict[str, Any]]:
+    # =========================== C. 投递 ===========================
+
+    def _spec_of(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """任务对应的 spec：优先按 agent_name 找；该 space 已被删时退到任意一个同部署 spec。
+
+        已派出的任务保留当时授权的 space（删 space 不影响旧任务投递），而这里的 spec
+        只用来拼 url/headers 去查子 run、取摘要——它们跟 space 无关。
+
+        shortcut: 所有子 agent 跑在同一部署（url/headers 相同），所以借一个就行；
+        将来多部署时要把 url 记进 task。
+        """
+        if not task.get("run_id"):
+            return None
+        spec = self._specs.get(task.get("agent_name", ""))
+        if spec is not None:
+            return spec
+        return next(iter(self._specs.values()), None)
+
+    @staticmethod
+    def _refresh_targets(tasks: dict[str, Any]) -> list[dict[str, Any]]:
+        """需要向服务端核实的任务：还非终态、且有 run_id（sync/async 两条路共用）。"""
+        return [t for t in tasks.values() if t.get("status") not in _TERMINAL and t.get("run_id")]
+
+    def _refreshed_sync(self, tasks: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """查到的真实状态变化（只含变了的）。查不到就按原状态算，不阻断派活。"""
         out: dict[str, dict[str, Any]] = {}
-        for task in ((request.state or {}).get("async_tasks") or {}).values():
-            if task.get("status") in _TERMINAL:
-                continue
-            spec = self._specs.get(task.get("agent_name", ""))
-            if spec is None or not task.get("run_id"):
+        for task in self._refresh_targets(tasks):
+            spec = self._spec_of(task)
+            if spec is None:
                 continue
             try:
                 run = self._sync_client(spec).runs.get(task["thread_id"], task["run_id"])
-            except Exception:  # noqa: BLE001 — 查不到就按原状态算，不阻断派活
+            except Exception:  # noqa: BLE001
                 continue
             status = run.get("status")
             if status and status != task.get("status"):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out
 
-    async def _refreshed_async(self, request: ToolCallRequest) -> dict[str, dict[str, Any]]:
+    async def _refreshed_async(self, tasks: dict[str, Any]) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
-        for task in ((request.state or {}).get("async_tasks") or {}).values():
-            if task.get("status") in _TERMINAL:
-                continue
-            spec = self._specs.get(task.get("agent_name", ""))
-            if spec is None or not task.get("run_id"):
+        for task in self._refresh_targets(tasks):
+            spec = self._spec_of(task)
+            if spec is None:
                 continue
             try:
                 run = await self._async_client(spec).runs.get(task["thread_id"], task["run_id"])
@@ -252,127 +509,31 @@ class AsyncTaskGuard(AgentMiddleware):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out
 
-    # ---------- 结果投递：子任务完成后注入主管上下文（before_model） ----------
-
-    def _cached_status(self, task_id: str) -> str | None:
-        with self._mu:
-            hit = self._polled.get(task_id)
-        if hit and time.monotonic() - hit[0] < _STATUS_TTL:
-            return hit[1]
-        return None
-
-    def _cache_status(self, task_id: str, status: str) -> None:
-        with self._mu:
-            self._polled[task_id] = (time.monotonic(), status)
-            if len(self._polled) > 256:  # 任务数有上限，这里只为进程长跑不无限涨
-                oldest = min(self._polled, key=lambda k: self._polled[k][0])
-                self._polled.pop(oldest, None)
-
-    def _spec_of(self, task: dict[str, Any]) -> dict[str, Any] | None:
-        spec = self._specs.get(task.get("agent_name", ""))
-        return spec if spec is not None and task.get("run_id") else None
-
-    def _poll_sync(self, task: dict[str, Any]) -> str | None:
-        task_id = task.get("task_id") or ""
-        cached = self._cached_status(task_id)
-        if cached is not None:
-            return cached
-        spec = self._spec_of(task)
-        if spec is None:
-            return None
-        try:
-            run = self._sync_client(spec).runs.get(task["thread_id"], task["run_id"])
-        except Exception:  # noqa: BLE001 — 查不到按原状态算，不阻断
-            return None
-        status = run.get("status") or task.get("status")
-        if status:
-            self._cache_status(task_id, status)
-        return status
-
-    async def _poll_async(self, task: dict[str, Any]) -> str | None:
-        task_id = task.get("task_id") or ""
-        cached = self._cached_status(task_id)
-        if cached is not None:
-            return cached
-        spec = self._spec_of(task)
-        if spec is None:
-            return None
-        try:
-            run = await self._async_client(spec).runs.get(task["thread_id"], task["run_id"])
-        except Exception:  # noqa: BLE001
-            return None
-        status = run.get("status") or task.get("status")
-        if status:
-            self._cache_status(task_id, status)
-        return status
-
-    @staticmethod
-    def _thread_summary(thread: Any) -> str:
-        messages = ((thread or {}).get("values") or {}).get("messages") or []
-        return (_message_text(messages[-1])[:500] or "(no output)") if messages else "(no output)"
-
-    def _summary_sync(self, task: dict[str, Any]) -> str:
-        spec = self._specs.get(task.get("agent_name", ""))
-        if spec is None or not task.get("thread_id"):
-            return "(no output)"
-        try:
-            return self._thread_summary(self._sync_client(spec).threads.get(task["thread_id"]))
-        except Exception:  # noqa: BLE001
-            return "(summary unavailable)"
-
     async def _summary_async(self, task: dict[str, Any]) -> str:
-        spec = self._specs.get(task.get("agent_name", ""))
+        """取子 agent 的最终结论（摘要）。拿不到就给占位，不阻断投递。"""
+        spec = self._spec_of(task)
         if spec is None or not task.get("thread_id"):
             return "(no output)"
         try:
-            return self._thread_summary(await self._async_client(spec).threads.get(task["thread_id"]))
+            return _thread_summary(await self._async_client(spec).threads.get(task["thread_id"]))
         except Exception:  # noqa: BLE001
             return "(summary unavailable)"
 
     @staticmethod
-    def _completion_text(task: dict[str, Any], status: str, summary: str) -> str:
-        name = task.get("agent_name", "subagent")
-        head = (
-            f"[Async subagent '{name}' has completed] Result: {summary}"
-            if status == "success"
-            else f"[Async subagent '{name}' has stopped ({status})] Result: {summary}"
-        )
-        return f"{head}\n\n{_TASK_MARK}{task['task_id']}\nrun_id: {task.get('run_id') or ''}"
-
-    @staticmethod
-    def _parent_thread_id() -> str:
-        try:
-            conf = (get_config() or {}).get("configurable") or {}
-        except RuntimeError:  # hook 在图外被触发（脚本/测试）
-            return ""
-        return str(conf.get("thread_id") or "")
-
-    def _claim_endpoint(self, task: dict[str, Any], parent_thread_id: str) -> tuple[str, dict[str, Any], dict[str, str]] | None:
-        """投递认领端点 + body + headers；缺信息时返回 None（不认领、也不阻断）。"""
-        spec = self._specs.get(task.get("agent_name", ""))
+    def _claim_endpoint(
+        spec: dict[str, Any] | None, task: dict[str, Any], parent_thread_id: str
+    ) -> tuple[str, dict[str, Any], dict[str, str]] | None:
+        """认领端点 + body + headers；缺信息时返回 None（不认领、也不阻断投递）。"""
         if not parent_thread_id or spec is None or not spec.get("url"):
             return None
         endpoint = f"{str(spec['url']).rstrip('/')}/custom/tasks/{task['task_id']}/deliver-claim"
-        body = {"parent_thread_id": parent_thread_id, "run_id": task.get("run_id")}
-        return endpoint, body, dict(spec.get("headers") or {})
-
-    def _claim_sync(self, task: dict[str, Any], parent_thread_id: str) -> bool | None:
-        """抢投递权：True 抢到 / False 别人抢到（或刚有别的任务在投） / None 无法判定。"""
-        req = self._claim_endpoint(task, parent_thread_id)
-        if req is None:
-            return None
-        endpoint, body, headers = req
-        try:
-            with httpx.Client(timeout=5) as client:
-                resp = client.post(endpoint, json=body, headers=headers)
-                resp.raise_for_status()
-                return bool(resp.json().get("claimed"))
-        except Exception:  # noqa: BLE001 — 认领服务不可用时不阻断投递（宁可多一条，不丢结果）
-            logger.warning("task_delivery_claim_failed", task_id=task.get("task_id"))
-            return None
+        return endpoint, {"parent_thread_id": parent_thread_id, "run_id": task.get("run_id")}, dict(
+            spec.get("headers") or {}
+        )
 
     async def _claim_async(self, task: dict[str, Any], parent_thread_id: str) -> bool | None:
-        req = self._claim_endpoint(task, parent_thread_id)
+        """抢投递权：True 抢到 / False 别人投过 / None 无法判定（照常投，宁可多一条）。"""
+        req = self._claim_endpoint(self._spec_of(task), task, parent_thread_id)
         if req is None:
             return None
         endpoint, body, headers = req
@@ -385,11 +546,23 @@ class AsyncTaskGuard(AgentMiddleware):
             logger.warning("task_delivery_claim_failed", task_id=task.get("task_id"))
             return None
 
+    async def _release_async(self, task: dict[str, Any], parent_thread_id: str) -> None:
+        """撤销认领：state 没写成时调，否则这次结果会被判为「已投递」而丢掉。"""
+        req = self._claim_endpoint(self._spec_of(task), task, parent_thread_id)
+        if req is None:
+            return
+        endpoint, body, headers = req
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.delete(endpoint, params=body, headers=headers)
+        except Exception:  # noqa: BLE001
+            logger.warning("task_delivery_release_failed", task_id=task.get("task_id"))
+
     @staticmethod
     def _plan(
         state: Any, fresh: dict[str, str | None]
     ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-        """(状态更新, 待投递任务)。fresh 只含本轮查到的非终态任务新状态。"""
+        """(要写回 state 的状态更新, 待投递任务)。fresh 只含本轮查到的非终态任务新状态。"""
         tasks = (state or {}).get("async_tasks") or {}
         delivered = _delivered_pairs((state or {}).get("messages") or [])
         changed: dict[str, dict[str, Any]] = {}
@@ -402,12 +575,40 @@ class AsyncTaskGuard(AgentMiddleware):
                     status = new
                     changed[task_id] = {**task, "status": status, "last_checked_at": _now()}
             # 工具路径可能已把 state 写成终态却没投递（_refreshed_* 只改状态），这里补投
-            if status in _TERMINAL and (task_id, task.get("run_id")) not in delivered:
+            if status in _TERMINAL and not _is_delivered(task, delivered):
                 pending.append({**task, "status": status})
         return changed, pending
 
-    @staticmethod
-    def _assemble(changed: dict[str, dict[str, Any]], texts: list[str]) -> dict[str, Any] | None:
+    async def _deliver(self, state: Any) -> dict[str, Any] | None:
+        """把"已完成且未投递"的子任务结果写进本次 run 的 state。
+
+        只有两个调用点（`before_agent` / `after_agent`，一次 run 各一次）：前者补上一个
+        run 结束后才完成的任务，后者落定这次跑动期间完成的任务（模型已没机会转述）。
+        认领后若写 state 抛异常，会把认领撤掉再抛，避免结果被永久锁成「已投递」。
+        """
+        tasks = (state or {}).get("async_tasks") or {}
+        fresh = {tid: t["status"] for tid, t in (await self._refreshed_async(tasks)).items()}
+        changed, pending = self._plan(state, fresh)
+        parent = self._parent_thread_id()
+        texts: list[str] = []
+        claimed: list[dict[str, Any]] = []
+        try:
+            for task in pending:
+                if await self._claim_async(task, parent) is False:  # notifier 已投过
+                    logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
+                    continue
+                claimed.append(task)
+                texts.append(_completion_text(task, await self._summary_async(task)))
+                # 记在 task 上：同路判重不再靠扫消息，check 过的也不会被再投一次
+                changed[task["task_id"]] = {
+                    **changed.get(task["task_id"], task),
+                    "status": task["status"],
+                    "delivered_run_id": task.get("run_id"),
+                }
+        except Exception:
+            for task in claimed:
+                await self._release_async(task, parent)
+            raise
         if not changed and not texts:
             return None
         out: dict[str, Any] = {}
@@ -417,259 +618,62 @@ class AsyncTaskGuard(AgentMiddleware):
             out["messages"] = [HumanMessage(content=t) for t in texts]
         return out
 
-    def before_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        tasks = (state or {}).get("async_tasks") or {}
-        fresh = {tid: self._poll_sync(t) for tid, t in tasks.items() if t.get("status") not in _TERMINAL}
-        changed, pending = self._plan(state, fresh)
-        parent = self._parent_thread_id()
-        texts: list[str] = []
-        for task in pending:
-            if self._claim_sync(task, parent) is False:  # 别人抢到了这次投递
-                logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
-                continue
-            texts.append(self._completion_text(task, task["status"], self._summary_sync(task)))
-        return self._assemble(changed, texts)
+    async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """run 开始：补上父线程空闲期间完成、通知路没投出去的结果。"""
+        return await self._deliver(state)
 
-    async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        tasks = (state or {}).get("async_tasks") or {}
-        fresh: dict[str, str | None] = {}
-        for task_id, task in tasks.items():
-            if task.get("status") not in _TERMINAL:
-                fresh[task_id] = await self._poll_async(task)
-        changed, pending = self._plan(state, fresh)
-        parent = self._parent_thread_id()
-        texts: list[str] = []
-        for task in pending:
-            if await self._claim_async(task, parent) is False:  # 别人抢到了这次投递
-                logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
-                continue
-            texts.append(self._completion_text(task, task["status"], await self._summary_async(task)))
-        return self._assemble(changed, texts)
+    async def aafter_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """run 结束：把这次跑动期间完成的子任务结果落进 state。"""
+        return await self._deliver(state)
 
-    # ---------- start ----------
+    @staticmethod
+    def _parent_thread_id() -> str:
+        """当前（主管）run 的 thread_id；hook 在图外被触发时返回空串。"""
+        try:
+            conf = (get_config() or {}).get("configurable") or {}
+        except RuntimeError:
+            return ""
+        return str(conf.get("thread_id") or "")
 
-    def wrap_tool_call(
-        self, request: ToolCallRequest, handler: Any
-    ) -> ToolMessage | Command[Any]:
+    def _mark_checked(self, request: ToolCallRequest, result: Any) -> Any:
+        """模型自己 check 到终态结果时补记 delivered_run_id，否则下一个 hook 会再投一遍。
+
+        check 返回的是 ToolMessage(json)，扫消息的判重认不出它；这里在 state 的 task 上
+        留记号，`_plan` 据此跳过（精确到 run_id，update_async_task 换 run 后照常再投）。
+        """
+        task_id = str((request.tool_call.get("args") or {}).get("task_id") or "").strip()
+        task = ((request.state or {}).get("async_tasks") or {}).get(task_id)
+        update = getattr(result, "update", None)
+        if task is None or not isinstance(update, dict):
+            return result
+        checked = (update.get("async_tasks") or {}).get(task_id) or {}
+        if checked.get("status") in _TERMINAL:
+            update["async_tasks"] = {
+                **(update.get("async_tasks") or {}),
+                task_id: {**checked, "delivered_run_id": task.get("run_id")},
+            }
+        return result
+
+    # =========================== D. 接线 ===========================
+
+    def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[..., Any]) -> ToolMessage | Command[Any]:
+        """同步接线：start/update 自己建 run，check 之后补记一次投递账。"""
         name = request.tool_call.get("name")
         if name == "start_async_task":
             return self._start_sync(request)
         if name == "update_async_task":
             return self._update_sync(request)
-        return handler(request)
+        result = handler(request)
+        return self._mark_checked(request, result) if name == "check_async_task" else result
 
     async def awrap_tool_call(
-        self, request: ToolCallRequest, handler: Any
+        self, request: ToolCallRequest, handler: Callable[..., Awaitable[Any]]
     ) -> ToolMessage | Command[Any]:
+        """异步接线（线上走这条）：同上。"""
         name = request.tool_call.get("name")
         if name == "start_async_task":
             return await self._astart(request)
         if name == "update_async_task":
             return await self._aupdate(request)
-        return await handler(request)
-
-    def _err(self, request: ToolCallRequest, msg: str) -> ToolMessage:
-        return ToolMessage(content=msg, tool_call_id=request.runtime.tool_call_id, name=request.tool_call.get("name"))
-
-    def _config_for(self, request: ToolCallRequest, spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-        """(子 run 的 configurable, 错误文本)：本任务 space + 父上下文（回写唤醒用）。
-
-        spec 绑定了 ``space`` 的子 agent 只发 ``[space]``（仅本任务 space），并先
-        校验主管有该空间权限，没有则拒绝启动。父上下文只在有鉴权上下文
-        （非本地 demo）时才转发；回写所需的 parent_user_identity 取服务端注入的
-        langgraph_auth_user，客户端伪造不了。
-        """
-        cfg = request.runtime.config or {}
-        conf = cfg.get("configurable") or {}
-        space = spec.get("space")
-        if space:
-            spaces = allowed_spaces(cfg)
-            if spaces is not None and space not in spaces:
-                return None, (
-                    f"用户没有空间 {space!r} 的权限，无法启动该子 agent"
-                    f"（可用：{sorted(spaces)}）"
-                )
-            user_spaces: list[str] | None = [space]
-        else:
-            user_spaces = self._spaces_payload(cfg)
-        payload: dict[str, Any] = {"user_spaces": user_spaces}
-
-        parent_identity = current_identity(request.runtime.config)
-        parent_thread_id = conf.get("thread_id")
-        if parent_identity != "local" and parent_thread_id:
-            parent_assistant = (
-                conf.get("assistant_id")
-                or (cfg.get("metadata") or {}).get("assistant_id")
-                or self._assistant_id
-            )
-            payload.update(
-                parent_thread_id=parent_thread_id,
-                parent_assistant_id=parent_assistant,
-                parent_user_identity=parent_identity,
-                # 子 run 与父 run 同一部署，用 spec 的 url（本部署即 aegra）
-                notify_url=spec.get("url"),
-            )
-        return {"configurable": payload}, None
-
-    def _task(self, task_id: str, agent_name: str, run_id: str, created_at: str | None = None) -> dict[str, Any]:
-        now = _now()
-        return {
-            "task_id": task_id,
-            "agent_name": agent_name,
-            "thread_id": task_id,
-            "run_id": run_id,
-            "status": "running",
-            "created_at": created_at or now,
-            "last_checked_at": now,
-            "last_updated_at": now,
-        }
-
-    def _launched(
-        self, request: ToolCallRequest, task: dict[str, Any], refreshed: dict[str, dict[str, Any]] | None = None
-    ) -> Command[Any]:
-        msg = f"Launched async subagent. task_id: {task['task_id']}"
-        return Command(
-            update={
-                "messages": [ToolMessage(msg, tool_call_id=request.runtime.tool_call_id)],
-                "async_tasks": {**(refreshed or {}), task["task_id"]: task},
-            }
-        )
-
-    def _start_sync(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
-        parent = self._parent_key(request)
-        refreshed = self._refreshed_sync(request)
-        spec, reserve, err = self._reserve(request, refreshed, parent)
-        if err:
-            return self._err(request, err)
-        assert spec is not None and reserve is not None
-        args = request.tool_call.get("args") or {}
-        config, err = self._config_for(request, spec)
-        if err:
-            self._settle(parent, reserve)
-            return self._err(request, err)
-        client = self._sync_client(spec)
-        try:
-            thread = client.threads.create()
-            run = client.runs.create(
-                thread_id=thread["thread_id"],
-                assistant_id=spec["graph_id"],
-                input={"messages": [{"role": "user", "content": args.get("description", "")}]},
-                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
-                stream_mode=["messages", "custom"],
-                config=config,
-            )
-        except Exception as e:  # noqa: BLE001 — SDK 异常无类型，回给模型
-            self._settle(parent, reserve)
-            logger.warning("failed_to_launch_async_subagent", error=str(e))
-            return self._err(request, f"Failed to launch async subagent: {e}")
-        task = self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"])
-        self._settle(parent, reserve, task)
-        return self._launched(request, task, refreshed)
-
-    async def _astart(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
-        parent = self._parent_key(request)
-        refreshed = await self._refreshed_async(request)
-        spec, reserve, err = self._reserve(request, refreshed, parent)
-        if err:
-            return self._err(request, err)
-        assert spec is not None and reserve is not None
-        args = request.tool_call.get("args") or {}
-        config, err = self._config_for(request, spec)
-        if err:
-            self._settle(parent, reserve)
-            return self._err(request, err)
-        client = self._async_client(spec)
-        try:
-            thread = await client.threads.create()
-            run = await client.runs.create(
-                thread_id=thread["thread_id"],
-                assistant_id=spec["graph_id"],
-                input={"messages": [{"role": "user", "content": args.get("description", "")}]},
-                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
-                stream_mode=["messages", "custom"],
-                config=config,
-            )
-        except Exception as e:  # noqa: BLE001
-            self._settle(parent, reserve)
-            logger.warning("failed_to_launch_async_subagent", error=str(e))
-            return self._err(request, f"Failed to launch async subagent: {e}")
-        task = self._task(thread["thread_id"], spec_name(spec, self._specs), run["run_id"])
-        self._settle(parent, reserve, task)
-        return self._launched(request, task, refreshed)
-
-    # ---------- update（新 run 同样要带 config，否则子 agent 中途丢 spaces） ----------
-
-    def _tracked(self, request: ToolCallRequest, task_id: str) -> dict[str, Any] | str:
-        tasks: dict[str, Any] = (request.state or {}).get("async_tasks") or {}
-        tracked = tasks.get((task_id or "").strip())
-        if not tracked:
-            return f"No tracked task found for task_id: {task_id!r}"
-        return tracked
-
-    def _updated(self, request: ToolCallRequest, tracked: dict[str, Any], run_id: str) -> Command[Any]:
-        task = {**tracked, "run_id": run_id, "status": "running", "last_updated_at": _now()}
-        msg = f"Updated async subagent. task_id: {tracked['task_id']}"
-        return Command(
-            update={
-                "messages": [ToolMessage(msg, tool_call_id=request.runtime.tool_call_id)],
-                "async_tasks": {tracked["task_id"]: task},
-            }
-        )
-
-    def _update_sync(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
-        tracked = self._tracked(request, (request.tool_call.get("args") or {}).get("task_id", ""))
-        if isinstance(tracked, str):
-            return self._err(request, tracked)
-        spec = self._specs.get(tracked["agent_name"])
-        if spec is None:
-            return self._err(request, f"Unknown agent for task: {tracked['task_id']!r}")
-        config, err = self._config_for(request, spec)
-        if err:
-            return self._err(request, err)
-        client = self._sync_client(spec)
-        try:
-            run = client.runs.create(
-                thread_id=tracked["thread_id"],
-                assistant_id=spec["graph_id"],
-                input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
-                multitask_strategy="interrupt",
-                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
-                stream_mode=["messages", "custom"],
-                config=config,
-            )
-        except Exception as e:  # noqa: BLE001
-            return self._err(request, f"Failed to update async subagent: {e}")
-        return self._updated(request, tracked, run["run_id"])
-
-    async def _aupdate(self, request: ToolCallRequest) -> ToolMessage | Command[Any]:
-        tracked = self._tracked(request, (request.tool_call.get("args") or {}).get("task_id", ""))
-        if isinstance(tracked, str):
-            return self._err(request, tracked)
-        spec = self._specs.get(tracked["agent_name"])
-        if spec is None:
-            return self._err(request, f"Unknown agent for task: {tracked['task_id']!r}")
-        config, err = self._config_for(request, spec)
-        if err:
-            return self._err(request, err)
-        client = self._async_client(spec)
-        try:
-            run = await client.runs.create(
-                thread_id=tracked["thread_id"],
-                assistant_id=spec["graph_id"],
-                input={"messages": [{"role": "user", "content": (request.tool_call.get("args") or {}).get("message", "")}]},
-                multitask_strategy="interrupt",
-                # 前端代理要订阅子 agent 的实时输出，必须先声明这些流模式
-                stream_mode=["messages", "custom"],
-                config=config,
-            )
-        except Exception as e:  # noqa: BLE001
-            return self._err(request, f"Failed to update async subagent: {e}")
-        return self._updated(request, tracked, run["run_id"])
-
-
-def spec_name(spec: dict[str, Any], specs: dict[str, dict[str, Any]]) -> str:
-    """反查 spec 对应的 agent 名（task.agent_name 需要）。"""
-    for name, s in specs.items():
-        if s is spec:
-            return name
-    return str(spec.get("name", ""))
+        result = await handler(request)
+        return self._mark_checked(request, result) if name == "check_async_task" else result

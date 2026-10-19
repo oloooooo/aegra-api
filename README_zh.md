@@ -12,7 +12,7 @@
 - **后端**：自托管的 Agent Protocol 服务（`src/aegra_api`），在 `aegra.json` 里注册图。
 - **图**（`graphs/`）：
   - `supervisor` — 主 agent，负责理解意图、拆清单、把活派给领域子 agent；
-  - `cbam_reporting` / `hybrid_bonding` / `sbol3_synbio` — 三个领域子 agent，各自绑定一个知识空间（Space），异步执行并主动回写结果。
+  - `supervisor` + `domain_agent` — 主 agent 与**唯一一个**领域子 agent 图；后者按 run config 里的 space 现读 prompt，所以用户有几个空间就有几个子 agent（不用改代码）。
 - **知识空间**：`graphs/okf/<空间名>/`，每个空间是一份 OKF（Markdown + YAML frontmatter，可带 xlsx 表格）。
 - **前端**（`web/`）：Vue 3 + Vite，左边会话、中间对话、右边面板（子任务实时进度 / 知识库文件树 / 定时任务）。
 
@@ -62,8 +62,8 @@ JWT_SECRET=换成长随机串
 PASSWORD_PEPPER=换成长随机串
 
 # --- 业务上限 ---
-# 一个主管线程同时最多几个非终态后台任务（默认 3）；提示词里的数字由它生成
-MAX_ACTIVE_TASKS=3
+# 一个账号最多同时拥有几个会话（主管线程，默认 200）；子线程跟着父线程计数
+MAX_THREADS_PER_USER=200
 
 # --- 服务 ---
 HOST=127.0.0.1
@@ -185,8 +185,8 @@ PYTHONPATH=. uv run uvicorn aegra_api.main:app --port 2026 --reload \
 
 | 形态 | 启动方式 | 影响 |
 |---|---|---|
-| 单进程（默认） | `python src/aegra_api/main.py` | 一切语义严格：取消、并发上限都准确 |
-| 多 worker | `uvicorn aegra_api.main:app --host 127.0.0.1 --port 2026 --workers 2 --loop asyncio:SelectorEventLoop`（需 Redis） | 吞吐上来，但**派活上限按进程各算**（最坏 `N × MAX_ACTIVE_TASKS`），见 [adr/0008](./docs/adr/0008-active-task-limit-is-per-process.md) |
+| 单进程（默认） | `python src/aegra_api/main.py` | 一切语义严格：取消、会话配额都准确 |
+| 多 worker | `uvicorn aegra_api.main:app --host 127.0.0.1 --port 2026 --workers 2 --loop asyncio:SelectorEventLoop`（需 Redis） | 吞吐上来；会话配额存数据库，多 worker 下仍然准确（ADR-0012） |
 
 两者都依赖 `REDIS_BROKER_ENABLED`：开了走 Redis worker 队列（可多进程、跨进程取消可靠），
 关了走进程内执行器（只能单进程，多进程下取消约 50% 失效，见 [adr/0009](./docs/adr/0009-worker-mode-requires-redis-broker.md)）。
@@ -232,16 +232,16 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
 | 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：`docker start redis6`（或本地 redis），或把该开关设回 `false` 并只用单进程启动 |
 | 取消后 run 还在继续跑 | 多进程启动但没开 Redis：取消信号跨不了进程（ADR-0009）。开 Redis 或改单进程 |
-| 同时出现的后台任务超过 `MAX_ACTIVE_TASKS` | 多 worker 部署下上限按进程各算（ADR-0008），最坏 `N × 上限`；要严格就单进程启动 |
+| 建会话报 403「会话数已达上限」 | 每个账号默认最多 20 个会话（`MAX_THREADS_PER_USER`，ADR-0012）；删掉不用的会话即可，删会话会连带删它的子线程 |
 
 ---
 
 ## 9. 一次完整对话长什么样
 
 1. 在中间输入框问：「CBAM 默认排放因子里铝的因子是多少？」
-2. 主管先 `write_todos` 拆任务 → `start_async_task` 派给 `cbam_reporting` → 回你一句「已派给 CBAM 领域 agent（task_id: …）」。
+2. 主管先 `write_todos` 拆任务 → `start_async_task` 派给 `cbam-reporting` → 回你一句「已派给 CBAM 领域 agent（task_id: …）」。
 3. 右侧「任务」面板出现一张卡：状态从 `running` → `success`，卡片里能看到子 agent 的实时输出与工具步骤（`xlsx_info` / `xlsx_query`）。
-4. 子 agent 跑完，结果会被送到主管面前：主管当时还在干活就直接出现在它的下一次思考里（`AsyncTaskGuard.abefore_model` 注入，不打断、不开新 run）；主管已经答完则 `CompletionNotifierMiddleware` 开一轮新 run 把它叫醒。所以你不用手动催「跑完了吗」。
+4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则 `CompletionNotifierMiddleware` 开一轮新 run 把它叫醒（只试一次）。所以你不用手动催「跑完了吗」；但结果消息只带前 500 字摘要，要全文让主管 `check_async_task`。
 
 ## 10. 父子 agent 之间的信息流通
 
@@ -254,7 +254,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 │  工具：start / check / update / cancel / list_async_task、write_todos        │
 └───┬──────────────────────────────────────────────────────────▲─────────────┘
     │ ① 任务描述（消息，单向给出）                                │ ③ 结果投递（消息，单向送回）
-    │  runs.create(thread_id=子线程,                              │  主管还在跑 → before_model 注入一条消息
+    │  runs.create(thread_id=子线程,                              │  主管 run 首尾 → before_agent/after_agent 写一条消息
     │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → runs.create 开新一轮
     │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"
     │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
@@ -264,7 +264,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
     │  parent_user_identity / notify_url                          │  check_async_task → runs.get → status + result
     │  ❗服务端注入的 user_spaces 收窄成单空间，越权由后端拒绝         │  顺带把 state.async_tasks 改成真实状态
     ▼                                                            │
-┌─────────────────────── 子 Thread（cbam_reporting 等）──────────────────────┐
+┌─────────────────────── 子 Thread（cbam-reporting 等）──────────────────────┐
 │  自己的 messages[]、自己的 checkpoint、自己的 space 可见范围                 │
 │  收尾钩子：CompletionNotifierMiddleware.aafter_agent → 触发 ③                │
 │  出错时：awrap_model_call 推一条 "… encountered an error" 同样走 ③          │
@@ -279,7 +279,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 |---|---|---|---|---|---|
 | ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
 | ② | 父 → 子 | `config.configurable` | 拦截层 | 同上 `_config_for()` | 无权限时直接拒绝派活 |
-| ③ | 子 → 父 | 父线程里一条消息（注入或新 run） | 主管侧 guard / 子 agent 中间件 | `async_task_guard.py::abefore_model`（主管在跑）/ `completion_notifier.py`（主管空闲） | 两条路都缺席则靠前端轮询与 `check_async_task` 兜底 |
+| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 子 agent 中间件 | `async_task_guard.py::abefore_agent/aafter_agent`（主管 run 首尾）/ `completion_notifier.py`（主管空闲） | 两条路都缺席时靠 `check_async_task` 兜底 |
 | ④ | 子 → 父 | 工具返回值 + state 更新 | 主管主动调用 | `deepagents/…/async_subagents.py::_build_check_result` | 返回 `Failed to get run status` |
 | ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/frontend_api.py::stream_task` | 发 `error` 帧后 `end` |
 
@@ -287,17 +287,23 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 ### ③ 结果什么时候真正到达主管
 
-主管**从不等待**后台任务：派完继续干自己的活，结果到达时再插进来。两条投递路径按父线程当时的
-状态分工（`Thread.status`：`busy` / `interrupted` / `idle` / `error`）：
+主管**从不等待**后台任务：派完继续干自己的活，结果到达时再插进来。两条投递路径按主管
+此刻的处境分工（
+`Thread.status`：`busy` / `interrupted` / `idle` / `error`）：
 
-| 父线程当时 | 谁投递 | 行为 |
+| 主管此刻 | 谁投递 | 行为 |
 |---|---|---|
-| `busy`（主管的 run 还在跑） | 主管侧 guard（`abefore_model`） | 下一次调用模型前把结果作为一条消息注入；**不打断**当前步骤、不另开 run。子 agent 侧只安排一次延迟复查，兜住「主管正好在收尾」的情况 |
-| `interrupted`（图在等某个 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，主管恢复后的下一轮由 guard 自动补上 |
-| `idle` / `error`（主管已经答完） | `CompletionNotifier`（子 agent 侧） | 用父身份开一轮新 run 投递（就是上一轮对话里看到的那条「子 agent 返回」） |
+| 正在跑（run 首尾） | 主管侧 guard（`abefore_agent` / `aafter_agent`） | run 开始时补上上个 run 之后完成的，run 结束时落定这次跑动期间完成的；**不打断**、不另开 run |
+| run 跑到一半需要结果 | 模型自己 | 调 `check_async_task`——它返回**全文**，而且 guard 会记下已投递，之后不再重复投 |
+| `interrupted`（图在等 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，下一次 run 的 hook 自动补上 |
+| `idle` / `error`（主管已经答完） | `CompletionNotifier`（子 agent 侧） | 用父身份开一轮新 run 投递（就是上一轮对话里看到的那条「子 agent 返回」），**只试一次** |
 
 两条路不重复：投递前先向服务端**认领** `(task_id, run_id)`（`async_task_delivery` 表，
-接口 `POST /custom/tasks/{id}/deliver-claim`），只有抢到的那方才有资格投递；投递 run 创建失败会撤回认领。
+接口 `POST /custom/tasks/{id}/deliver-claim`），只有抢到的那方才有资格投递；投递失败会撤回认领。
+投过的任务在 state 里留 `delivered_run_id`，所以模型自己 check 过的结果不会被再投一遍。
+判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run。
+
+投递消息只带前 500 字摘要，超长时末尾带 `…[结果已截断…]`；**全文只能从 `check_async_task` 取**。
 判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run，只认 task_id 会把更新后的第二次结果当成重复丢掉。
 用表而不是读 state 判重，是因为跨进程才原子，而且不用为了查一个标记把整份对话读回来。主 prompt 另外要求模型对重复通知只更新 todo。
 
@@ -305,18 +311,18 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 | 情形 | 结果 |
 |---|---|
-| 同一轮里几个任务一起完成，主管正在跑 | 它们在**一次**状态更新里合并注入，各一条消息，不多跑一轮模型 |
-| 几个子 agent 几乎同时收尾，主管正忙 | 全部交给主管侧注入，notifier 全程不创建 run |
-| 几个子 agent 几乎同时收尾，主管空闲 | 第一个抢到认领并开 run；8 秒内后到的拿到 `in_flight` 直接让路，结果由主管边界的注入送达（同一时刻最多一个投递 run，跨 worker 也成立） |
+| 同一轮里几个任务一起完成，主管正在跑 | 它们在**一次** `after_agent` 里合并成一条 state 更新，各一条消息，不多跑一轮模型 |
+| 几个子 agent 几乎同时收尾，主管正忙 | notifier 看到 `busy` 直接返回，不创建 run；结果由下次 run 的 hook 写进 state |
+| 几个子 agent 几乎同时收尾，主管空闲 | 第一个抢到认领并开 run；8 秒内后到的拿到 `in_flight` 直接让路，结果由下次 run 的 hook 补上（同一时刻最多一个投递 run，跨 worker 也成立） |
 
 子 agent 自身不受影响：每个任务在自己的线程里独立执行，同时完成只是把结果一起排队送到主管。
 
-投递的过期窗口、让路窗口、延迟复查节奏都是代码常量，怎么成对调、以及不能怎么调，见
-[adr/0010 §三个时间参数与怎么调](./docs/adr/0010-task-delivery-idempotency.md#三个时间参数与怎么调)。
+投递的过期窗口与让路窗口是代码常量（`custom/delivery_api.py`），含义见
+[adr/0010 §两个时间参数](./docs/adr/0010-task-delivery-idempotency.md#两个时间参数)。
 
-**仍然存在的空隙**：子 agent 恰好在主管「正在生成最终答案」的那一刻完成时，那轮答案里不包含它，
-会落到 `idle` 那条路补答一轮（用户看到先答一版、再补一段）。要消除它只能硬杀主管的 run，
-代价是丢掉当前步骤并可能重复工具副作用，目前不做。
+**仍然存在的空隙**：子 agent 恰好在主管「正在生成最终答案」的那一刻完成时，`after_agent`
+写的消息模型没机会转述，用户会看到「答案 + 一张结果卡片」；而 notifier 只试一次，
+`busy` 期间完成的结果要等用户再说一句话才出现。
 
 ### 明确**不**流通的东西
 
@@ -328,206 +334,110 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 ---
 
-## 11. 在 graph 里新增一个子 agent
+## 11. 新增一个子 agent（= 新增一个 Space）
 
-新增一个领域子 agent（例：`bio_lab`，绑空间 `bio-lab`）需要动 **7 处**。前 2 处是「知识 + 权限」，后 5 处是「代码」。
+**不用改代码**。一个 Space 就是一个子 agent：`space` 表一行 + 知识空间下一个文件夹 +
+该文件夹里的 `AGENT.md`。名单、prompt、工具都是运行时按这些派生的（见
+[adr/0011](docs/adr/0011-space-agent-is-dynamic.md)）。
 
-### 11.1 建知识空间（磁盘）
-
-```
-graphs/okf/bio-lab/
-├── index.md          # 必需：OKF v0.2，只有 frontmatter `okf_version: "0.2"` + 分组链接列表
-├── log.md            # 建议：按日期分组的更新历史
-├── some-concept.md   # 概念文档：frontmatter 带 type/title/description/tags/status/stale_after/generated/sources
-└── xxx.xlsx          # 可选：要查表就放这里（子 agent 用 xlsx_info/query/search/profile 读）
-```
-
-概念文档的最小 frontmatter（`type` 必填，其余见 `docs/streaming.md` 之外的 OKF 规范）：
-
-```yaml
----
-type: concept
-title: 菌株保藏与复苏
-description: 甘油菌复苏与传代的操作边界
-tags: [bio-lab, strain]
-status: stable
-verified: true
-generated:
-  by: okf-enrichment-agent
-  at: 2026-10-18
-stale_after: 2027-10-18
-sources:
-  - "internal://sop-001"
----
-```
-
-### 11.2 登记进数据库（否则派活会被拒）
-
-`space` 名字就是磁盘文件夹名，`path` 相对项目根：
+### 11.1 建空间（推荐走接口）
 
 ```bash
-psql -U postgres -d aegra <<'SQL'
-insert into space(name, path) values ('bio-lab', 'graphs/okf/bio-lab')
-  on conflict (name) do nothing;
+curl -s -X POST http://127.0.0.1:2026/custom/spaces/create \
+  -H "Authorization: Bearer <超管 token>" -H "Content-Type: application/json" \
+  -d '{"space_name": "bio-lab"}'
+# → {"space_name": "bio-lab", "message": "bio-lab 已经建立"}
+```
 
--- 谁能用这个空间（不给就没任何人能派活给这个 agent）
-insert into user_space(identity, space_name) values ('root', 'bio-lab')
-  on conflict do nothing;
+接口会做三件事：名字校验（字母/数字/下划线/点/短横线，1–64 字符）、按知识空间根派生目录
+（`graphs/okf/bio-lab`，请求里的 `path` 已废弃）、目录里没有 `AGENT.md` 时从模板生成一份。
+
+手写也行，但**三样缺一不可**：
+
+```bash
+mkdir -p graphs/okf/bio-lab
+psql -U postgres -d aegra <<'SQL'
+insert into space(name, path) values ('bio-lab', 'graphs/okf/bio-lab') on conflict (name) do nothing;
+-- 谁能用这个空间（不给就没任何人能派活给它）
+insert into user_space(identity, space_name) values ('root', 'bio-lab') on conflict do nothing;
 SQL
 ```
 
-> 拦截层派活前会校验「当前用户的 spaces 包含该空间」，不包含就直接拒绝：
+> 拦截层派活前会校验「当前用户的 spaces 包含该空间」，不包含就拒绝：
 > `用户没有空间 'bio-lab' 的权限，无法启动该子 agent`。
 
-### 11.3 写两份 prompt
+### 11.2 写 `AGENT.md`（唯一的 prompt 来源）
 
-| 文件 | 作用 | 谁读 |
-|---|---|---|
-| `graphs/prompts/bio_lab.md` | 子 agent 的 system prompt：知识库导航、工具用法、边界 | 子 agent 自己 |
-| `graphs/prompts/bio_lab_description.md` | **主 agent 选人用的描述**：一句话讲清「什么问题该找我」 | 主 agent |
-
-`bio_lab_description.md` 的写法（决定主管能不能选中它，比 system prompt 更关键）：
+`graphs/okf/bio-lab/AGENT.md`：frontmatter 的 `description` 是**主管选人用的描述**
+（比正文更关键），正文是**子 agent 自己的 system prompt**。
 
 ```markdown
-生物实验室领域专家，运行在 bio-lab 知识空间。负责：菌株保藏/复苏、培养基配方、
-实验记录查询（xxx.xlsx）。用户问题涉及菌株、培养基、传代、生物实验 SOP 时派给我。
-```
+---
+description: 生物实验室领域专家，运行在 bio-lab 知识空间。负责菌株保藏/复苏、培养基配方、实验记录查询。用户问题涉及菌株、培养基、传代、生物实验 SOP 时派给我。
+---
 
-`bio_lab.md` 里必须写清知识库清单与工具规则，参考 `graphs/prompts/cbam.md`：
-
-```markdown
 你是生物实验室领域的专用知识 agent，只读不写。主 agent 转述的任务会带 /bio-lab/xxx 路径。
 
 ## 知识库（先读后答）
 - /bio-lab/index.md：总览与导航
-- /bio-lab/some-concept.md：...
-- /bio-lab/xxx.xlsx：sheet「...」
+- /bio-lab/strain-bank.md：菌株保藏与复苏边界
 
-## 工具
-- read：读 .md 文档，回答业务问题必读对应文档，不要凭记忆答。
-- xlsx_info / xlsx_query / xlsx_search / xlsx_profile：查表（先 info 认表再 query）。
-
-## 边界
-- 只处理本领域；只读，任何写盘请求一律拒绝并说明。
+## 流程
+最终答案 = 结论 + 出处，不要贴超长原表。
 ```
 
-### 11.4 导出常量
+两处兜底：没有 `AGENT.md` 时 prompt 退到一句通用说明、description 退到空间名；有正文但没写
+`description` 时用正文首行。
 
-`graphs/prompts/__init__.py`：
+### 11.3 放知识（磁盘）
 
-```python
-BIO_LAB_SYSTEM_PROMPT = load_prompt("bio_lab")
-BIO_LAB_SUBAGENT_DESCRIPTION = load_prompt("bio_lab_description")
-
-__all__ = [
-    # ...
-    "BIO_LAB_SUBAGENT_DESCRIPTION",
-    "BIO_LAB_SYSTEM_PROMPT",
-]
+```
+graphs/okf/bio-lab/
+├── AGENT.md          # 上面那份：description + system prompt
+├── index.md          # 必备：OKF v0.2（frontmatter `okf_version: "0.2"` + 分组链接）
+└── xxx.md / *.xlsx   # 概念文档与表格
 ```
 
-### 11.5 实例化图
+**有 `.xlsx` 才会装 xlsx 四件套**（`xlsx_info/query/search/profile` + CodeInterpreterMiddleware），
+纯文档空间自动不装。
 
-`graphs/domain_agents.py`（builder 已封装好工具栈、写禁用、回写钩子）：
-
-```python
-from graphs.prompts import BIO_LAB_SYSTEM_PROMPT
-
-graph_bio_lab = _domain_agent("bio_lab", BIO_LAB_SYSTEM_PROMPT, xlsx=True)
-#                                                  ↑只有文档时用 xlsx=False，
-#                                                  不带 xlsx 四件套，也不装 CodeInterpreterMiddleware
-```
-
-`_domain_agent(name, ...)` 里的 `name` 同时是日志名与回写通知里的名字，必须和下面两处的 agent 名一致。
-
-### 11.6 在 `aegra.json` 注册图
-
-```json
-{
-  "graphs": {
-    "supervisor": "./graphs/deepagents_nodes.py:graph",
-    "bio_lab": "./graphs/domain_agents.py:graph_bio_lab"
-  }
-}
-```
-
-键名（`bio_lab`）就是主管调用 `start_async_task` 时用的 `subagent_type`，也是 `assistant_id`。
-
-### 11.7 在主管侧登记 spec（绑定 space）
-
-`graphs/deepagents_nodes.py` 的 `_DOMAIN_SPECS` 加一条：
-
-```python
-_DOMAIN_SPECS = {
-    # ...现有三个...
-    "bio_lab": {
-        "space": "bio-lab",                 # ← 权限收窄：子 agent 只能看这一个空间
-        "description": BIO_LAB_SUBAGENT_DESCRIPTION,
-    },
-}
-```
-
-同时把常量加进该文件的 import：
-
-```python
-from graphs.prompts import (
-    MAIN_SYSTEM_PROMPT, CBAM_SUBAGENT_DESCRIPTION, HYBRID_BONDING_SUBAGENT_DESCRIPTION,
-    SBOL3_SUBAGENT_DESCRIPTION, BIO_LAB_SUBAGENT_DESCRIPTION,   # ← 新增
-)
-```
-
-### 11.8 告诉主管「有这么个 agent」
-
-`graphs/prompts/main.md` 的「## 可用的子 agent」加一行（漏了这步 = 模型永远不选它）：
-
-```markdown
-- `bio_lab`：生物实验室专家——菌株保藏/复苏、培养基配方、实验记录查询。知识空间 /bio-lab/。
-```
-
-### 11.9 重启 + 验证
+### 11.4 验证（不用重启）
 
 ```bash
-# 1) 图能 import（注册表在启动时读一次，必须先过这关）
+# 空间能被解析、AGENT.md 读得到
 PYTHONPATH=. uv run python -c "
-import graphs.domain_agents, graphs.deepagents_nodes as s
-print('specs:', {k: v['space'] for k, v in s._specs.items()})"
-# → specs: {'cbam_reporting': 'cbam-reporting', ...}
-#   会伴随一条 CodeInterpreterMiddleware 的 LangChainBetaWarning，属正常
-
-# 2) 重启服务（改了 aegra.json 或图代码都必须重启）
-PYTHONPATH=. uv run python -u src/aegra_api/main.py
-
-# 3) 确认 assistant 已生成
-curl -s http://127.0.0.1:2026/custom/graphs -H "Authorization: Bearer <token>"
-#   → {"graphs":[...,"bio_lab",...]}
-
-# 4) 真正派活（用对应领域的问题）
-uv run python custom_test.py "某个 bio-lab 领域的问题"
+from graphs.space_agents import load_agent_spec, has_tables
+d, p = load_agent_spec('bio-lab'); print(has_tables('bio-lab'), d[:40], len(p))"
 ```
+
+名单是**每次 run 现算**的，所以下一次对话就能派给它；正在跑的 run 看不到新空间。
+`/custom/graphs` 里永远只有 `supervisor` 与 `domain_agent` 两个图——空间不再是一个 graph key。
 
 ### 11.10 不用手写的东西
 
-`_domain_agent` + 拦截层已经把这些固定好了，新增 agent 不用重复实现：
+拦截层 + 单个通用图已经把这些固定好了，新增空间不用重复实现：
 
 | 能力 | 来自 |
 |---|---|
 | 只能读本 space 的文件（含 ls/grep/glob 过滤） | `graphs/space_backend.py::SpaceBackend` |
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
-| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管在跑时注入）+ `CompletionNotifierMiddleware`（主管空闲时回写唤醒） |
+| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `CompletionNotifierMiddleware`（主管空闲时开新 run） |
 | 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
-| 同时最多 N 个后台任务（`MAX_ACTIVE_TASKS`，默认 3，可配）+ 僵尸状态核实 | `AsyncTaskGuard` + `graphs/limits.py` |
+| 一个账号最多几个会话（`MAX_THREADS_PER_USER`，默认 200）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |
+| prompt 与描述 | `<space>/AGENT.md`（`graphs/space_agents.py`） |
 
 ### 11.11 常见坑
 
 | 现象 | 原因 |
 |---|---|
-| 主管永远不派给新 agent | 忘了改 `graphs/prompts/main.md`，或 description 写得太宽/太窄 |
-| `Unknown async subagent type` | `_DOMAIN_SPECS` 没加，或名字与 `aegra.json` 的键不一致 |
-| `用户没有空间 'bio-lab' 的权限` | `space` / `user_space` 表没登记（§11.2） |
-| 子 agent 说「无权访问 /bio-lab/...」 | 磁盘目录不存在，或 `space.path` 写错（相对项目根） |
-| 子 agent 读不到 xlsx 工具 | 实例化时传了 `xlsx=False` |
-| 改完没生效 | 没重启后端（`aegra.json` 与图注册表启动时只读一次） |
+| 主管永远不派给新 agent | 没给这个用户分配 space，或 `AGENT.md` 的 `description` 写得太宽/太窄 |
+| `Unknown async subagent type` | `space` 表没登记，或表里有但目录 `graphs/okf/<space>/` 不存在（会被跳过并记日志） |
+| `用户没有空间 'bio-lab' 的权限` | `user_space` 表没登记（§11.1） |
+| 子 agent 说「无权访问 /bio-lab/...」 | 磁盘目录不存在，或 `space.path` 与实际目录不一致（由接口建的不会错） |
+| 子 agent 读不到 xlsx 工具 | 空间里没有 `.xlsx`（按文件自动决定） |
+| 刚刚新建的空间这个对话里用不了 | 名单只在 run 开始时确定，下一次对话才可见 |
+| 改了 `AGENT.md` 没生效 | prompt 在建图时读，新 run 生效；当前 run 不会变 |
 
 ---
 

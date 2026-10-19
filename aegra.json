@@ -1,9 +1,7 @@
 {
   "graphs": {
     "supervisor": "./graphs/deepagents_nodes.py:graph",
-    "cbam_reporting": "./graphs/domain_agents.py:graph_cbam_reporting",
-    "hybrid_bonding": "./graphs/domain_agents.py:graph_hybrid_bonding",
-    "sbol3_synbio": "./graphs/domain_agents.py:graph_sbol3_synbio"
+    "domain_agent": "./graphs/domain_agents.py:graph"
   },
   "http": {
     "app": "./custom/fastapi.py:app"

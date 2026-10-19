@@ -1,53 +1,168 @@
-"""Completion notifier middleware for async subagents.
+"""子 agent 完成时，往**空闲的**父线程推一条唤醒消息。
 
-子 agent 跑完（成功或出错）时，主动往父线程（主管）推一条消息，让它醒来把结果
-转达给用户，而不必等用户再问 `check_async_task`。
+父 run 还在跑、或停在 HITL 上一律不动：那两种情况由主管自己的
+`AsyncTaskGuard.abefore_agent` / `aafter_agent` 把结果写进 state。本中间件只补
+"主管早已答完、没人来拿"这个缺口。
 
-**这是 bring-your-own 组件**：async subagent 协议本身没有完成通知机制，默认只有
-主管主动 `check_async_subagent` 才拿得到结果。本中间件补上这个缺口。
+===============================================================================
+一、它挂在哪儿、什么时候跑
+===============================================================================
 
-## 回写为什么不能用服务 token（ADR-0005 选项1）
+本中间件装在**子 agent 的图**里（`graphs/domain_agents.py::graph`），不是主管那边。
+所以下面两个 hook 都在**子 run 的进程/协程**里执行：
 
-aegra 的 `runs.create` 只允许线程属主写（runs.py 查 `thread.user_id != user.identity`
-→ 404）。服务身份拿不到父线程，所以回写必须以**父用户自己的身份**写。
+    aafter_agent      子 agent 正常收尾   -> 摘要 = 子线程最后一条消息
+    awrap_model_call  子内模型调用抛异常 -> 只报错，不阻断（异常原样抛回去）
 
-做法：拦截层（graphs/async_task_guard.py）把父上下文经子 run 的 ``configurable``
-转发进来——``parent_thread_id`` / ``parent_assistant_id`` / ``parent_user_identity``
-（取服务端注入的 ``langgraph_auth_user``，客户端伪造不了）/ ``notify_url``。本中间件在
-hook 内用 ``get_config()`` 读到它们后：
+子 agent 写完自己的 checkpoint 就结束，**没有人等它**。它要做的最后一件事是
+"通知父线程"，而父线程可能在另一个进程、另一个 worker 上。
 
-1. 用 env 的 ``JWT_SECRET`` **现铸一枚短时父身份 token**（不写进 config/DB，用完即弃）；
-2. 用显式 ``get_client(url=notify_url, headers=Bearer <父token>)`` 回写父线程。
+===============================================================================
+二、返回父 agent 的调用路径（ADR-0005 / ADR-0006）
+===============================================================================
 
-于是唤醒 run 以父用户身份跑（spaces 正常），同用户写自己的线程，归属校验通过。
+为什么不能直接用服务身份打一发 `runs.create`？
+因为 aegra 的 `POST /threads/{tid}/runs` 会校验线程属主
+（`thread.user_id != user.identity` -> 404）。子 agent 跑在静态服务账号下
+（ADR-0004），它写不了属于终端用户的父线程。
 
-**不转发父上下文 = 不回写**（本地直跑 demo、或没走拦截层的部署），只是安静跳过。
+所以走"临时借用父身份"：
 
-## 什么时候投递、怎么保证只投一次
+    拦截层派活时（graphs/async_task_guard.py::_config_for）
+      把父上下文塞进子 run 的 config.configurable：
+        parent_thread_id / parent_assistant_id /
+        parent_user_identity（取服务端注入的 langgraph_auth_user，客户端伪造不了）/
+        notify_url（本部署自己的 base url）
+            │
+            ▼  （子 run 启动，子 agent 干活、收尾）
+    aafter_agent
+      │ 1. _parent()          从 get_config() 取回上面四项；缺一项 -> 告警并放弃
+      │ 2. _mint_parent_token 用 env 的 JWT_SECRET 现铸一枚 300s 的父身份 token
+      │                       （不写进 config/DB，用完即弃）
+      │ 3. get_client(url=notify_url, headers=Bearer <父token>)
+      │                       显式 HTTP 客户端（不是进程内 ASGI）
+      │ 4. GET  /threads/{parent}         看父线程忙不忙
+      │ 5. POST /custom/tasks/{id}/deliver-claim   抢投递权
+      │ 6. POST /threads/{parent}/runs    以父身份开一轮新 run，把结果当 user 消息
+      ▼
+    父线程多一条 human 消息，内容以 `[Async subagent '<name>' ...]` 开头，
+    末尾带 `task_id: <id>` / `run_id: <id>`；主管被这一轮叫醒，转达给用户。
+    前端 `web/src/stores/chat.ts::toView` 靠同一个前缀把它渲染成「子 agent 返回」卡片。
 
-按父线程状态三态分派：`busy` → 不插队（主管会在下一个模型调用前通过
-`AsyncTaskGuard.abefore_model` 注入结果），只安排延迟复查；`interrupted` → 一律不动
-（否则会把用户正等着回答的答案顶掉）；`idle` / `error` → 开一轮新 run 投递。
+===============================================================================
+三、多进程下的争夺机制
+===============================================================================
 
-判重交给服务端的认领表（`custom/delivery_api.py`，主键 `(task_id, run_id)`）：
-抢到认领才投，创建 run 失败撤回答领，同线程 8 秒内已有认领则让路。
-所以本中间件既不需要读 thread state 判重，也不依赖进程内状态——多进程部署同样成立。
+部署是 `WORKER_COUNT=2`（.env），所以同一个子 run 的收尾、多个子 run 的收尾、
+主管自己的 hook，都可能在不同进程里同时决定"我要投"。三个层各自负责一段：
 
-## 兼容官方 factory 模式
+  层 1  进程内无状态
+        本中间件不存任何"投过没"的内存标记（早期版本有一个 set，已删）。
+        多进程、多副本下内存标记本来就不可靠，判重完全交给层 2。
 
-官方例子（graphs/official_researcher.py）用 graph factory 把父 id 从 config 传进
-构造函数。本组件同时支持两条路：优先从 ``get_config()`` 读（拦截层注入的那套），
-读不到再退回构造函数传入的值。但要铸 token 还缺 ``parent_user_identity`` 与
-``notify_url``，两者只能来自 config 或显式构造参数——缺任何一个都跳过并告警，
-绝不静默失败（这正是旧版「试了不太行」的病灶之一）。
+  层 2  服务端认领表 async_task_delivery(task_id, run_id)（custom/delivery_api.py）
+        主键就是判重键。POST 时在**一个事务**里先拿
+        pg_advisory_xact_lock(hashtext(parent_thread_id))——同一父线程的认领串行，
+        跨进程也生效——然后：
+
+          主键已存在，且 claimed_at 在 15s 内   -> {"claimed": false, "reason": "delivered"}
+          主键已存在，但超过 15s（认领后崩了） -> {"claimed": true,  "reason": "reclaimed"}
+          同父线程 8s 内已有别的任务认领       -> {"claimed": false, "reason": "in_flight"}
+          其它                                 -> {"claimed": true,  "reason": "claimed"}
+
+        in_flight 那 8 秒是给"同线程同时有多个投递"留的让路窗口：即使任务不同
+        （主键不同），也不允许两个投递 run 并发写同一个父线程。
+
+  层 3  state 里的 delivered_run_id（graphs/async_task_guard.py）
+        投递成功的任务在 state 上记 `delivered_run_id = run_id`。这是**主管自己**
+        那条路的判重依据（包括模型自己 check_async_task 拿到终态结果的情况），
+        不需要发 HTTP。
+
+  崩溃语义：认领是"先写票、后投递"。进程在"抢到票"和"真投出去"之间死掉时，
+  这次结果 15s 内不会被重投；15s 后过期重投。正常路径下建 run 失败会立刻
+  DELETE 撤回，不留死行。
+
+===============================================================================
+四、多个子 agent 同时完成
+===============================================================================
+
+  ┌─ 子 A 收尾 ─┐      ┌─ 子 B 收尾 ─┐       （A、B 可能在不同进程）
+  │ aafter_agent │      │ aafter_agent │
+  └──────┬───────┘      └──────┬───────┘
+         │ GET 父线程 status            │
+         ├──────────────┬──────────────┤
+         │              │              │
+         ▼              ▼              ▼
+   父线程 busy    父线程 idle      父线程 idle
+   （还有 run）                  A 先抢到票        B 后到
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+   直接返回，不投    A: runs.create  B: in_flight -> 直接返回
+   不认领、不开 run  (新的一轮)      (8s 让路)   等下一次父 run 的 hook 补
+         │
+         ▼
+   结果由父 run 收尾时的
+   AsyncTaskGuard.aafter_agent 写进 state，
+   不开第二轮 run
+
+注意 in_flight 不是丢结果：B 的结果没被认领、也没被投，但它还在子线程里；
+用户下一次说话（或任何新父 run）时，`AsyncTaskGuard.abefore_agent` 会重新扫描
+`async_tasks`，发现 B 已终态且 `delivered_run_id` 不等于它的 run_id，就补写一条。
+
+===============================================================================
+五、父 agent 内部已经读过这条结果，会怎么处理
+===============================================================================
+
+"已经读过"有三个来源，本中间件在每个来源下都不重复投：
+
+  1. 主管的 hook 已经写进 state（同一个 run 的 before_agent / after_agent）
+     -> 此时父线程多半已经 idle（那一轮答完了），notifier 仍会走到认领；
+        但主键 (task_id, run_id) 已被主管 hook 先抢过 -> 拿到 "delivered" -> 退出。
+        （主管 hook 也走同一张表，见 graphs/async_task_guard.py::_deliver）
+
+  2. 模型自己调了 check_async_task 并拿到终态结果
+     -> guard 在 awrap_tool_call 里给它记上 delivered_run_id；
+        下一轮父 run 的 hook 不会再写，**本中间件也不会补投**。
+
+        为什么不会补投：工具只可能在某个父 run 里被调用，而子 agent 收尾
+        （触发本中间件的 aafter_agent）可能早于、也可能晚于调用 check 的那一轮。
+        早于的话，那一刻父线程还是 busy -> notifier 已放弃，不会再来第二次；
+        晚于的话，用户看到的就是主管自己那一轮把结果用上的回答。两条路上都不产生
+        第二张卡片。
+
+        这就是"check 过就没有回调卡片"的代价，也是**有意的**：主管已经在回答里
+        用上了结果；再投一条就是让用户收到两份答案（而且新 run 的 input 是一条
+        user 消息，模型会再答一遍）。
+
+  3. 同一次子 run 里 aafter_agent 和 awrap_model_call 都触发
+     -> 认领表第二次返回 "delivered"，只投一次（只多一次 HTTP）。
+
+===============================================================================
+六、失败与兜底
+===============================================================================
+
+**只试一次**：没有重试、没有延迟复查。任何异常只记一条 warning。
+理由：通知是便利，不是唯一路径。漏掉的结果会在下一次父 run 开始时由
+`AsyncTaskGuard.abefore_agent` 补上（它不看认领表过期时间，只看 state）。
+代价：父线程一直 busy 且用户不再说话时，这条结果会一直停在子线程里。
+
+===============================================================================
+七、类与函数的分布（改代码前先看这张表）
+===============================================================================
+
+  A. 准入      _DELIVERABLE, _parent_status()
+  B. 内容      _SUMMARY_LIMIT, _shorten(), _extract_last_message()
+  C. 传输/身份 _PARENT_TOKEN_TTL, _mint_parent_token(), _claim_endpoint(),
+               _claim_delivery(), _release_delivery()
+  D. 上下文    CompletionNotifierMiddleware._config() / _parent() / _run_key() / _task_id()
+  主干         CompletionNotifierMiddleware._send_notification()
+  E. 接线      aafter_agent(), awrap_model_call(), build_completion_notifier()
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
-from collections import deque
 from typing import Any
 
 import httpx
@@ -63,55 +178,47 @@ logger = structlog.getLogger(__name__)
 # 短时父 token 有效期：只够完成一次回写，越短泄露面越小（ADR-0005）
 _PARENT_TOKEN_TTL = 300
 
-# 去重集合的上限：只增不减会随进程寿命缓慢涨；淘汰最旧，最坏多一次重复通知
-_NOTIFIED_MAX = 4096
+# 只有这两种线程状态可以投：busy 交给主管 hook，interrupted 不能顶掉用户待答的问题
+_DELIVERABLE = frozenset({"idle", "error"})
+
+# 摘要上限：与 graphs/async_task_guard.py 同一口径（同一个截断标记，模型才认得）
+_SUMMARY_LIMIT = 500
+_TRUNCATED = f"…[结果已截断（仅前 {_SUMMARY_LIMIT} 字），调 check_async_task 取全文]"
 
 
-# 允许 resume 的中断白名单。**现在为空**：① 方案下父 run 不会为等任务而挂起，
-# 所以 notifier 一个 interrupted 线程都不碰（HITL 提问、未知中断都交给 ① 兜底）。
-# 将来做"协作式挂起"时，把那种中断的 kind 加进来即可。
-_RESUMABLE_KINDS: frozenset[str] = frozenset()
-
-# 父线程正忙：不插队，等父 run 结束后再确认一次"① 是否已经投递过"。
-# 这组延迟之和（35s）+ 重试（约 3s）必须小于 custom/delivery_api.py 的 _STALE_SECONDS，
-# 否则正常投递过的结果会在复查时被当成"认领过期"再投一次。
-_RECHECK_DELAYS = (5, 10, 20)
-
-# 延迟复查的 task 需要留引用，否则可能被 GC（asyncio 只持弱引用）
-_RECHECK_TASKS: set[asyncio.Task[Any]] = set()
+# ---------- A. 准入：父线程此刻能不能投 ----------
 
 
-def _interrupt_kinds(snapshot: dict[str, Any]) -> set[str]:
-    """待恢复中断的判别字段（我们自己的 ask 用 value.tool 标识）。"""
-    kinds: set[str] = set()
-    for item in (snapshot or {}).get("interrupts") or []:
-        value = item.get("value") if isinstance(item, dict) else getattr(item, "value", None)
-        if isinstance(value, dict):
-            kinds.add(str(value.get("kind") or value.get("tool") or "unknown"))
-        else:
-            kinds.add("unknown")
-    return kinds
+async def _parent_status(client: Any, thread_id: str) -> str:
+    """父线程状态；查不到返回 "unknown"（按不投处理，交给主管 hook 兜底）。"""
+    try:
+        thread = await client.threads.get(thread_id)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    return str((thread or {}).get("status") or "idle")
 
 
-async def _claim_delivery(url: str, token: str, parent_thread_id: str, task_id: str, run_id: str) -> tuple[bool, str]:
-    """向服务端认领这次执行结果的投递权（跨进程幂等；见 custom/delivery_api.py）。"""
-    endpoint = f"{url.rstrip('/')}/custom/tasks/{task_id}/deliver-claim"
-    body = {"parent_thread_id": parent_thread_id, "run_id": run_id}
-    headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(endpoint, json=body, headers=headers)
-        resp.raise_for_status()
-        payload = resp.json()
-    return bool(payload.get("claimed")), str(payload.get("reason") or "")
+# ---------- B. 内容：投什么 ----------
 
 
-async def _release_delivery(url: str, token: str, parent_thread_id: str, task_id: str, run_id: str) -> None:
-    """撤销认领：投递 run 没创建成功时调用，否则这次结果会被永久判为"已投递"。"""
-    endpoint = f"{url.rstrip('/')}/custom/tasks/{task_id}/deliver-claim"
-    params = {"parent_thread_id": parent_thread_id, "run_id": run_id}
-    headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=10) as client:
-        await client.delete(endpoint, params=params, headers=headers)
+def _shorten(text: str) -> str:
+    """截断摘要并显式留标记——静默硬切会让模型分不清「写完了」和「被切了」。"""
+    return text if len(text) <= _SUMMARY_LIMIT else text[:_SUMMARY_LIMIT] + _TRUNCATED
+
+
+def _extract_last_message(state: dict[str, Any]) -> str:
+    """子 agent 的结论 = 它自己 state 的最后一条消息；空对话给占位文案。"""
+    messages = state.get("messages", [])
+    if not messages:
+        return "(no output)"
+    last = messages[-1]
+    content = getattr(last, "content", None)
+    if content is None and isinstance(last, dict):
+        content = last.get("content", "")
+    return _shorten(content if isinstance(content, str) else str(content))
+
+
+# ---------- C. 传输与身份：铸 token、认领、撤票 ----------
 
 
 def _mint_parent_token(identity: str) -> str:
@@ -124,8 +231,36 @@ def _mint_parent_token(identity: str) -> str:
     )
 
 
+def _claim_endpoint(url: str, task_id: str) -> str:
+    """认领接口地址（POST 抢票 / DELETE 撤票共用同一个端点）。"""
+    return f"{url.rstrip('/')}/custom/tasks/{task_id}/deliver-claim"
+
+
+async def _claim_delivery(url: str, token: str, parent_thread_id: str, task_id: str, run_id: str) -> tuple[bool, str]:
+    """向服务端认领这次执行结果的投递权（跨进程幂等；见 custom/delivery_api.py）。"""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            _claim_endpoint(url, task_id),
+            json={"parent_thread_id": parent_thread_id, "run_id": run_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    return bool(payload.get("claimed")), str(payload.get("reason") or "")
+
+
+async def _release_delivery(url: str, token: str, parent_thread_id: str, task_id: str, run_id: str) -> None:
+    """撤销认领：投递 run 没创建成功时调用，否则这次结果会被永久判为"已投递"。"""
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.delete(
+            _claim_endpoint(url, task_id),
+            params={"parent_thread_id": parent_thread_id, "run_id": run_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+
 class CompletionNotifierMiddleware(AgentMiddleware):
-    """子 agent 完成/出错时，往父线程推一条唤醒消息。
+    """子 agent 完成/出错时，父线程空闲就推一条唤醒消息。
 
     Args:
         parent_thread_id: 父线程 ID（通常从 config 读，这里是回退值）。
@@ -148,23 +283,35 @@ class CompletionNotifierMiddleware(AgentMiddleware):
         self.parent_user_identity = parent_user_identity
         self.notify_url = notify_url
         self.subagent_name = subagent_name or "subagent"
-        # 按 run_id 去重：静态图的 middleware 实例在同 worker 内被并发 run 共享，
-        # 用 set 而非 bool 位，避免一个 run 的完成把另一个 run 的通知吞掉。
-        self._notified_runs: set[str] = set()
-        # 插入顺序，配合 set 做有界淘汰
-        self._notified_order: deque[str] = deque()
 
-    # ---------- 解析父上下文（config 优先，构造值回退） ----------
+    # ---------- D. 上下文：一次解析出父线程四元组 ----------
 
     @staticmethod
     def _config() -> dict[str, Any]:
+        """当前子 run 的 RunnableConfig；图外调（单测/脚本）时返回空 dict。"""
         try:
             return get_config() or {}
         except RuntimeError:  # hook 在图外被触发（测试/脚本）
             return {}
 
-    def _resolve_parent(self) -> tuple[str, str, str, str] | None:
-        """返回 (thread_id, assistant_id, identity, url)；缺任何一项都放弃回写。"""
+    def _run_key(self) -> str:
+        """子 run 的 id——认领表的主键之一，也是写进消息末尾的 `run_id:` 标记。
+
+        拿不到 run_id 时退到 thread_id，再退到常量，保证总能拼出一个键
+        （退化的键会让判重变粗，但不会让投递失败）。
+        """
+        conf = self._config().get("configurable") or {}
+        return str(conf.get("run_id") or conf.get("thread_id") or "unknown-run")
+
+    def _task_id(self) -> str | None:
+        """子 run 的 thread_id 就是父侧记的 task_id（guard 建任务时两者相同）。"""
+        return str((self._config().get("configurable") or {}).get("thread_id") or "") or None
+
+    def _parent(self) -> tuple[str, str, str, str] | None:
+        """(thread_id, assistant_id, identity, url)；缺任何一项都放弃回写。
+
+        config 优先（拦截层注入的那套），构造参数回退（官方 factory 模式）。
+        """
         conf = self._config().get("configurable") or {}
         thread_id = conf.get("parent_thread_id") or self.parent_thread_id
         assistant_id = conf.get("parent_assistant_id") or self.parent_assistant_id
@@ -182,77 +329,32 @@ class CompletionNotifierMiddleware(AgentMiddleware):
             return None
         return str(thread_id), str(assistant_id), str(identity), str(url)
 
-    def _run_key(self) -> str:
-        conf = self._config().get("configurable") or {}
-        return str(conf.get("run_id") or conf.get("thread_id") or "unknown-run")
-
-    # ---------- 回写（四态分派） ----------
+    # ---------- 主干：准入 → 认领 → 投递 → 失败撤票 ----------
 
     async def _send_notification(self, message: str, task_id: str | None = None) -> None:
-        """按父线程此刻的状态决定怎么投递（不再是"一律开一个 run"）。
-
-        - busy：父 run 还在跑 → 不插队，①（before_model 注入）会在它的下一个边界
-          把结果送进去；这里只安排延迟复查，兜住"父 run 正好在收尾"的缺口。
-        - interrupted：图在等某个 resume 值（HITL 提问等）→ 一律不动，否则会把
-          用户要回答的答案顶掉；用户答完后 ① 会在下一轮补上。
-        - idle / error：线程空着 → 用 input 开新一轮投递（已经是消息就跳过）。
-        """
-        parent = self._resolve_parent()
+        """主干：先看父线程状态，再抢认领，抢到才开 run；任何一步不过就放弃。"""
+        parent = self._parent()
         if parent is None:
             return
-        run_key = self._run_key()
-        if not self._mark_once(run_key):
-            return
         thread_id, assistant_id, identity, url = parent
-        task_id = task_id or str((self._config().get("configurable") or {}).get("thread_id") or thread_id)
-        # 末尾带 task_id：主管侧与这里的判重都靠这个标记（两边投递只留一份）
-        message = f"{message}\n\ntask_id: {task_id}\nrun_id: {run_key}"
-        ctx = (thread_id, assistant_id, identity, url, message, task_id, run_key)
-        await self._deliver(ctx)
-
-    async def _deliver(self, ctx: tuple[str, str, str, str, str, str, str], attempt: int = 1, recheck: int = 0) -> None:
-        thread_id, assistant_id, identity, url, message, task_id, run_key = ctx
+        task_id = task_id or self._task_id() or thread_id
+        run_key = self._run_key()
+        # 末尾带 task_id / run_id：主管侧判重与这里都靠这两个标记（两边投递只留一份）
+        body = f"{message}\n\ntask_id: {task_id}\nrun_id: {run_key}"
         try:
             token = _mint_parent_token(identity)
             client = get_client(url=url, headers={"Authorization": f"Bearer {token}"})
-            status = await self._thread_status(client, thread_id)
-
-            if status == "busy":
-                self._defer(ctx, recheck)
-                return
-            if status == "unknown":
-                raise RuntimeError("parent thread unreachable")
-
-            if status == "interrupted":
-                # 只在这一种情况下需要 state：要知道挂的是哪种中断（HITL 提问 vs 将来我们自己造的）
-                snapshot = await self._thread_state(client, thread_id)
-                kinds = _interrupt_kinds(snapshot)
-                if not (kinds & _RESUMABLE_KINDS):
-                    logger.info(
-                        "completion_notify_skipped_interrupted",
-                        parent_thread_id=thread_id,
-                        subagent=self.subagent_name,
-                        interrupt_kinds=sorted(kinds) or ["none"],
-                    )
-                    return
-                claimed, reason = await _claim_delivery(url, token, thread_id, task_id, run_key)
-                if not claimed:
-                    logger.info(
-                        "completion_notify_skipped_claim",
-                        parent_thread_id=thread_id,
-                        subagent=self.subagent_name,
-                        reason=reason,
-                    )
-                    return
-                # 白名单命中（目前为空）：将来做协作式挂起时走这里
-                await client.runs.create(
-                    thread_id=thread_id, assistant_id=assistant_id, command={"resume": message}
+            status = await _parent_status(client, thread_id)
+            if status not in _DELIVERABLE:
+                logger.info(
+                    "completion_notify_skipped_parent_state",
+                    parent_thread_id=thread_id,
+                    parent_status=status,
+                    subagent=self.subagent_name,
+                    task_id=task_id,
                 )
-                logger.info("completion_notify_resumed", parent_thread_id=thread_id, subagent=self.subagent_name)
                 return
 
-            # 跨进程认领：主键 (task_id, run_id)；同一线程刚有人认领时让路（in_flight），
-            # 这样不会出现两个投递 run 并发写同一线程。
             claimed, reason = await _claim_delivery(url, token, thread_id, task_id, run_key)
             if not claimed:
                 logger.info(
@@ -267,7 +369,7 @@ class CompletionNotifierMiddleware(AgentMiddleware):
                 await client.runs.create(
                     thread_id=thread_id,
                     assistant_id=assistant_id,
-                    input={"messages": [{"role": "user", "content": message}]},
+                    input={"messages": [{"role": "user", "content": body}]},
                 )
             except Exception:
                 # 没投出去就把认领撤掉，否则这次结果会被永久判为"已投递"
@@ -278,98 +380,22 @@ class CompletionNotifierMiddleware(AgentMiddleware):
                 parent_thread_id=thread_id,
                 subagent=self.subagent_name,
                 task_id=task_id,
-                attempt=attempt,
             )
         except Exception as e:  # noqa: BLE001 —— 通知是尽力而为，失败要留痕不能吞
-            if attempt >= 3:
-                self._notified_runs.discard(run_key)  # 释放占位，后续 hook 还能再试
-                logger.warning(
-                    "completion_notify_failed",
-                    parent_thread_id=thread_id,
-                    subagent=self.subagent_name,
-                    error=str(e),
-                    attempt=attempt,
-                    exc_info=True,
-                )
-                return
-            logger.info(
-                "completion_notify_retry",
+            logger.warning(
+                "completion_notify_failed",
                 parent_thread_id=thread_id,
                 subagent=self.subagent_name,
-                attempt=attempt,
+                task_id=task_id,
                 error=str(e),
+                exc_info=True,
             )
-            await asyncio.sleep(0.5 * attempt)
-            await self._deliver(ctx, attempt + 1, recheck)
 
-    def _defer(self, ctx: tuple[str, str, str, str, str, str, str], recheck: int) -> None:
-        """父线程忙：过一会儿再确认。1 ① 已经注入 → 跳过；2 父 run 收尾没注入 → 补投。"""
-        if recheck >= len(_RECHECK_DELAYS):
-            logger.info(
-                "completion_notify_gave_up_busy",
-                parent_thread_id=ctx[0],
-                subagent=self.subagent_name,
-            )
-            return
-        delay = _RECHECK_DELAYS[recheck]
-        task = asyncio.create_task(self._recheck(ctx, recheck + 1, delay))
-        _RECHECK_TASKS.add(task)
-        task.add_done_callback(_RECHECK_TASKS.discard)
-
-    async def _recheck(self, ctx: tuple[str, str, str, str, str, str, str], recheck: int, delay: float) -> None:
-        await asyncio.sleep(delay)
-        await self._deliver(ctx, 1, recheck)
-
-    @staticmethod
-    async def _thread_status(client: Any, thread_id: str) -> str:
-        """父线程状态；查不到返回 "unknown"。busy 时不必再花一次请求取 state。"""
-        try:
-            thread = await client.threads.get(thread_id)
-        except Exception:  # noqa: BLE001
-            return "unknown"
-        return str((thread or {}).get("status") or "idle")
-
-    @staticmethod
-    async def _thread_state(client: Any, thread_id: str) -> dict[str, Any]:
-        try:
-            return await client.threads.get_state(thread_id) or {}
-        except Exception:  # noqa: BLE001 —— 拿不到快照就当没有投递记录
-            return {}
-
-    def _mark_once(self, run_key: str) -> bool:
-        """首次见到这个 run_key 返回 True；重复返回 False。
-
-        去重集合保量：超过上限时按插入顺序淘汰最旧（最坏情况多一次重复通知）。
-        """
-        if run_key in self._notified_runs:
-            return False
-        self._notified_runs.add(run_key)
-        self._notified_order.append(run_key)
-        while len(self._notified_order) > _NOTIFIED_MAX:
-            self._notified_runs.discard(self._notified_order.popleft())
-        return True
-
-    # ---------- hooks ----------
-
-    @staticmethod
-    def _extract_last_message(state: dict[str, Any]) -> str:
-        messages = state.get("messages", [])
-        if not messages:
-            return "(no output)"
-        last = messages[-1]
-        content = getattr(last, "content", None)
-        if content is None and isinstance(last, dict):
-            content = last.get("content", "")
-        content = content if content is not None else str(last)
-        return content[:500] if isinstance(content, str) else str(content)[:500]
-
-    def _task_id(self) -> str | None:
-        """子 run 的 thread_id 就是父侧记的 task_id（guard 建任务时两者相同）。"""
-        return str((self._config().get("configurable") or {}).get("thread_id") or "") or None
+    # ---------- E. 接线：两个 hook ----------
 
     async def aafter_agent(self, state: dict[str, Any], runtime: Runtime) -> dict[str, Any] | None:
-        """成功完成时：把结果摘要交给父线程（忙/挂起不插队，详见 _send_notification）。"""
-        summary = self._extract_last_message(state)
+        """子 agent 正常收尾：把结果通知父线程（要不要投由 _send_notification 判）。"""
+        summary = _extract_last_message(state)
         await self._send_notification(
             f"[Async subagent '{self.subagent_name}' has completed] Result: {summary}", self._task_id()
         )

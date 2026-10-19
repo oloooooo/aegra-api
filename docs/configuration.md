@@ -258,6 +258,12 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `AEGRA_THREAD_TTL` | 无 | 覆盖 `checkpointer.ttl`；可写分钟数，也可写 `{"strategy":"keep_latest","default_ttl":...}`。别名 `LANGGRAPH_THREAD_TTL` |
 | `AEGRA_CHECKPOINT_DURABILITY` | 无 | 覆盖 `checkpointer.durability` |
 
+### 业务配额（本项目自定义，在 `custom/quota.py`）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MAX_THREADS_PER_USER` | `200` | 一个账号最多同时拥有几个会话（主管线程；子线程计到所属主管上）。超额时 `POST /threads` 返回 403。超管不受限。见 [adr/0012](./adr/0012-thread-quota-replaces-task-limit.md) |
+
 ### LLM
 
 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` 由 langchain-openai 从环境读取（`settings.py` 把 `.env` 灌进 `os.environ`）。注意**模型名不会自动生效**，图代码必须自己取（见 `.env_example` 里的注释）。

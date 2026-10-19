@@ -27,6 +27,7 @@ from custom.services import (
     _create_access_token,
     _verify_password,
 )
+from graphs.space_agents import scaffold_space, space_rel_path, valid_space_name
 
 router = APIRouter(prefix="/custom", tags=["/custom"])
 logger = structlog.getLogger(__name__)
@@ -92,10 +93,20 @@ async def create_space(
     session: Annotated[AsyncSession, Depends(get_session)],
     user: Annotated[User, Depends(require_auth)],
 ) -> CreateSpaceResponse:
+    """建一个空间 = 建一个子 agent：目录 + AGENT.md 由知识空间根派生，不收客户端路径。
+
+    每个空间就是一个领域子 agent（见 graphs/space_agents.py）：名字同时是目录名与
+    子 agent 名，所以只校验一处。目录里没有 AGENT.md 时用模板生成，字段缺省也有兜底。
+    """
     if "write" not in user.permissions:
         raise HTTPException(status_code=403, detail="只有超级用户可以创建微服务空间")
+    name = body.space_name.strip()
+    if not valid_space_name(name):
+        raise HTTPException(status_code=422, detail="空间名只能用字母/数字/下划线/点/短横线，1-64 字符")
     repo = SpaceRepository(session)
-    space = await repo.create(body.space_name, body.path)
+    # path 由名字派生（知识空间根/名字）；body.path 只为老客户端兼容，不参与访问控制
+    space = await repo.create(name, space_rel_path(name))
+    scaffold_space(name)
     return CreateSpaceResponse(space_name=space.name, message=f"{space.name} 已经建立")
 
 

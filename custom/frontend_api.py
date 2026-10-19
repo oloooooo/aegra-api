@@ -299,3 +299,4 @@ async def stream_task(
         yield format_sse_message("end", {"status": (await _fresh_status(request, task)).get("status")}).encode()
 
     return StreamingResponse(gen(), headers=get_sse_headers())
+
