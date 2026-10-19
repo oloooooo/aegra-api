@@ -67,9 +67,13 @@ async def _cascade_child_threads(ctx, value):
     # aegra 在 ownership 校验之前调用本 handler，所以自己先确认这个 thread 属于调用者
     if owner != ctx.user.identity and 非超管: return None   # 交给原生接口 404
     children = 所有 metadata->>'parent_thread_id' = 本线程 的行
-    删 children 的 checkpoint + thread 行
+    for c in children: adelete_thread(c)      # 先删 checkpoint
+    delete from thread where thread_id in children   # 再删行
     # 父线程交给原生 DELETE /threads/{id} 继续删
 ```
+
+顺序不能反（与 aegra 原生 `delete_thread` 同一约定）：先删行的话，`adelete_thread` 一失败就留下
+再也找不到的孤儿 checkpoint；先删 checkpoint 则失败时行还在，客户端重试即可。
 
 ## 删掉的东西
 

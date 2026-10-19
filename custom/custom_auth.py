@@ -120,10 +120,15 @@ async def _cascade_child_threads(ctx, value):
         owner = await session.scalar(select(ThreadORM.user_id).where(ThreadORM.thread_id == thread_id))
         if owner is None or (owner != ctx.user.identity and "write" not in (ctx.permissions or [])):
             return None  # 交给原生接口去 404/拒绝，这里不动任何东西
-        children = await ThreadQuotaRepository(session).delete_children(thread_id)
+        repo = ThreadQuotaRepository(session)
+        children = await repo.list_children(thread_id)
+        if children:
+            checkpointer = db_manager.get_checkpointer()
+            for child in children:
+                # 先删 checkpoint：这一步失败时 thread 行还在，客户端重试即可；
+                # 反序则行已没、checkpoint 再也没人能找到（同 aegra delete_thread 的约定）
+                await checkpointer.adelete_thread(child)
+            await repo.delete_threads(children)
     if children:
-        checkpointer = db_manager.get_checkpointer()
-        for child in children:
-            await checkpointer.adelete_thread(child)  # checkpoint 没有外键，要自己清
-    logger.info("thread_children_deleted", parent=thread_id, children=len(children))
+        logger.info("thread_children_deleted", parent=thread_id, children=len(children))
     return None

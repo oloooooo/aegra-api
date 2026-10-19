@@ -179,17 +179,17 @@ class ThreadQuotaRepository:
         )
         return int((await self.session.execute(stmt)).scalar_one())
 
-    async def delete_children(self, parent_thread_id: str) -> list[str]:
-        """删掉某个主管线程下所有已认领的子线程，返回被删的 thread_id。
-
-        不删的话：子线程归服务账号，用户看不见也删不掉，会永久占着配额与存储。
-        调用方负责先删这些线程的 checkpoint（同 aegra 的 delete_thread 顺序）。
-        """
+    async def list_children(self, parent_thread_id: str) -> list[str]:
+        """某个主管线程名下的子线程 id（**只查不删**，顺序由调用方控）。"""
         stmt = select(ThreadORM.thread_id).where(
             ThreadORM.metadata_json["parent_thread_id"].astext == parent_thread_id
         )
-        children = list((await self.session.execute(stmt)).scalars())
-        if children:
-            await self.session.execute(delete(ThreadORM).where(ThreadORM.thread_id.in_(children)))
-            await self.session.commit()
-        return children
+        return list((await self.session.execute(stmt)).scalars())
+
+    async def delete_threads(self, thread_ids: list[str]) -> None:
+        """按 id 删线程行。**调用方必须先删这些线程的 checkpoint**——反序会留孤儿
+        （与 aegra 原生 delete_thread 同一约定，见 api/threads.py）。"""
+        if not thread_ids:
+            return
+        await self.session.execute(delete(ThreadORM).where(ThreadORM.thread_id.in_(thread_ids)))
+        await self.session.commit()

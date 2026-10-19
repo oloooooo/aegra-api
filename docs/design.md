@@ -341,6 +341,15 @@ supervisor = create_deep_agent(
 
 ### 本项目自定义部分的验证（2026-10-19，Redis / 无 Redis 两种模式均过）
 
+**离线自检**（不需要 DB/LLM，改代码后先跑这两个）：
+
+```bash
+PYTHONPATH=. PYTHONUTF8=1 uv run python scripts/check_task_delivery.py   # 投递/判重/认领 29 项
+PYTHONPATH=. PYTHONUTF8=1 uv run python scripts/check_thread_quota.py     # 配额与级联顺序 14 项
+```
+
+**真服务 e2e**：
+
 - **结果投递**（§2.4）：主管 run 首尾写 state、空闲时 notifier 开新 run；两种模式下都观察到
   `[Async subagent '<space>' has completed]` 带 `task_id:` / `run_id:` 的 `human` 消息落地。
 - **会话配额**（ADR-0012）：第 N+1 个 `POST /threads` 返 403 且文案可读；删一个后能再建；
