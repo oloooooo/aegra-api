@@ -174,11 +174,10 @@ def _thread_summary(thread: Any) -> str:
 class AsyncTaskGuard(AgentMiddleware):
     """拦截 async subagent 的 run 创建：注入 user_spaces、给子线程打归属标记。"""
 
-    def __init__(self, specs: dict[str, dict[str, Any]], assistant_id: str = "supervisor") -> None:
-        """specs: {agent_name: AsyncSubAgent spec}；assistant_id = 主管自己的 assistant
-        （回写唤醒 run 用；config 里若带 assistant_id 则优先用 config 的）。"""
+    def __init__(self, specs: dict[str, dict[str, Any]]) -> None:
+        """specs: {agent_name: AsyncSubAgent spec}（名单由 `domain_specs()` 按本次 run 的
+        spaces 现算；唤醒 run 不再回写父线程，所以不需要主管自己的 assistant_id）。"""
         self._specs = specs
-        self._assistant_id = assistant_id
         self._sync: dict[tuple, SyncLangGraphClient] = {}
         self._async: dict[tuple, LangGraphClient] = {}
 
@@ -217,11 +216,11 @@ class AsyncTaskGuard(AgentMiddleware):
         """(子 run 的 configurable, 错误文本)：本任务 space + 父上下文（收尾回写用）。
 
         spec 绑定了 ``space`` 的子 agent 只发 ``[space]``，并先校验主管有该空间权限；
-        没有 space 绑定时回退主管的全量快照。父上下文只在有鉴权上下文（非本地 demo）
-        时才转发，其中的 identity 取服务端注入的 `langgraph_auth_user`，客户端伪造不了。
+        没有 space 绑定时回退主管的全量快照。子 run 的 configurable 只放 `user_spaces`：
+        父上下文（谁是我的父线程）走 `_thread_meta` 的子线程 metadata，那是 `finalize_run`
+        写发件箱行的判据；不再往子 run 里塞父身份/回调地址。
         """
         cfg = request.runtime.config or {}
-        conf = cfg.get("configurable") or {}
         space = spec.get("space")
         if space:
             spaces = allowed_spaces(cfg)
@@ -231,21 +230,7 @@ class AsyncTaskGuard(AgentMiddleware):
         else:
             all_spaces = allowed_spaces(cfg)
             user_spaces = None if all_spaces is None else sorted(all_spaces)
-        payload: dict[str, Any] = {"user_spaces": user_spaces}
-
-        parent_identity = current_identity(request.runtime.config)
-        parent_thread_id = conf.get("thread_id")
-        if parent_identity != "local" and parent_thread_id:
-            payload.update(
-                parent_thread_id=parent_thread_id,
-                parent_assistant_id=(
-                    conf.get("assistant_id") or (cfg.get("metadata") or {}).get("assistant_id") or self._assistant_id
-                ),
-                parent_user_identity=parent_identity,
-                # 子 run 与父 run 同一部署，用 spec 的 url（本部署即 aegra）
-                notify_url=spec.get("url"),
-            )
-        return {"configurable": payload}, None
+        return {"configurable": {"user_spaces": user_spaces}}, None
 
     @staticmethod
     def _thread_meta(request: ToolCallRequest) -> dict[str, Any]:

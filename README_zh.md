@@ -277,9 +277,10 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
     │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
     │ ② config.configurable（元数据，不进消息）                   │  身份：以父线程属主的身份建 run（服务端按 user_space 复原权限）
     │  user_spaces = [ 本任务的那一个 space ]                      │
-    │  parent_thread_id / parent_assistant_id                     │ ④ 拉取（工具调用，非推送）
-    │  parent_user_identity / notify_url                          │  check_async_task → runs.get → status + result
-    │  ❗服务端注入的 user_spaces 收窄成单空间，越权由后端拒绝         │  顺带把 state.async_tasks 改成真实状态
+    │  ❗服务端注入的 user_spaces 收窄成单空间，越权由后端拒绝         │ ④ 拉取（工具调用，非推送）
+    │                                                            │  check_async_task → runs.get → status + result
+    │ 子线程 metadata（归属，另走 threads.create）                │  顺带把 state.async_tasks 改成真实状态
+    │  owner_identity / parent_thread_id                         │  ❗parent_thread_id 是 finalize_run 写发件箱行的判据
     ▼                                                            │
 ┌─────────────────────── 子 Thread（cbam-reporting 等）──────────────────────┐
 │  自己的 messages[]、自己的 checkpoint、自己的 space 可见范围                 │

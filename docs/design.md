@@ -149,8 +149,8 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
 
 以下为接线前核实过的事实，仍然适用：
 
-- **stock 派活不传父上下文**：`deepagents/middleware/async_subagents.py` 的四处 `runs.create`（264、304、499、538 行）只发 `thread_id` / `assistant_id` / `input`（update 路径多一个 `multitask_strategy="interrupt"`），全包 grep `parent_thread_id` / `parent_assistant_id` 零命中。父 ID 必须由 supervisor 侧显式带过去。
-- **aegra 照单接收 `config.configurable`**：`RunCreate.config`（`models/runs.py:46`）→ `run_preparation.py:328` 合并进 `assistant.config` → `create_run_config()`（`langgraph_service.py:717`）交给图；只强制覆盖 `thread_id` / `run_id`（同文件 721-722 行），其余键透传。所以 `parent_thread_id` 能原样到达子 agent 的**图工厂**。
+- **stock 派活不传父上下文**：`deepagents/middleware/async_subagents.py` 的四处 `runs.create`（264、304、499、538 行）只发 `thread_id` / `assistant_id` / `input`（update 路径多一个 `multitask_strategy="interrupt"`），全包 grep `parent_thread_id` 零命中。所以父线程的归属只能由 supervisor 侧显式带到**子线程的 metadata**（`AsyncTaskGuard._thread_meta`），`finalize_run` 以它为写发件箱行的判据。
+- **aegra 照单接收 `config.configurable`**：`RunCreate.config`（`models/runs.py:46`）→ `run_preparation.py:328` 合并进 `assistant.config` → `create_run_config()`（`langgraph_service.py:717`）交给图；只强制覆盖 `thread_id` / `run_id`（同文件 721-722 行），其余键透传。因此拦截层只往子 run 里放 `user_spaces`，不再塞父身份/回调地址（那些只服务已删除的 notifier）。
 - **aegra 不往 `configurable` 注入 `assistant_id`**：只注入 `thread_id`、`run_id`、`user_id`、`user_display_name`、`langgraph_auth_user`（`langgraph_service.py:721-722`、684）。父的 assistant_id 只能静态取（用 graph key `"supervisor"`，aegra 会 uuid5 解析，`utils/assistants.py:23`）。
 - **工具能拿到父 thread_id**：`ToolRuntime.config` 就是该 run 的 `RunnableConfig`（`langchain/agents/middleware/types.py` 构造处），自建派活工具可直接读 `runtime.config["configurable"]["thread_id"]`，无需外部传参。
 - **工厂图这条路通**：1 参数 `config: RunnableConfig` 工厂（`graph_factory.py:209`）与 async contextmanager 返回值（`generate_graph`，`graph_factory.py:394`）aegra 都支持，按 run 重建，不缓存工厂图（`_base_graph_cache` 只缓存静态图，`langgraph_service.py:300`）。已用探针验证 `@asynccontextmanager async def graph(config: RunnableConfig)` 被 `classify_factory` 判为 factory。
