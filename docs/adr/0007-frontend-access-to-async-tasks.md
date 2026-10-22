@@ -62,6 +62,9 @@ async_tasks: {'d9eb5ea6': 'running'}   ← 子 run 早已 success，父 state �
 - **提高 `MAX_ACTIVE_TASKS` 或改成按派发次数计数**：治不了「名额被僵尸占满」，只是把上限挪远。
 - **回写完成后让 notifier 顺手把状态改成终态**：notifier 拿不到父 state 的写权限（它只是往父线程
   发一条消息），且需要新表或新接口来落状态。
+  > **该方案已随 [ADR-0010](./0010-task-delivery-idempotency.md) 失效**：notifier 已删除，
+  > 现在是 `finalize_run` 写发件箱行、服务端的 `custom/outbox_dispatcher.py` 在父线程空闲时
+  > 开唤醒 run。本条保留为历史评估记录（“拿不到父 state 写权限”这个限制仍然成立）。
 - **前端各自刷新**：只解决显示，不解决派活被拒。
 - **拦截层派活前核实**（选中）：唯一的判上限的地方就是拦截层，修在这里最靠根因。
 
