@@ -251,6 +251,23 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `CRON_MAX_PER_USER` / `CRON_TICK_BATCH_SIZE` / `CRON_MAX_PAYLOAD_BYTES` | `100` / `100` / `65536` | 配额与批量 |
 | `CRON_ALLOW_SECONDS_SCHEDULE` | `false` | 是否允许秒级调度 |
 
+### 任务结果发件箱（`custom/outbox_dispatcher.py`）
+
+进程内后台循环，每个进程一个，靠 `FOR UPDATE SKIP LOCKED` + 租约分工。
+**不依赖 Redis**（Redis 只用于 `executor.submit`）；不配置也能跑。语义见
+[adr/0010](./adr/0010-task-delivery-idempotency.md)。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `OUTBOX_POLL_INTERVAL_SECONDS` | `1.0` | 轮询间隔；空表时每 tick 一次索引扫描 |
+| `OUTBOX_BATCH_SIZE` | `50` | 一次 tick 最多领多少行 |
+| `OUTBOX_LEASE_SECONDS` | `30` | 领取租约；进程死了过期后别人接手 |
+| `OUTBOX_BUSY_BACKOFF_SECONDS` | `2` | 父线程有活跃 run 时的重看间隔（不计失败次数） |
+| `OUTBOX_MAX_ATTEMPTS` | `10` | 建唤醒 run 连续失败多少次后标 `failed`，交由父 run 的 hook 兜底 |
+| `OUTBOX_STARTUP_DELAY_SECONDS` | `5` | 启动后首次 tick 的延迟（等 DB/LangGraph 初始化完） |
+| `OUTBOX_SUMMARY_TIMEOUT_SECONDS` | `5` | 现查子线程摘要的超时；超时退到发件箱里的快照 |
+| `AEGRA_INTERNAL_URL` | `http://127.0.0.1:{PORT}` | 分发者读子线程用的自调地址；用 IPv4 回环（`localhost` 在 Windows 下会先解成 `::1`） |
+
 ### 保留策略
 
 | 变量 | 默认 | 说明 |

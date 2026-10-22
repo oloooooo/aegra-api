@@ -39,8 +39,8 @@ aegra 的每个 thread 查询都带 `user_id == user.identity` 过滤（`threads
 
 ## 决定 2：派活前向子 run 核实状态，不信 state 里的 `async_tasks.status`
 
-`async_tasks` 的 `status` 只由 `check_async_task` 更新。走完成回写路径时（`CompletionNotifierMiddleware`
-→ 唤醒主管 → 主管直接转达）**不经过 check**，于是实测出现：
+`async_tasks` 的 `status` 只由 `check_async_task` 更新。走完成回写路径时（当时是 `CompletionNotifierMiddleware`
+→ 唤醒主管 → 主管直接转达；现已换成 ADR-0010 的发件箱分发者）**不经过 check**，于是实测出现：
 
 ```
 async_tasks: {'d9eb5ea6': 'running'}   ← 子 run 早已 success，父 state 仍是 running

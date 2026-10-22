@@ -272,10 +272,10 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 └───┬──────────────────────────────────────────────────────────▲─────────────┘
     │ ① 任务描述（消息，单向给出）                                │ ③ 结果投递（消息，单向送回）
     │  runs.create(thread_id=子线程,                              │  主管 run 首尾 → before_agent/after_agent 写一条消息
-    │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → runs.create 开新一轮
+    │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → 发件箱分发者开新一轮（custom/outbox_dispatcher.py）
     │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"
     │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
-    │ ② config.configurable（元数据，不进消息）                   │  身份：现铸父身份短时 token（300s）
+    │ ② config.configurable（元数据，不进消息）                   │  身份：以父线程属主的身份建 run（服务端按 user_space 复原权限）
     │  user_spaces = [ 本任务的那一个 space ]                      │
     │  parent_thread_id / parent_assistant_id                     │ ④ 拉取（工具调用，非推送）
     │  parent_user_identity / notify_url                          │  check_async_task → runs.get → status + result
@@ -329,17 +329,18 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 情形 | 结果 |
 |---|---|
 | 同一轮里几个任务一起完成，主管正在跑 | 它们在**一次** `after_agent` 里合并成一条 state 更新，各一条消息，不多跑一轮模型 |
-| 几个子 agent 几乎同时收尾，主管正忙 | notifier 看到 `busy` 直接返回，不创建 run；结果由下次 run 的 hook 写进 state |
-| 几个子 agent 几乎同时收尾，主管空闲 | 第一个抢到认领并开 run；8 秒内后到的拿到 `in_flight` 直接让路，结果由下次 run 的 hook 补上（同一时刻最多一个投递 run，跨 worker 也成立） |
+| 几个子 agent 几乎同时收尾，主管正忙 | 发件箱行留在 `pending`，分发者看到活跃 run 就退避；结果由那轮的 `after_agent` 写进 state |
+| 几个子 agent 几乎同时收尾，主管空闲 | 分发者一个 tick 领到全部 → 只开**一轮**唤醒 run，input 拼了所有结果（同一时刻最多一个投递 run，跨 worker 也成立） |
 
 子 agent 自身不受影响：每个任务在自己的线程里独立执行，同时完成只是把结果一起排队送到主管。
 
-投递的过期窗口与让路窗口是代码常量（`custom/delivery_api.py`），含义见
-[adr/0010 §两个时间参数](./docs/adr/0010-task-delivery-idempotency.md#两个时间参数)。
+投递的重试退避与领取租约是 `custom/outbox_dispatcher.py` 的模块常量（`OUTBOX_*` 环境变量
+可覆盖），语义见 [adr/0010](./docs/adr/0010-task-delivery-idempotency.md)。
 
 **仍然存在的空隙**：子 agent 恰好在主管「正在生成最终答案」的那一刻完成时，`after_agent`
-写的消息模型没机会转述，用户会看到「答案 + 一张结果卡片」；而 notifier 只试一次，
-`busy` 期间完成的结果要等用户再说一句话才出现。
+写的消息模型没机会转述，用户会看到「答案 + 一张结果卡片」；主管一直忙且用户不停说话时，
+发件箱行会一直 `pending`（结果晚到，不丢）；卡片正文靠现查子线程获取，自调失败时退化成
+`(no output)`——完整清单见 [adr/0010 §已知问题与残留风险](./docs/adr/0010-task-delivery-idempotency.md#已知问题与残留风险)。
 
 ### 明确**不**流通的东西
 

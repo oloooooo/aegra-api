@@ -4,7 +4,7 @@
 
 实现位置：`custom/frontend_api.py`（路由前缀 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
 
-另有 **2 个内部接口**（前端不调用，供主管侧拦截层与子 agent 的完成中间件做投递认领）：
+另有 **2 个内部接口**（前端不调用，供主管侧拦截层与发件箱分发者做投递 ack）：
 `POST /custom/tasks/{task_id}/deliver-claim` 与 `DELETE` 同名接口。
 它们的鉴权只允许父线程属主或服务身份，语义见 [adr/0010](./adr/0010-task-delivery-idempotency.md)。
 
@@ -180,7 +180,8 @@ POST /threads/{thread_id}/runs/crons
 实测行为：
 
 - **创建即先跑一次**，之后按 cron 重复；返回的是一次 Run，`status` 从 `pending` 开始。
-- cron 触发的 run **带完整用户身份**：派子 agent、完成回写、Space 权限全部正常（`completion_notify_sent` 正常打出）。
+- cron 触发的 run **带完整用户身份**：派子 agent、完成回写、Space 权限全部正常
+  （日志里能看到 `outbox_wake_run_created` / `task_results_delivered`）。
 - `POST /runs/crons/search` 返回 `next_run_date` / `enabled` / `payload`；`PATCH` 可改 schedule 或 `{"enabled": false}` 暂停。
 - **删除线程会级联删除它的 cron**，不会留孤儿。
 - 没有「执行历史」接口：每次触发的 run 就在该线程的 `/threads/{id}/runs` 里。

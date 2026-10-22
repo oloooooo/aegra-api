@@ -16,7 +16,7 @@
     uv run python custom_test.py "问题"   # 带首个问题启动
 
 预期：supervisor 按空间描述选子 agent（如 CBAM 表 → cbam-reporting），子 agent 跑完
-经 CompletionNotifierMiddleware / guard 的 run 首尾 hook 把结果送回，这里能流式看到过程与最终回答。
+由发件箱分发者（或主管 run 首尾的 hook）把结果送回，这里能流式看到过程与最终回答。
 """
 
 import os
@@ -90,7 +90,7 @@ def _ask(thread_id: str, prompt: str) -> str:
 
 
 def _wait_for_callback(thread_id: str, timeout: int = 180) -> None:
-    """等子 agent 回写（CompletionNotifierMiddleware 会唤醒主管再跑一轮）。
+    """等子 agent 回写（服务端发件箱分发者会在父线程空闲时开一轮唤醒 run）。
 
     主管派完活本轮 run 就结束了，结果在后来的 run 里才出现；这里轮询线程状态，
     一有新消息就打印，直到最后一条是带内容的 ai 消息或超时。

@@ -19,14 +19,12 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 只�
     start_async_task(subagent_type="cbam-reporting", description="…")
       │
       │ 1. _prepare()        subagent_type -> spec（名单来自 aegra.json 的图 + space）
-      │ 2. _config_for()     what the child may read / who to notify
+      │ 2. _config_for()     what the child may read
       │      configurable.user_spaces = ["cbam-reporting"]     ← 只给本任务的那个
       │      （spec 绑了 space 时还先校验主管有该 space，没有就拒绝）
-      │      configurable.parent_thread_id / parent_assistant_id /
-      │                   parent_user_identity / notify_url   ← 子 agent 收尾回写用
       │ 3. _thread_meta()   what the child thread is owned by
       │      metadata = {owner_identity: <终端用户>, parent_thread_id: <主管>}
-      │      （子线程属主是服务账号，配额与级联删除靠这两个字段，见 ADR-0012）
+      │      （子线程属主是服务账号；parent_thread_id 同时是 finalize_run 写发件箱行的判据）
       │ 4. POST /threads -> POST /threads/{tid}/runs
       │      stream_mode=["messages","custom"]（前端代理要订阅子 agent 实时输出）
       ▼
@@ -46,7 +44,7 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 只�
     before_agent / after_agent
       │ 1. _refreshed_async()  向子 run 问真实状态（state 里的 status 只是快照）
       │ 2. _plan()             谁已终态、且结果还没进过主管上下文
-      │ 3. POST /custom/tasks/{id}/deliver-claim   抢投递权（与 notifier 互斥）
+      │ 3. POST /custom/tasks/{id}/deliver-claim   抢投递权（与发件箱分发者互斥）
       │ 4. GET /threads/{child}                    取子 agent 最后一条消息当摘要
       │ 5. 返回 {"messages": [HumanMessage("[Async subagent … ] Result: …")],
       │          "async_tasks": {task_id: {..., delivered_run_id: run_id}}}
@@ -587,7 +585,7 @@ class AsyncTaskGuard(AgentMiddleware):
         claimed: list[dict[str, Any]] = []
         try:
             for task in pending:
-                if await self._claim_async(task, parent) is False:  # notifier 已投过
+                if await self._claim_async(task, parent) is False:  # 分发者或别的 run 已投过
                     logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
                     continue
                 claimed.append(task)

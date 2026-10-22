@@ -77,7 +77,8 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 ### 2.4 子 agent 结果投递（task delivery）
 
 > 背景：子 agent 跑完后要把结果送回 supervisor 的 thread，让它不必被问就汇报。**已接线**，
-> 当前实现是两条路：主管 run 的首尾由拦截层写进自己的 state；主管已空闲时由子 agent 中间件开新 run 回写。
+> 当前实现是两条路：主管 run 的首尾由拦截层写进自己的 state；主管已空闲时由服务端的
+> 发件箱分发者（`custom/outbox_dispatcher.py`）开一轮唤醒 run。
 
 **为什么不是一条路**：LangGraph 没有向运行中的图投递消息的 API；从外部能做的只有读状态、
 杀 run（`runs/cancel`）、另开 run。所以 run 中途想拿结果只能由模型自己 `check_async_task`，
@@ -339,12 +340,10 @@ supervisor = create_deep_agent(
 4. `multitask_strategy` 的 `reject` / `enqueue` / `rollback` 仍被忽略（同线程并发 run 可并存）。因此投递不会用 `multitask_strategy` 抢占，而是按父线程状态分派（见 §2.4）。
 5. `GET /threads/{tid}` 不返回 `interrupts`。
 6. 独立包 `aegra-protocol` 与根 `docs/` 保留不动，仅作历史参照。
-7. **任务投递的三个边界**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md#consequences)）：
-   同线程 8 秒 `in_flight` 窗口内后到的任务不开 run，改由下次 run 的 hook 补上（延迟一个 step，不丢）；
-   认领行随任务数线性增长且当前没有清理任务（按 `claimed_at` 定期删旧行即可）；
-   认领后崩溃时该结果 15 秒内不投（过期后允许重投）；notifier 只试一次，父线程 `busy`
-   期间完成的结果要等用户再说一句话才出现。两个时间参数见
-   [adr/0010 §两个时间参数](./adr/0010-task-delivery-idempotency.md#两个时间参数)。
+7. **任务投递的三个边界**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md#已知问题与残留风险)）：
+   发件箱行随任务数线性增长且当前没有清理任务（按 `delivered_at` 定期删旧行即可）；
+   主管一直忙且用户不停说话时行会一直 `pending`（晚到不丢）；卡片正文靠现查子线程，
+   自调失败时退化为 `(no output)`；分发者 ack 与 state 写入不同事务，崩溃窗口内可能多一张卡。
 
 ## 10. 测试清单（e2e，真 PG）
 
@@ -373,8 +372,9 @@ PYTHONPATH=. PYTHONUTF8=1 uv run python scripts/check_thread_quota.py     # 配�
 
 **真服务 e2e**：
 
-- **结果投递**（§2.4）：主管 run 首尾写 state、空闲时 notifier 开新 run；两种模式下都观察到
-  `[Async subagent '<space>' has completed]` 带 `task_id:` / `run_id:` 的 `human` 消息落地。
+- **结果投递**（§2.4）：主管 run 首尾写 state、空闲时由发件箱分发者开一轮唤醒 run；两种模式下
+  都观察到 `[Async subagent '<space>' has completed]` 带 `task_id:` / `run_id:` 的 `human` 消息落地；
+  多个任务几乎同时完成时只出现**一次** `outbox_wake_run_created`。
 - **会话配额**（ADR-0012）：第 N+1 个 `POST /threads` 返 403 且文案可读；删一个后能再建；
   超管不受限；子线程不计入配额。
 - **级联删除**：删主管会话 → 它的子线程（含 checkpoint）一并消失；别人删我的会话返 404。
