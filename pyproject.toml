@@ -60,6 +60,8 @@ dependencies = [
     # pandas 读 xlsx 的引擎，pd.read_excel 没它直接 ImportError
     "openpyxl>=3.1.5",
     "bcrypt>=5.0.0",
+    "pandoc",
+    "pypandoc>=1.17",
 ]
 
 [project.urls]

@@ -3,6 +3,7 @@ from typing import Annotated
 import asyncio
 
 from deepagents import AsyncSubAgent, create_deep_agent
+from deepagents.backends import CompositeBackend, StoreBackend
 from deepagents.middleware import FilesystemPermission
 import dotenv
 
@@ -22,10 +23,13 @@ class deepAgentContext(BaseModel):
 
 
 from langchain.tools import InjectedToolArg, tool, ToolRuntime
+from langgraph.config import get_config
 from langgraph.graph.state import RunnableConfig
 from langchain.agents.middleware import TodoListMiddleware
+from custom.session_store import session_namespace
 from graphs.async_task_guard import AsyncTaskGuard
-from graphs.space_access import allowed_spaces
+from graphs.session_files import SessionFilesMiddleware
+from graphs.space_access import allowed_spaces, current_identity
 from graphs.space_agents import KNOWLEDGE_ROOT, list_spaces, load_agent_spec, space_dir
 from graphs.space_backend import SpaceBackend
 from graphs.prompts import MAIN_SYSTEM_PROMPT
@@ -105,6 +109,28 @@ def domain_specs(config: RunnableConfig) -> dict[str, dict]:
     return specs
 
 
+def _uploads_namespace(_runtime: object) -> tuple[str, ...]:
+    """`/uploads/` 路由的 store 命名空间：身份与线程都取服务端注入的 config。
+
+    不用 ``runtime.context``——那是客户端可控的；也不分给子 agent，会话文件只对主管可见。
+    """
+    config = get_config() or {}
+    conf = config.get("configurable") or {}
+    return session_namespace(current_identity(config), str(conf.get("thread_id") or ""))
+
+
+def supervisor_backend() -> CompositeBackend:
+    """主管的存储路由：默认仍按 space 隔离，`/uploads/` 走本会话的 store 命名空间。
+
+    包在外面而不是改 `SpaceBackend`：后者是「这次 run 能读哪些 space」的判定单点（ADR-0005），
+    路由是另一件事；`CompositeBackend` 是纯前缀匹配，`/uploads/x.md` 根本不会到它那里。
+    """
+    return CompositeBackend(
+        default=SpaceBackend(root_dir=KNOWLEDGE_ROOT),
+        routes={"/uploads/": StoreBackend(namespace=_uploads_namespace)},
+    )
+
+
 def graph(config: RunnableConfig):  # noqa: ANN201 — 返回编译后的图
     """主管图（工厂图）：子 agent 名单每次 run 现算，见 domain_specs。"""
     specs = domain_specs(config)
@@ -112,12 +138,17 @@ def graph(config: RunnableConfig):  # noqa: ANN201 — 返回编译后的图
         model=model,
         system_prompt=MAIN_SYSTEM_PROMPT,
         tools=[*MAIN_TOOLS],
-        # 按空间隔离的 backend：8 个 fs 工具单点兜住 allowed_spaces（ADR-0005）
-        backend=SpaceBackend(root_dir=KNOWLEDGE_ROOT),
+        # 按空间隔离的 backend + 会话文件的 /uploads 路由（ADR-0013）
+        backend=supervisor_backend(),
         context_schema=deepAgentContext,
         # 拆任务清单（write_todos）；guard 拦截 start/update_async_task：按 spec 绑定的
         # space 经 run config 转发给子 agent（ADR-0005）+ 并发上限
-        middleware=[TodoListMiddleware(), AsyncTaskGuard(specs)],
+        middleware=[
+            TodoListMiddleware(),
+            AsyncTaskGuard(specs),
+            # 本会话上传的文件清单：run 首查一次，每次模型调用注入（不写 state）
+            SessionFilesMiddleware(),
+        ],
         subagents=[*specs.values()],
         permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
     )

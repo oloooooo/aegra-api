@@ -191,6 +191,20 @@ PYTHONPATH=. uv run uvicorn aegra_api.main:app --port 2026 --reload \
 两者都依赖 `REDIS_BROKER_ENABLED`：开了走 Redis worker 队列（可多进程、跨进程取消可靠），
 关了走进程内执行器（只能单进程，多进程下取消约 50% 失效，见 [adr/0009](./docs/adr/0009-worker-mode-requires-redis-broker.md)）。
 
+### 6.2 启动 Redis（多 worker 必需）
+
+```bash
+# 第一次：创建容器（与 .env 的 REDIS_URL=redis://127.0.0.1:6379/0 对应）
+docker run -d --name redis6 -p 6379:6379 redis:6-alpine
+# 之后每次（Docker Desktop 重启/休眠后）
+docker start redis6
+docker exec redis6 redis-cli ping   # 应返回 PONG
+```
+
+> Docker Desktop 重启或休眠后容器可能退出（`Exited`）。多 worker 模式下 Redis 一挂，
+> 新 run 入不了队、子 agent 完成时的唤醒 run 也建不出来（表现：子 agent 返回了但主管不说话，
+> 死锁到用户再发一条消息）。启动后端前先 `docker ps` 确认 redis6 是 `Up`。
+
 > **改了 `aegra.json` 一定要重启**：图注册表在启动时读取一次。
 
 ---
@@ -230,7 +244,8 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 改了 `graphs/` 下的图或 `aegra.json` 但没生效 | 后端启动时只读一次注册表，**重启服务** |
 | 子 agent 一直显示 `running` | 父 state 里的状态是快照（只在 check 时更新）。看真实状态用 `GET /custom/tasks/{id}` |
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
-| 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：`docker start redis6`（或本地 redis），或把该开关设回 `false` 并只用单进程启动 |
+| 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：按 §6.2 启动（`docker start redis6`），或把该开关设回 `false` 并只用单进程启动 |
+| 子 agent 返回后主管不说话（死锁） | Redis 挂了：唤醒 run 由子 agent 进程 POST 创建，入队失败就没人叫主管。`docker ps` 看 redis6，按 §6.2 启动 |
 | 取消后 run 还在继续跑 | 多进程启动但没开 Redis：取消信号跨不了进程（ADR-0009）。开 Redis 或改单进程 |
 | 建会话报 403「会话数已达上限」 | 每个账号默认最多 20 个会话（`MAX_THREADS_PER_USER`，ADR-0012）；删掉不用的会话即可，删会话会连带删它的子线程 |
 
@@ -241,7 +256,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 1. 在中间输入框问：「CBAM 默认排放因子里铝的因子是多少？」
 2. 主管先 `write_todos` 拆任务 → `start_async_task` 派给 `cbam-reporting` → 回你一句「已派给 CBAM 领域 agent（task_id: …）」。
 3. 右侧「任务」面板出现一张卡：状态从 `running` → `success`，卡片里能看到子 agent 的实时输出与工具步骤（`xlsx_info` / `xlsx_query`）。
-4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则 `CompletionNotifierMiddleware` 开一轮新 run 把它叫醒（只试一次）。所以你不用手动催「跑完了吗」；但结果消息只带前 500 字摘要，要全文让主管 `check_async_task`。
+4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则由服务端的**发件箱分发者**（`custom/outbox_dispatcher.py`）开一轮新 run 把它叫醒（失败/崩溃会退避重试，不会丢）。所以你不用手动催「跑完了吗」；但结果消息只带前 500 字摘要，要全文让主管 `check_async_task`。
 
 ## 10. 父子 agent 之间的信息流通
 
@@ -266,8 +281,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
     ▼                                                            │
 ┌─────────────────────── 子 Thread（cbam-reporting 等）──────────────────────┐
 │  自己的 messages[]、自己的 checkpoint、自己的 space 可见范围                 │
-│  收尾钩子：CompletionNotifierMiddleware.aafter_agent → 触发 ③                │
-│  出错时：awrap_model_call 推一条 "… encountered an error" 同样走 ③          │
+│  收尾：子 run 转终态 → finalize_run 写一行发件箱（不在图里做任何事）          │
 └──────────────────────────────┬────────────────────────────────────────────┘
                                │ ⑤ 实时旁路（前端直连，不经过父 agent）
                                ▼
@@ -279,7 +293,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 |---|---|---|---|---|---|
 | ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
 | ② | 父 → 子 | `config.configurable` | 拦截层 | 同上 `_config_for()` | 无权限时直接拒绝派活 |
-| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 子 agent 中间件 | `async_task_guard.py::abefore_agent/aafter_agent`（主管 run 首尾）/ `completion_notifier.py`（主管空闲） | 两条路都缺席时靠 `check_async_task` 兜底 |
+| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 发件箱分发者 | `async_task_guard.py::abefore_agent/aafter_agent`（主管 run 首尾）/ `custom/outbox_dispatcher.py`（主管空闲） | 分发者会重试；仍失败时靠 `check_async_task` 兜底 |
 | ④ | 子 → 父 | 工具返回值 + state 更新 | 主管主动调用 | `deepagents/…/async_subagents.py::_build_check_result` | 返回 `Failed to get run status` |
 | ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/frontend_api.py::stream_task` | 发 `error` 帧后 `end` |
 
@@ -296,10 +310,11 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 正在跑（run 首尾） | 主管侧 guard（`abefore_agent` / `aafter_agent`） | run 开始时补上上个 run 之后完成的，run 结束时落定这次跑动期间完成的；**不打断**、不另开 run |
 | run 跑到一半需要结果 | 模型自己 | 调 `check_async_task`——它返回**全文**，而且 guard 会记下已投递，之后不再重复投 |
 | `interrupted`（图在等 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，下一次 run 的 hook 自动补上 |
-| `idle` / `error`（主管已经答完） | `CompletionNotifier`（子 agent 侧） | 用父身份开一轮新 run 投递（就是上一轮对话里看到的那条「子 agent 返回」），**只试一次** |
+| `idle` / `error`（主管已经答完） | 发件箱分发者（服务端） | 子 run 终态时 `finalize_run` 已写了一行发件箱；分发者把一个 tick 里同一父线程的待投结果合成**一轮**唤醒 run |
 
-两条路不重复：投递前先向服务端**认领** `(task_id, run_id)`（`async_task_delivery` 表，
-接口 `POST /custom/tasks/{id}/deliver-claim`），只有抢到的那方才有资格投递；投递失败会撤回认领。
+两条路不重复：发件箱行 `async_task_outbox` 的主键就是 `(task_id, run_id)`，投递前先用
+`POST /custom/tasks/{id}/deliver-claim` 把行从 `pending` **原子翻成 `delivered`**，
+翻不成就说明别人已投（单行条件 UPDATE，没有时间窗口、没有 advisory lock）。
 投过的任务在 state 里留 `delivered_run_id`，所以模型自己 check 过的结果不会被再投一遍。
 判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run。
 
@@ -421,7 +436,7 @@ d, p = load_agent_spec('bio-lab'); print(has_tables('bio-lab'), d[:40], len(p))"
 |---|---|
 | 只能读本 space 的文件（含 ls/grep/glob 过滤） | `graphs/space_backend.py::SpaceBackend` |
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
-| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `CompletionNotifierMiddleware`（主管空闲时开新 run） |
+| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `custom/outbox_dispatcher.py`（主管空闲时开一轮唤醒 run） |
 | 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
 | 一个账号最多几个会话（`MAX_THREADS_PER_USER`，默认 200）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |

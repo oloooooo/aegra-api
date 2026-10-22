@@ -1,122 +1,132 @@
-# 任务结果投递的幂等与并发
+# 任务结果投递：事务性发件箱 + 单一分发者
 
-结果投递（见 `docs/design.md §2.4`）有两条路，且会在两种情况下并发：同一轮里多个后台任务
-同时完成、多个子 agent 在几乎同一时刻收尾，以及通知路与主管 hook 同时决定投递。
-本文记录为什么不只靠 state 判重、认领表负责什么、以及三种并发下的行为。
+结果投递（见 `docs/design.md §2.4`）要满足两件事，而它们在多进程下会互相干扰：
 
-## 两条路的分工
+1. **不丢**：子 agent 跑完时父线程可能早就答完、没人在等它，结果得主动送过去；
+2. **不重**：同一个 `(task_id, run_id)` 的结果，只能出现在父线程的对话里一次。
 
-| 父线程此刻 | 谁投递 | 动作 |
+本文记录为什么放弃"投递认领 + 时间窗口"，改成"发件箱 + 只由一个组件开唤醒 run"。
+
+## 旧设计的三个毛病（实测踩到）
+
+旧实现是 `async_task_delivery` 认领表 + 两个时间常量（`_IN_FLIGHT_SECONDS=8`、
+`_STALE_SECONDS=15`）：
+
+- **用时间窗口冒充状态**。8 秒和 15 秒都在猜"投递大概多久落地""进程大概什么时候死"。
+- **一张表干两件不相关的事**：`(task_id, run_id)` 主键管结果幂等（正确性），
+  `parent_thread_id + claimed_at` 管"同线程只允许一个投递 run"（调度）。后者塞进前者后，
+  查询只能按 `parent_thread_id` 扫、认不出调用方，于是**同一次 hook 里第 1 个任务认领后
+  就把同批后面的全卡住**——三个子 agent 几乎同时完成时漏投 1/3（日志复现：
+  `task_delivery_skipped_claim` 连续出现，剩最后一个直到用户再说一句话才补）。
+- **认领与投递不原子**，"15 秒过期"是在猜崩溃，不是在检测崩溃。
+
+外部结论也一致：Azure 的 Idempotent Consumer 模式指出消息投递只能做到 at-least-once，
+正确的做法是**消费者侧持久去重键**，而不是幻想跨系统 exactly-once；Stripe 的幂等键把
+幂等放在"写"这一层，不是放在"投递前抢票"这一层。
+
+## 新机制：发件箱 + 单一分发者
+
+### 一、产生：`finalize_run` 写一行（src）
+
+任何 run 转终态都会经过 `run_status.finalize_run`。若该 run 所属线程的 metadata 里有
+`parent_thread_id`（派活时 `AsyncTaskGuard._thread_meta` 写入的归属标记，主管线程没有），
+就在**同一个事务**里插一行 `async_task_outbox`：
+
+```sql
+INSERT INTO async_task_outbox (task_id, run_id, parent_thread_id, agent_name, terminal_status, summary)
+ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不会插第二行
+```
+
+- `task_id` = 子线程 id，`run_id` = 这次执行；
+- `summary` = 终态 state 里最后一条消息（截断），分发者不需要再读子图；
+- `interrupted` 不入账：那说明子 run 被取消或被 `update_async_task` 顶掉，这一轮结果不完整，
+  后面那次 run 会自己入账。
+
+### 二、分发：只有一个组件会开唤醒 run（custom）
+
+`custom/outbox_dispatcher.py`，与 `lease_reaper` / `cron_scheduler` 同款的进程内循环：
+
+```
+每 1s（可调）：
+  1. 领批  SELECT ... WHERE status='pending' AND next_attempt_at<=now()
+           AND (lease_expires_at IS NULL OR lease_expires_at<now())
+           ORDER BY next_attempt_at FOR UPDATE SKIP LOCKED LIMIT 50
+           并写 lease_expires_at = now()+30s
+  2. 按 parent_thread_id 分组
+  3. 每组：SELECT thread FOR UPDATE          ← 锁住线程行
+           有 pending/running run?  → 有：退避 2s 后再看（那轮 hook 会投）
+                                     无：建**一个**唤醒 run，input = 这批结果的消息
+           建完把这批行标 delivered
+```
+
+三个关键性质：
+
+- **不依赖 Redis**。正本是 DB 轮询；Redis 只在 `executor.submit` 那一步被用到，挂了就退避
+  重试，恢复后自动补投（旧版是"只试一次，然后永久丢失"）。
+- **不重复**。唤醒 run 用**确定性 run_id**（`uuid5(parent + 排序后的 (task,run))`）：
+  崩在"建 run 成功、还没标 delivered"之间，重试会撞主键，据此认定"已经建过了"。
+- **不开并发的 run**。`SELECT thread FOR UPDATE` + 活跃 run 检查在同一事务里，而 run INSERT
+  会对 thread 行取 `FOR KEY SHARE`——多进程下第二个分发者会阻塞到第一个提交，然后看到新
+  run 并让路（与 `thread_ttl.py` 处理同一竞态的做法一致）。
+
+### 三、消费：父 run 的 hook 写 state 并 ack（graphs）
+
+父线程有活跃 run 时，分发者不动手——那一轮的 `AsyncTaskGuard.abefore_agent` /
+`aafter_agent` 会把终态结果写进 state。写之前先 `POST /custom/tasks/{id}/deliver-claim`
+**把发件箱行从 pending 原子翻成 delivered**：
+
+```sql
+UPDATE async_task_outbox
+   SET status='delivered', delivered_at=now()
+ WHERE task_id=:t AND run_id=:r AND status IN ('pending','failed')
+RETURNING task_id          -- 0 行 = 别人已经投了，放弃
+```
+
+抢到翻牌权才有资格投递。**没有 advisory lock、没有让路窗口**——单行条件 UPDATE 就是原子的，
+一行一判，同批 N 个任务互不影响（这正是旧版漏投的根因）。
+
+写 state 失败时调 `DELETE` 把行退回 `pending`，分发者会接手。
+
+### 四、判重仍然两层，各管一段
+
+| 层 | 位置 | 管什么 |
 |---|---|---|
-| `busy`（主管的 run 还在跑） | `AsyncTaskGuard.abefore_agent` / `aafter_agent` | 把结果写进**自己 run 的 state**；不打断、不另开 run |
-| `interrupted`（在等人工回答） | 谁都不动 | 硬 resume 会顶掉用户正等着回答的答案；用户答完后下一次 run 的 hook 会补上 |
-| `idle` / `error` | `CompletionNotifierMiddleware` | 用父身份开一轮新 run，**只试一次** |
-
-hook 只在 run 首尾各跑一次——这是有意的：LangGraph 没有向运行中的图投递消息的 API，
-run 中途想拿结果只能由模型自己 `check_async_task`；而 run 首尾是主管唯一能确定
-"这件事还没进我上下文"的时刻。所以 `check` 是 run 中途的正路，通知是空闲时的兜底。
-
-## 判重为什么不能只放在 state 里
-
-投递消息统一为（前端靠前缀识别成「子 agent 返回」）：
-
-```
-[Async subagent '<name>' has completed] Result: …（摘要，超 500 字带截断标记）
-<空行>
-task_id: <id>
-run_id: <完成这次执行的 run id>
-```
-
-按消息判重最省事，但有两个硬伤：
-
-1. **跨进程不原子**。两个 worker 同时"查空 → 创建"，两边都通过；同一父线程上还会出现
-   两个投递 run 并发写同一线程。
-2. **认不出模型自己 check 过的结果**。`check_async_task` 返回的是 `ToolMessage(json)`，
-   不是这条带前缀的消息，扫消息会把"已经从工具拿到结果"的任务当成没投过，再投一遍。
-
-用 `task_id` 单键判重还会吞掉 `update_async_task` 的第二次结果（同一任务、新 run）。
-
-## 机制：认领表 + `delivered_run_id`
-
-### 认领表负责「两条路互斥」
-
-`async_task_delivery(task_id, run_id)`，主键即判重键，另有 `parent_thread_id` 与 `claimed_at`。
-接口在 `custom/delivery_api.py`：
-
-```
-POST /custom/tasks/{task_id}/deliver-claim   {parent_thread_id, run_id}
-  → {"claimed": true,  "reason": "claimed" | "reclaimed"}
-  → {"claimed": false, "reason": "delivered" | "in_flight"}
-DELETE /custom/tasks/{task_id}/deliver-claim?parent_thread_id=&run_id=
-```
-
-规则（全部在一个事务里，配 `pg_advisory_xact_lock(hashtext(parent_thread_id))` 串行化同线程认领）：
-
-| 情况 | 结果 | 调用方该做什么 |
-|---|---|---|
-| 主键已存在且 `claimed_at` 在 15 秒内 | `delivered` | 跳过——这次执行的结果已经投过 |
-| 主键已存在但超过 15 秒（认领后进程死掉、没真投出去） | `reclaimed`，刷新时间 | 照常投递 |
-| 同线程上 8 秒内已有别的任务认领 | `in_flight` | 跳过——那条投递正在落地 |
-| 其它 | `claimed`，插入一行 | 去投递；**投递失败时调 `DELETE` 撤回认领** |
-
-两个调用方都用它：`AsyncTaskGuard._claim_async`（服务身份）与
-`CompletionNotifierMiddleware`（现铸的父身份 token）。授权：`Thread.user_id == 调用者`
-或调用者是服务身份，否则 403；线程不存在 404。
-
-### `delivered_run_id` 负责「同一个 run 只投一次」
-
-投递成功的任务在 state 的 `async_tasks[task_id]` 上记 `delivered_run_id = run_id`。
-它同时覆盖三件事：
-
-- 模型自己 `check_async_task` 拿到终态结果时，guard 在 `awrap_tool_call` 里补记这个字段
-  （否则下一个 hook 会把同一个结果再写一遍）；
-- hook 写 state 失败、认领被撤回后，字段没写进去，下一次 run 的 hook 会重新尝试；
-- 判重不再需要扫 `state.messages`（消息在、字段不在的情况仍用消息兜底，用于跨 run 的
-  notifier 投递）。
+| 发件箱行状态 | `async_task_outbox.status` | **这次结果投没投过**（跨进程、跨 run 的唯一真相） |
+| `delivered_run_id` | 父 state 的 `async_tasks[task_id]` | **同一个 run 只投一次**（模型自己 `check_async_task` 也算已投，见 `_mark_checked`） |
+| 投递消息本身 | 父 state 的 messages | 兜底：消息在、行状态丢了（比如 ack 前崩溃）也不重复写 |
 
 ## 三种并发场景的行为
 
 | 场景 | 行为 | 幂等 |
 |---|---|---|
-| 同一轮里多个任务同时终态，主管在跑 | 一次 `after_agent` 合并成一条 state 更新；每个任务各自认领一次 | 天然幂等（一次 checkpoint） |
-| 多个子 agent 同时收尾，主管正忙 | notifier 看到 `busy` 直接返回，不认领、不生成 run；结果由下次 run 的 hook 写 | 不会产生 run |
-| 多个子 agent 同时收尾，主管空闲 | 第一个抢到认领并开 run；8 秒内后到的拿到 `in_flight` 让路（下次 run 的 hook 兜住） | 同一时刻最多一个投递 run |
-| notifier 读到 `idle` 后用户立刻发消息 | 服务端在跑图之前就把线程置 `busy`；两条路谁先认领谁投，另一个拿到 `delivered` | 只投一次 |
-| 同一任务被两个 hook 投递 | 第二个看到 `delivered_run_id` 或拿到 `delivered` | 只投一次 |
+| 同一轮里多个任务几乎同时终态，主管在跑 | 那轮的 `after_agent` 逐个 ack + 合并成一条 state 更新 | 一次 checkpoint，天然幂等 |
+| 多个子 agent 同时收尾，主管空闲 | 分发者一个 tick 领到全部 → 只开**一轮**唤醒 run，input 拼了所有结果 | 一批一个 run，确定性 run_id |
+| 结果到达时主管正在跑唤醒 run | 分发者看到活跃 run → 退避重看；那轮的 hook 会 ack 并写 state | 不产生第二个 run |
+| 分发者崩在"建 run 后、标 delivered 前" | 租约过期后重试 → 撞确定性 run_id → 按已投递处理 | 不开第二轮 |
+| 建 run 失败（Redis 挂 / 接口 500） | `attempts++`，指数退避（封顶 60s），最多 10 次后标 `failed` | 结果保留，恢复后补投 |
 | `update_async_task` 后的新 run | 新 `run_id` → 新主键 → 再投一次 | 有意为之 |
-
-### 两个时间参数
-
-| 参数 | 位置 | 当前值 | 作用 |
-|---|---|---|---|
-| `_STALE_SECONDS` | `custom/delivery_api.py` | 15s | 认领多久算"过期、允许重投"。**它决定崩溃后结果最多晚多久到达** |
-| `_IN_FLIGHT_SECONDS` | `custom/delivery_api.py` | 8s | 同一父线程上，刚认领后的让路窗口；防止两个投递 run 同时写一个线程 |
-
-投递动作本身是毫秒级，且通知路既没有重试也没有延迟复查，所以这两个值不再互相牵制
-（旧版那条"`_STALE_SECONDS` 必须大于重试 + 复查总和"的不变式随复查一起删掉了）。
-崩溃后没投出去的结果，在下一次父 run 开始时由 hook 重算补上——用户不发新消息就不会补，
-这是"只试一次"接受的代价。
 
 ## Considered Options
 
-- **只靠 state 消息标记**（更早的实现）：零新表，但每次判重读整份 state，且跨进程不原子；
-  也认不出 `check_async_task` 已经拿到的结果。
-- **在 `before_model` 每次模型调用前注入**（上一版实现）：run 中途就能拿到结果，但每个
-  step 都要轮询子 run 状态（带 5s TTL 缓存），还逼出"重试 + 延迟复查"和与之绑定的过期窗口。
-- **数据库认领表 + `delivered_run_id`（选中）**：认领表解决跨路互斥，字段解决同路判重；
-  hook 只在 run 首尾各跑一次，轮询次数从"每个 step"降到"每次 run 两次"。
-- **在服务端直接创建投递 run**：能让"认领 + 创建"彻底原子，但要把 aegra 的 run 创建流程
-  搬进 `custom/`，耦合面太大，不做。
+- **旧版：认领表 + 8s/15s 时间窗口**（已废弃）：能互斥，但时间窗口在"同一 hook 多个任务"
+  这个必然场景下会自阻塞，且崩溃语义靠猜。
+- **给 `runs.create` 加客户端幂等键 + `multitask_strategy=reject`**（平台原生）：把"一线程一
+  活跃 run"交给平台，同样能删掉认领表；需要改平台契约（`RunCreate.run_id`、`reject` 的
+  原子实现），且只在"发 run"这一层判重，不解决"结果从哪来、谁负责重试"。
+- **事务性发件箱 + 单一分发者（选中）**：产生端与投递端解耦，重试与崩溃恢复有明确落点，
+  Redis 变成纯加速项而不是正确性依赖。代价是多一张表 + 一个后台循环。
+- **LangGraph `interrupt()` + `Command(resume=...)`**：框架原生，但父线程整个等待期都停在
+  `interrupted`（busy），用户中途发言要处理打断；interrupt 本意是给人工审批的。
 
 ## Consequences
 
-- 主管 run 中途想拿结果，只能靠模型自己 `check_async_task`——提示词里写成硬口径
-  （需要结果才能往下走、或用户问进度时才查）。
-- `after_agent` 写进 state 的结果，模型已没机会转述：用户看到的是"答案 + 一张结果卡片"。
-  这是 run 首尾投递的固有形态，换来的是不开新 run、不重复生成答案。
-- 投递消息只带 500 字摘要并带截断标记；全文只能从 `check_async_task` 取（那边不截断）。
-- 认领是先写后投：进程在"认领成功"与"真投出去"之间崩溃时，这次结果 15 秒内不会重投；
-  正常路径下失败会先 `DELETE` 撤回，不留死行。
-- 认领表会长大：一行对应一次 `(task, run)` 投递，随任务数线性增长。当前没有清理任务；
-  需要时按 `claimed_at` 定期删旧行即可（删了最坏效果是"远古任务被重新投一次"）。
-- 认领行与 `Run` 没有外键：删线程不会级联清理认领行，理由同上。
+- **多一张表**：`async_task_outbox`，一行 = 一次子 run 的终态结果。仍没有清理任务；
+  需要时按 `delivered_at` 定期删旧行（删了最坏效果是"远古任务被重新投一次"）。
+- **多一个后台循环**：每个进程一个，靠 `SKIP LOCKED` + 租约分工；空表时每 tick 一次索引扫描。
+- **延迟**：正常情况下 ≤ 一个轮询间隔（默认 1s）；父线程忙时等那轮 run 的 hook，与旧版一致。
+- **保底语义是 at-least-once**：ack 与 state 写入不在同一事务里，崩溃窗口内可能多投一次；
+  投递消息带 `task_id` / `run_id` 标记，前端与 guard 都按标记判重，重复卡片比丢结果更可接受。
+- **`interrupted` 的结果不主动投**：取消/被顶掉的子 run 没有完整结论，用户下次发言时由
+  `check_async_task` 或下一次 hook 带出。
+- 主管 run 中途想拿结果仍然只能靠模型自己 `check_async_task`（提示词里写成硬口径）；
+  `after_agent` 写进 state 的结果模型已没机会转述，用户看到的是"答案 + 结果卡片"。

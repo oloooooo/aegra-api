@@ -17,7 +17,7 @@
 | [adr/0007-frontend-access-to-async-tasks.md](./adr/0007-frontend-access-to-async-tasks.md) | 子 agent 的流与状态经 `custom/` 代理暴露（不放开 ownership）；派活前核实 `async_tasks` 真实状态 |
 | [adr/0008-active-task-limit-is-per-process.md](./adr/0008-active-task-limit-is-per-process.md) | ~~`MAX_ACTIVE_TASKS` 靠进程内账本 + 锁保证原子；多 worker 部署下上限按进程各算~~（已由 ADR-0012 取代） |
 | [adr/0009-worker-mode-requires-redis-broker.md](./adr/0009-worker-mode-requires-redis-broker.md) | worker / 多副本必须开 Redis broker：不开时跨进程取消约 50% 静默丢失（实测证据与三种部署对比） |
-| [adr/0010-task-delivery-idempotency.md](./adr/0010-task-delivery-idempotency.md) | 任务投递的幂等与并发：主管 run 首尾写 state 为主路、notifier 空闲时兼底；认领表管两路互斥，`delivered_run_id` 管同路判重 |
+| [adr/0010-task-delivery-idempotency.md](./adr/0010-task-delivery-idempotency.md) | 任务结果投递：事务性发件箱 + 单一分发者；发件箱行状态管跨进程幂等，`delivered_run_id` 管同 run 判重 |
 | [adr/0011-space-agent-is-dynamic.md](./adr/0011-space-agent-is-dynamic.md) | 空间子 agent 动态化：内容放 `<space>/AGENT.md`、单个 `domain_agent` 图 + 工厂图现算名单，加/删 space 不碰代码 |
 | [adr/0012-thread-quota-replaces-task-limit.md](./adr/0012-thread-quota-replaces-task-limit.md) | 用 thread 配额（`MAX_THREADS_PER_USER`）取代派活并发上限：子线程带 `owner_identity` metadata，建会话时计额、删会话时级联删子线程 |
 

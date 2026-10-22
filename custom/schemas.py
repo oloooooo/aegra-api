@@ -48,3 +48,13 @@ class CreateSpaceResponse(MessagesBaseModel):
 
 class CreateUserSpaceResponse(CreateSpaceResponse):
     user_identity: str
+
+
+class UploadFileResponse(BaseModel):
+    """上传成功的会话文件（ADR-0013）：path 是 agent 眼里的路径。"""
+
+    name: str
+    path: str
+    bytes: int
+    uploaded_at: str
+    ttl_minutes: int

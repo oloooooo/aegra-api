@@ -9,23 +9,19 @@ When deployed via `langgraph.json`, this graph is addressable by its graph ID
 
 ## Completion notifications
 
-By default, the supervisor only learns about completion when it calls
-`check_async_subagent`. To enable push notifications, uncomment the
-completion notifier wiring below. See `completion_notifier.py` for details.
+和所有异步子 agent 一样，结果由服务端的发件箱分发者在父线程空闲时送回
+（`custom/outbox_dispatcher.py`，ADR-0010）。图本身不需要任何通知中间件。
 """
 
 from __future__ import annotations
 
+import contextlib
+
 from langchain.agents import create_agent
-from langchain_anthropic import ChatAnthropic
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-from custom.middlewares.completion_notifier import build_completion_notifier
 from graphs.llms import model
-
-# Uncomment to enable completion notifications:
-# from langchain_core.runnables import RunnableConfig
-# from middleware.completion_notifier import build_completion_notifier
 
 SYSTEM_PROMPT = """\
 You are a research agent specializing in information gathering and analysis.
@@ -89,27 +85,16 @@ def summarize_findings(content: str, format: str = "bullet_points") -> str:
 # )
 
 
-# --- Dynamic graph factory with completion notifications ---
-# Uncomment this block and comment out the static `graph` above to enable
-# push notifications back to the supervisor when this subagent finishes.
-
-import contextlib
-from langchain_core.runnables import RunnableConfig
+# --- Graph factory ---
+# 结果回写不在这里做：服务端发件箱分发者负责（ADR-0010），所以图本身与普通图一样。
 
 
 @contextlib.asynccontextmanager
 async def graph(config: RunnableConfig):
-    """Graph factory that wires up the completion notifier from config."""
-    configurable = config.get("configurable", {})
-    notifier = build_completion_notifier(
-        parent_thread_id=configurable.get("parent_thread_id"),
-        parent_assistant_id=configurable.get("parent_assistant_id"),
-        subagent_name="researcher",
-    )
+    """Graph factory。`config` 保留给 aegra 的工厂图约定，内容当前不需要。"""
     yield create_agent(
         model=model,
         tools=[analyze_topic, summarize_findings],
         system_prompt=SYSTEM_PROMPT,
-        middleware=[notifier],
         name="researcher",
     )

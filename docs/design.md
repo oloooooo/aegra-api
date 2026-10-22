@@ -83,48 +83,54 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 杀 run（`runs/cancel`）、另开 run。所以 run 中途想拿结果只能由模型自己 `check_async_task`，
 而「主管早已答完」只能靠另开一个 run 叫醒。
 
-**投递规则**（`graphs/async_task_guard.py::abefore_agent/aafter_agent` + `custom/middlewares/completion_notifier.py`）：
+**投递规则**（`graphs/async_task_guard.py::abefore_agent/aafter_agent` + `custom/outbox_dispatcher.py`）：
 
 | 父线程当时 | 谁投递 | 行为 |
 |---|---|---|
 | `busy` / 本次 run 内 | 主管侧 guard（`before_agent` / `after_agent`，run 首尾各一次） | 写一条带 `task_id:` 标记的消息进自己的 state；不打断、不开新 run |
 | run 中途 | 模型自己 | `check_async_task`——它返回**全文**，且 guard 会记下 `delivered_run_id`，之后不再重复投 |
 | `interrupted` | 谁都不动 | 硬 resume 会把用户正等着回答的答案顶掉（同 §9 #1）；用户答完后下一次 run 的 hook 自动补上 |
-| `idle` / `error` | `CompletionNotifier` | 以父身份开新 run 投递，**只试一次**（不重试、不延迟复查） |
+| `idle` / `error` | 发件箱分发者（服务端后台循环） | 一批待投递结果合成**一轮**唤醒 run；失败/崩溃会退避重试，不会只试一次就丢 |
 
 **去重**：两条路的消息都以 `[Async subagent '<name>' …] Result: …` 开头（前端 `toView`
-靠此前缀识别成「子 agent 返回」），结尾带 `task_id: <id>` 与 `run_id: <id>`。
+靠此前缀识别成「子 agent 返回」），结尾带 `task_id: <id>` 与 `run_id: <id>`；
+格式定义在 `custom/outbox.py`，分发者与 guard 共用同一份。
 
-认领表负责两路互斥：`async_task_delivery(task_id, run_id)`（主键即判重键），
-接口 `POST /custom/tasks/{task_id}/deliver-claim` 抢认领，`DELETE` 撤回
-（`custom/delivery_api.py`）。只有认领成功的一方才投递；投递失败会撤回认领。
-判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run。
-同一路内（hook 与 hook、notifier 与 notifier）的判重靠 state 里的 `delivered_run_id` 字段，
-**不靠扫消息**——`check_async_task` 返回的是 `ToolMessage(json)`，扫不到会被当成未投递再投一遍。
+事务性发件箱（ADR-0010）：子 run 终态时 `finalize_run` 在**同一个事务**里插一行
+`async_task_outbox(task_id, run_id)`（主键即幂等键）；分发者
+`custom/outbox_dispatcher.py` 用 `FOR UPDATE SKIP LOCKED` + 租约领批，父线程
+**无活跃 run** 才建一轮唤醒 run（`SELECT thread FOR UPDATE` 关掉 check-then-act 竞态，
+run_id 是确定性的，重试赚主键即视为已投）。guard 写 state 前先
+`POST /custom/tasks/{task_id}/deliver-claim` 把行从 `pending` 原子翻成 `delivered`
+（`custom/delivery_api.py`）——**没有 advisory lock、没有时间窗口**，一行一判，
+同一批 N 个任务互不影响。
+同一路内（hook 与 hook）的判重靠 state 里的 `delivered_run_id` 字段，**不靠扫消息**
+——`check_async_task` 返回的是 `ToolMessage(json)`，扫不到会被当成未投递再投一遍。
 
 **成本**：每次 run 只在首尾两次核对非终态任务的真实状态（无 TTL 缓存，任务终态后不再查）；
-run 中途不轮询。投递判重是一次主键查询（认领表），不读 thread state；notifier 读一次
-`GET /threads/{tid}` 看状态，`interrupted` 分支已删，不再读快照。
+run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表），不读 thread state；
+分发者空表时每 tick 一次索引扫描，**不依赖 Redis**（Redis 只用于 `executor.submit`）。
 
 **摘要与全文**：投递消息只带前 500 字摘要，超长时追加 `…[结果已截断…调 check_async_task 取全文]`
-（`async_task_guard._shorten` / `completion_notifier._shorten` 同一口径）。全文只有
-`check_async_task` 能取（deepagents 侧不截断）。
+（`custom/outbox.py::shorten`，三处写入点同一口径）。全文只有 `check_async_task` 能取
+（deepagents 侧不截断）。
 
 **并发与幂等**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md)）：
 
 - 同一轮里多个任务同时终态 → 一次 `after_agent` 合并成一条 state 更新，天然幂等。
-- 多个子 agent 同时收尾而主管**正忙** → notifier 看到 `busy` 直接返回，不认领、不生成 run。
-- 多个子 agent 同时收尾而主管**空闲** → 第一个抢到认领并开 run；8 秒内后到的拿到
-  `in_flight` 让路（同一时刻最多一个投递 run）。
-- 同一任务被两个 hook 投递 → 第二个看到 `delivered_run_id`，只投一次。
-- `runs.create` 没有幂等键：创建失败会先撤回认领，不会留下"已认领但没投"的死行。
+- 多个子 agent 同时收尾而主管**正忙** → 分发者看到活跃 run 就退避，那轮的 hook 会投。
+- 多个子 agent 同时收尾而主管**空闲** → 一个 tick 领到全部 → 只开**一轮**唤醒 run，
+  input 拼了所有结果（实测 3 个同时完成 → 1 轮 run、3 张卡片全在）。
+- 主管自己的 hook 一次要投 N 个任务 → 逐个 ack（一行一判），互不阻塞。
+- 同一任务被两个 hook 投递 → 第二个看到 `delivered_run_id` 或翻牌失败，只投一次。
+- 建 run 失败/崩溃 → `attempts++` + 退避重试；确定在 run_id 让重试不会开第二轮。
 
 **仍存在的空隙**：
 
 - 子 agent 恰好在主管生成最终答案的那一刻完成时，`after_agent` 的那条消息模型没机会转述，
   用户看到「答案 + 一张结果卡片」；想让它开口只能另开一轮 run。
-- notifier 只试一次：父线程 `busy` 时它直接放弃，这期间完成的结果要等用户再说一句话
-  （下一次 run 的 `before_agent`）才会出现。
+- 分发者与 state 写入不在同一事务：崩溃窗口内可能多开一轮唤醒 run（不会多写消息，
+  因为输入消息本身带 `task_id` / `run_id` 标记，guard 会跳过）。
 
 以下为接线前核实过的事实，仍然适用：
 
@@ -134,7 +140,10 @@ run 中途不轮询。投递判重是一次主键查询（认领表），不读 
 - **工具能拿到父 thread_id**：`ToolRuntime.config` 就是该 run 的 `RunnableConfig`（`langchain/agents/middleware/types.py` 构造处），自建派活工具可直接读 `runtime.config["configurable"]["thread_id"]`，无需外部传参。
 - **工厂图这条路通**：1 参数 `config: RunnableConfig` 工厂（`graph_factory.py:209`）与 async contextmanager 返回值（`generate_graph`，`graph_factory.py:394`）aegra 都支持，按 run 重建，不缓存工厂图（`_base_graph_cache` 只缓存静态图，`langgraph_service.py:300`）。已用探针验证 `@asynccontextmanager async def graph(config: RunnableConfig)` 被 `classify_factory` 判为 factory。
 - **传输**：`get_client()` 不传 url 走进程内 ASGI（需服务端注册，aegra 未见注册）；传 url 走真 HTTP。`langgraph_sdk` 0.4.6 的 `runs.create` 接受 `config` 与 `context` 关键字（`_async/runs.py:364`）。
-- **无并发保护**（同 §9 #4）：通知 run 会与父 run 并发写同一 thread，aegra 不拦。`POST /threads/{tid}` 的 `GET /threads/{tid}` 响应含 `status`（`idle` / `busy` / `interrupted` / `error`，`models/threads.py:98`），可作为发通知前的忙闲判据。
+- **无并发保护**（同 §9 #4）：aegra 不拦同线程并发 run。所以发件箱分发者必须自己用
+  `SELECT thread FOR UPDATE` + 活跃 run 检查来保证“空闲才建 run”（`custom/outbox_dispatcher.py`）。
+  `POST /threads/{tid}` 的 `GET /threads/{tid}` 响应含 `status`（`idle` / `busy` / `interrupted` / `error`，
+  `models/threads.py:98`），但分发者不再用它——那是“先查后建”的竞态写法。
 - **图文件**（方案变化过，以当前 `aegra.json` 为准）：现在只注册 `supervisor`（`./graphs/deepagents_nodes.py:graph`）与 `domain_agent`（`./graphs/domain_agents.py:graph`）——两个都是工厂图：主管每次 run 按自己拥有的 spaces 现算子 agent 名单，子 agent 按 run config 里的 space 现读 `graphs/okf/<space>/AGENT.md`（ADR-0011）。旧的三张领域图与 `_DOMAIN_SPECS` 已删；`graphs/xlsx_process.py` 及备份 `graphs/xlsx_process copy.py` 也不再是活图。
 
 ## 3. 端点契约

@@ -300,16 +300,21 @@ async def _prepare_run(
     *,
     initial_status: str,
     event_streaming_v2: bool = False,
+    run_id: str | None = None,
 ) -> tuple[str, Run, RunJob]:
     """Shared run-creation logic used by create, stream, and wait endpoints.
 
     Validates inputs, resolves the assistant, persists the RunORM record,
     builds a RunJob, submits it to the executor, and returns the triple
     ``(run_id, run_model, job)``.
+
+    ``run_id`` is an optional idempotency key: pass a deterministic value and a
+    retried create collides on the primary key instead of starting a second run
+    (used by ``custom/outbox_dispatcher.py``).
     """
     await _validate_resume_command(session, thread_id, request.command)
 
-    run_id = str(uuid4())
+    run_id = run_id or str(uuid4())
     langgraph_service = get_langgraph_service()
     logger.info(
         "Scheduling run",

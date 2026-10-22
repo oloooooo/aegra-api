@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import structlog
 from sqlalchemy import CursorResult, exists, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.orm import Run as RunORM
@@ -19,6 +20,8 @@ from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.utils.status_compat import validate_run_status, validate_thread_status
+from custom.models import AsyncTaskOutbox
+from custom.outbox import summary_from_output
 
 logger = structlog.getLogger(__name__)
 _serializer = GeneralSerializer()
@@ -209,10 +212,56 @@ async def finalize_run(
             validated_thread,
             user_id=user_id,
         )
+        await _enqueue_task_result(
+            session, run_id=run_id, thread_id=thread_id, status=validated_run, output=output
+        )
         await session.commit()
 
     logger.info("Finalized run", run_id=run_id, status=validated_run, thread_status=validated_thread)
     return True
+
+
+async def _enqueue_task_result(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    thread_id: str,
+    status: str,
+    output: Any,
+) -> None:
+    """把终态结果写进发件箱（ADR-0010），供分发者唤醒父线程。
+
+    识别方式：子线程的 metadata 里有 `parent_thread_id`（派活时 `AsyncTaskGuard` 写入的
+    归属标记），而主管自己的线程没有这个字段。
+
+    - 同一个事务：子 run 转终态与发件箱插入一起提交，不会出现“状态改了但结果没入账”；
+    - 幂等：worker lease 过期重跑会再次进入这里，主键 (task_id, run_id) 挡住重复。
+
+    `interrupted` 不入账：那意味着子 run 被取消或被 `update_async_task` 顶掉，这一轮的
+    结果并不完整，后续那次 run 会自己入账。
+    """
+    if status == "interrupted":
+        return
+
+    metadata = await session.scalar(select(ThreadORM.metadata_json).where(ThreadORM.thread_id == thread_id))
+    if not isinstance(metadata, dict):
+        return  # 没元数据 / 不是对象形态：识别不出父子关系，不入账
+    parent_thread_id = metadata.get("parent_thread_id")
+    if not parent_thread_id:
+        return  # 主管自己的 run，没人等它
+
+    await session.execute(
+        pg_insert(AsyncTaskOutbox)
+        .values(
+            task_id=thread_id,
+            run_id=run_id,
+            parent_thread_id=str(parent_thread_id),
+            agent_name=metadata.get("graph_id"),
+            terminal_status=status,
+            summary=summary_from_output(output),
+        )
+        .on_conflict_do_nothing(index_elements=["task_id", "run_id"])
+    )
 
 
 def _safe_serialize(output: Any, run_id: str) -> Any:

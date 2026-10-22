@@ -27,7 +27,6 @@ from deepagents import FilesystemPermission, create_deep_agent
 from langchain_quickjs import CodeInterpreterMiddleware
 from langgraph.graph.state import RunnableConfig
 
-from custom.middlewares.completion_notifier import CompletionNotifierMiddleware
 from graphs.llms import model
 from graphs.space_access import allowed_spaces
 from graphs.space_agents import KNOWLEDGE_ROOT, has_tables, load_agent_spec
@@ -58,8 +57,9 @@ def graph(config: RunnableConfig) -> Any:  # noqa: ANN401 — 返回编译后的
                 max_result_chars=10000,
             )
         )
-    # 完成时主动回写父线程（父上下文从 config 读，ADR-0005 选项1）
-    middleware.append(CompletionNotifierMiddleware(subagent_name=space or "domain_agent"))
+    # 完成时的回写由服务端发件箱分发者负责（ADR-0010）：
+    # 子 run 转终态 -> finalize_run 写发件箱行 -> 分发者在父线程空闲时开一轮唤醒 run。
+    # 子图不再需要任何通知中间件。
 
     return create_deep_agent(
         model=model,

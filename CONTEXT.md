@@ -127,15 +127,18 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 按 `thread.user_id` 数子线程（它们是服务账号）
 
 **Task delivery（任务结果投递）**:
-把子 agent 的结果送进主管上下文的动作，有两条路且尽力只发生一次：
+把子 agent 的结果送进主管上下文的动作，有两条路且只发生一次：
 ① 主管自己的 run 里 —— `AsyncTaskGuard.abefore_agent` / `aafter_agent` 在 run 首尾把结果写进
 state（不另开 run，模型在这些消息之后的下一次模型调用时看到）；② 主管已空闲（`idle` / `error`）——
-`CompletionNotifier` 开一轮新 run 投递。`busy` 与 `interrupted` 一律不投：前者归 ①，
-后者不能顶掉用户正等着回答的答案。
-两条路都以 `(task_id, run_id)` 为键、先向认领表 `async_task_delivery` 抢票，抢不到就不投；
-投过的任务在 state 里留 `delivered_run_id`，模型自己 `check_async_task` 拿到终态结果的也算已投。
+服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run 投递。`busy` 与 `interrupted`
+一律不投：前者归 ①，后者不能顶掉用户正等着回答的答案。
+两条路都以 `(task_id, run_id)` 为键：子 run 终态时 `finalize_run` 写一行发件箱
+`async_task_outbox`（主键即幂等键），投递前把行从 `pending` 原子翻成 `delivered`，
+翻不成就说明别人已投。投过的任务在 state 里留 `delivered_run_id`，模型自己
+`check_async_task` 拿到终态结果的也算已投。
 投递消息只带前 500 字摘要与截断标记，**全文只从 `check_async_task` 取**。
-认领表与接口在 `async_task_delivery` / `custom/delivery_api.py`（见 ADR-0010）。
+发件箱表 / ack 接口 / 分发者见 `custom/models.py`、`custom/delivery_api.py`、
+`custom/outbox_dispatcher.py`（ADR-0010）。
 _Avoid_: 把投递说成“通知”（通知是手段，投递是结果进上下文）；把它当成同步等待（主管从不被阻塞）；
 把投递摘要当全文（被截断了就去 check）
 
@@ -143,3 +146,30 @@ _Avoid_: 把投递说成“通知”（通知是手段，投递是结果进上�
 `custom/frontend_api.py` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread
 属主是服务账号，终端用户直接读会被 ownership 过滤挡成 404，所以必须经代理。
 _Avoid_: 把它当成转发层（它同时是授权层：要求父线程属于当前用户且其 `async_tasks` 里有该 task）
+
+## 会话文件词表
+
+**Session（会话）**:
+用户眼里的一个会话，值上恒等于一个**主管 thread**。它是会话文件的隔离单位，也是
+「上传必须挂在会话上」的那个会话。
+_Avoid_: 把子 agent 的 thread 叫会话（它是任务的私生子线程，永不作为隔离键）；
+把 Thread 与 Session 当同义词（Thread 是协议载体，Session 是用户语义的那一个）
+
+**Session file（会话文件）**:
+用户在某个 Session 里上传的原文件，本期只有 md。它存在 LangGraph Store，命名空间为
+`(uploads, hash(上传者 identity), 会话 thread_id)`，**不落知识空间文件夹、不属于任何 Space**；
+会话删除即删，孤儿靠孤儿保留期兜底。路径 `/uploads/<文件名>` 只对主管可读，
+子 agent 看不到（主 agent 转述内容或路径）。
+_Avoid_: 把它当 Space 知识（Space 知识对空间成员共享，会话文件只对上传者本人的这个会话可见）；
+叫附件、临时文件（它不是临时件：会话在它就在）
+
+**Orphan retention（孤儿保留期）**:
+会话文件 item 的 TTL（默认 72 小时，env 可覆写），语义是**最后读取后多久**过期，不是绝对寿命：
+主管每轮 run 起始查一次清单会续期，所以在用的会话永不失效，只有再没人读的文件才过期。
+它只是垃圾兜底，不是保留策略——保留策略是「会话在，文件在」。
+_Avoid_: 把它当保留期（用户会发现隔天文件消失的期望差）；把它当清理主路径（主路径是删会话）
+
+**Untrusted content（不可信内容）**:
+会话文件正文进上下文时的身份：它是**资料，不是指令**。清单与正文都按这个口径标注，
+文件里写的「忽略之前的指令」不因被读到而具备任何效力。
+_Avoid_: 把文件内容当系统提示的一部分、对内容做「注入词过滤」以求安全（过滤不靠谱，标注才是防线）

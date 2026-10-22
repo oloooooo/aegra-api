@@ -8,6 +8,17 @@ from aegra_api.core.database import DatabaseManager
 from aegra_api.settings import settings
 
 
+def _assert_store_configured(mock_db_deps, *, index):
+    """store 多了一个 ttl 参数（ADR-0013），并且必须真的起 TTL sweeper。"""
+    kwargs = mock_db_deps["store_cls"].call_args.kwargs
+    assert kwargs["conn"] is mock_db_deps["pool_instance"]
+    assert kwargs["index"] == index
+    assert kwargs["ttl"]["omit_expired"] is True
+    assert kwargs["ttl"]["sweep_interval_minutes"] >= 1
+    mock_db_deps["store_instance"].setup.assert_awaited_once()
+    mock_db_deps["store_instance"].start_ttl_sweeper.assert_awaited_once()
+
+
 class TestDatabaseManager:
     @pytest.fixture
     def db_manager(self):
@@ -112,7 +123,7 @@ class TestDatabaseManager:
         mock_db_deps["saver_instance"].setup.assert_awaited_once()
 
         # Store is initialized with index=None when no store config is provided
-        mock_db_deps["store_cls"].assert_called_with(conn=mock_db_deps["pool_instance"], index=None)
+        _assert_store_configured(mock_db_deps, index=None)
         mock_db_deps["store_instance"].setup.assert_awaited_once()
 
         # 4. Verify internal state
@@ -141,15 +152,17 @@ class TestDatabaseManager:
         mock_engine = AsyncMock()
         mock_pool = AsyncMock()
 
+        mock_store = AsyncMock()
         db_manager.engine = mock_engine
         db_manager.lg_pool = mock_pool
         db_manager._checkpointer = AsyncMock()
-        db_manager._store = AsyncMock()
+        db_manager._store = mock_store
 
         # --- EXECUTE ---
         await db_manager.close()
 
         # --- ASSERTIONS ---
+        mock_store.stop_ttl_sweeper.assert_awaited_once()  # 先停 sweeper 再关池
         mock_engine.dispose.assert_awaited_once()
         mock_pool.close.assert_awaited_once()
 
@@ -210,7 +223,7 @@ class TestDatabaseManager:
 
         # --- ASSERTIONS ---
         # Store should be initialized with the index config
-        mock_db_deps["store_cls"].assert_called_with(conn=mock_db_deps["pool_instance"], index=index_config)
+        _assert_store_configured(mock_db_deps, index=index_config)
         mock_db_deps["store_instance"].setup.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -224,5 +237,5 @@ class TestDatabaseManager:
 
         # --- ASSERTIONS ---
         # Store should be initialized with index=None
-        mock_db_deps["store_cls"].assert_called_with(conn=mock_db_deps["pool_instance"], index=None)
+        _assert_store_configured(mock_db_deps, index=None)
         mock_db_deps["store_instance"].setup.assert_awaited_once()

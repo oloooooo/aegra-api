@@ -57,8 +57,8 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 只�
 摘要截断到 500 字并带标记，**全文只有 check_async_task 能取**（那边不截断）。
 
 判重两个来源：messages 里的投递消息（跨 run/跨进程都看得见）与 task 上的
-`delivered_run_id`（模型自己 check 过也算已投，见 `_mark_checked`）。认领表
-`(task_id, run_id)` 负责与子 agent 侧的 notifier 互斥，抢不到就不写。
+`delivered_run_id`（模型自己 check 过也算已投，见 `_mark_checked`）。发件箱行
+`(task_id, run_id)` 负责与分发者互斥：谁能把行从 pending 翻成 delivered，谁去写 state。
 
 ===============================================================================
 四、多进程
@@ -66,8 +66,8 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 只�
 
 guard 自己不存任何跨请求状态（旧版的名额账本已随 ADR-0008 删除）。所有跨进程
 判重都落在两处服务端：
-  - `async_task_delivery(task_id, run_id)`：管"这次结果投没投过"（ADR-0010）；
-  - `thread.metadata_json`：管"这个子线程是谁的"（ADR-0012）。
+  - `async_task_outbox(task_id, run_id)`：管“这次结果投没投过”（ADR-0010）；
+  - `thread.metadata_json`：管“这个子线程是谁的”（ADR-0012）。
 
 ===============================================================================
 五、代码分区（改代码前先看这张表）
@@ -103,21 +103,18 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
+from custom.outbox import completion_text, message_text, shorten
 from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
 
 _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
 
-# 投递账本标记：与 notifier 用同一个前缀/字段，前端与判重都靠它
+# 投递账本标记：格式定义在 custom/outbox.py（与分发者、finalize_run 共用同一口径）
 _TASK_MARK = "task_id: "
 _TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
 # 判重键含 run_id：update_async_task 会给同一任务开新 run，只认 task_id 会吞掉第二次结果
 _RUN_ID_RE = re.compile(r"run_id: ([0-9a-zA-Z_-]+)")
-
-# 摘要上限：投递消息只带开头，全文走 check_async_task（那边不截断）
-_SUMMARY_LIMIT = 500
-_TRUNCATED = f"…[结果已截断（仅前 {_SUMMARY_LIMIT} 字），调 check_async_task 取全文]"
 
 
 # ============================ A. 文本与判重（纯函数） ============================
@@ -128,20 +125,13 @@ def _now() -> str:
 
 
 def _shorten(text: str) -> str:
-    """截断摘要并显式留标记——静默硬切会让模型分不清「写完了」和「被切了」。"""
-    return text if len(text) <= _SUMMARY_LIMIT else text[:_SUMMARY_LIMIT] + _TRUNCATED
+    """截断摘要——口径在 custom/outbox.py，三处必须逐字一致。"""
+    return shorten(text)
 
 
 def _message_text(msg: Any) -> str:
     """消息正文：兼容 str / content 块列表 / dict 三种形态。"""
-    content = getattr(msg, "content", None)
-    if content is None and isinstance(msg, dict):
-        content = msg.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-    return str(content) if content is not None else ""
+    return message_text(msg)
 
 
 def _delivered_pairs(messages: Any) -> set[tuple[str, str]]:
@@ -173,15 +163,8 @@ def _is_delivered(task: dict[str, Any], pairs: set[tuple[str, str]]) -> bool:
 
 
 def _completion_text(task: dict[str, Any], summary: str) -> str:
-    """投递消息正文：前端靠这个前缀与尾部两个标记识别/判重。"""
-    name = task.get("agent_name", "subagent")
-    status = task.get("status")
-    head = (
-        f"[Async subagent '{name}' has completed] Result: {summary}"
-        if status == "success"
-        else f"[Async subagent '{name}' has stopped ({status})] Result: {summary}"
-    )
-    return f"{head}\n\n{_TASK_MARK}{task['task_id']}\nrun_id: {task.get('run_id') or ''}"
+    """投递消息正文——格式口径在 custom/outbox.py。"""
+    return completion_text(task["task_id"], task.get("run_id"), task.get("agent_name"), task.get("status"), summary)
 
 
 def _thread_summary(thread: Any) -> str:
@@ -510,7 +493,12 @@ class AsyncTaskGuard(AgentMiddleware):
         return out
 
     async def _summary_async(self, task: dict[str, Any]) -> str:
-        """取子 agent 的最终结论（摘要）。拿不到就给占位，不阻断投递。"""
+        """取子 agent 的最终结论（摘要）。拿不到就给占位，不阻断投递。
+
+        注：发件箱行里也存了一份写入时的摘要快照（分发者用的）；这里现查线程是为了
+        拿到**当下**的最后一条消息（同一条 run 里模型可能后来又追加了内容）。
+        快照与现查是同一套截断口径（custom/outbox.py），不会出现两种格式。
+        """
         spec = self._spec_of(task)
         if spec is None or not task.get("thread_id"):
             return "(no output)"
@@ -523,13 +511,18 @@ class AsyncTaskGuard(AgentMiddleware):
     def _claim_endpoint(
         spec: dict[str, Any] | None, task: dict[str, Any], parent_thread_id: str
     ) -> tuple[str, dict[str, Any], dict[str, str]] | None:
-        """认领端点 + body + headers；缺信息时返回 None（不认领、也不阻断投递）。"""
+        """认领端点 + body + headers；缺信息时返回 None（不认领、但也不阻断投递）。
+
+        认领 = 把发件箱行从 pending 原子翻成 delivered（见 custom/delivery_api.py）。
+        没有时间窗口、没有“让路”参数：一行一判，同批多个任务互不影响。
+        """
         if not parent_thread_id or spec is None or not spec.get("url"):
             return None
         endpoint = f"{str(spec['url']).rstrip('/')}/custom/tasks/{task['task_id']}/deliver-claim"
-        return endpoint, {"parent_thread_id": parent_thread_id, "run_id": task.get("run_id")}, dict(
-            spec.get("headers") or {}
-        )
+        return endpoint, {
+            "parent_thread_id": parent_thread_id,
+            "run_id": task.get("run_id"),
+        }, dict(spec.get("headers") or {})
 
     async def _claim_async(self, task: dict[str, Any], parent_thread_id: str) -> bool | None:
         """抢投递权：True 抢到 / False 别人投过 / None 无法判定（照常投，宁可多一条）。"""
@@ -616,6 +609,8 @@ class AsyncTaskGuard(AgentMiddleware):
             out["async_tasks"] = changed
         if texts:
             out["messages"] = [HumanMessage(content=t) for t in texts]
+            # 投递成功才留痕：查日志时能分清"这轮谁投的"与"分发者另开的"
+            logger.info("task_results_delivered", tasks=[t["task_id"] for t in claimed], count=len(texts))
         return out
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:

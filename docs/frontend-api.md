@@ -154,7 +154,8 @@ agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null
 （判重在服务端做，见 `POST /custom/tasks/{id}/deliver-claim`）：
 
 - 主管的 run 首尾 → `AsyncTaskGuard.abefore_agent` / `aafter_agent` 写进自己的 state（不开新 run）；
-- 主管已答完（线程 `idle`）→ `CompletionNotifierMiddleware` 现铸父身份 token 写回（ADR-0006）。
+- 主管已答完（线程 `idle`）→ 服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run
+  （ADR-0010；不再有子 agent 侧的通知中间件，也不需要现铸父身份 token）。
 
 两种都**渲染成「子任务返回结果」区块**，不要当作用户输入。主管在等用户回答（线程 `interrupted`）时
 不会投递，结果会等用户答完后补上——前端不要为此做特殊处理。

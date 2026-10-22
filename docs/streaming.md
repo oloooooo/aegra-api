@@ -147,7 +147,7 @@ async for ev in stream:
    不声明时 aegra 默认只产 `values`（`run_executor._resolve_stream_modes` 缺省 `["values"]`），
    代理再订閲 `messages/custom` 也拿不到东西。
 2. **`async_tasks.status` 会僵尸**：它只在 `check_async_task` 或拦截层核实后更新；走完成投递路径
-   （主管侧注入 / `CompletionNotifier` 唤醒）时，如果主管之后没再跑过模型调用，
+   （主管侧注入 / 发件箱分发者唤醒）时，如果主管之后没再跑过模型调用，
    state 里的 `status` 会停在 `running`。
    拦截层现在派活前会向子 run 核实真实状态并回写（`_refreshed_sync/_refreshed_async`），
    这个核实服务于结果投递（`_deliver` 靠它判断子任务是否已终态）。名额机制已换成 thread 配额（ADR-0012）。

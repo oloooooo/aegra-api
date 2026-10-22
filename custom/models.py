@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing import Optional
 
 from datetime import datetime
 
@@ -7,9 +6,13 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
+    Integer,
     String,
+    Text,
     false,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,10 +32,10 @@ class UserTables(Base):
         index=True,
         comment="用户名",
     )
-    org_id: Mapped[Optional[str]] = mapped_column(
+    org_id: Mapped[str | None] = mapped_column(
         String(50), comment="组织名", default=None
     )
-    email: Mapped[Optional[str]] = mapped_column(
+    email: Mapped[str | None] = mapped_column(
         String(80), comment="邮箱名", default=None
     )
 
@@ -41,7 +44,7 @@ class UserTables(Base):
         Boolean, default=False, server_default=false(), comment="超级用户，只能直接改库"
     )
     # 只读视图：带权限的关联走 UserSpace，写入请直接操作它
-    spaces: Mapped[list["Space"]] = relationship(secondary="user_space", viewonly=True)
+    spaces: Mapped[list[Space]] = relationship(secondary="user_space", viewonly=True)
 
     def __repr__(self) -> str:
         return f"<User {self.identity!r}>"
@@ -63,7 +66,7 @@ class Space(Base):
         String(512), comment="工作目录路径，相对项目根（服务启动时的 CWD）"
     )
     # 只读视图，写入走 UserSpace
-    users: Mapped[list["UserTables"]] = relationship(
+    users: Mapped[list[UserTables]] = relationship(
         secondary="user_space", viewonly=True
     )
 
@@ -90,22 +93,47 @@ class UserSpace(Base):
     def __repr__(self) -> str:
         return f"<UserSpace {self.identity!r} -> {self.space_name!r}>"
 
-class AsyncTaskDelivery(Base):
-    """后台任务结果的投递认领：跨进程/跨 run 的幂等键。
+class AsyncTaskOutbox(Base):
+    """后台任务结果的发件箱（ADR-0010，Transactional Outbox）。
 
-    一行 = (task_id, run_id) 这次执行的结果**已经有权**投递给主管。主键即判重键：
-    `INSERT ... ON CONFLICT DO NOTHING` 抢到的那个调用方才有资格开投递 run 或注入消息。
-    `parent_thread_id` 用于同一父线程上的并发投递让路（短租约看 `claimed_at`）。
+    一行 = 一次子 run 的终态结果**待投递**。写入点是 `finalize_run`（子 run 转终态的
+    同一个事务里插入），主键 (task_id, run_id) 就是幂等键。
+
+    状态机：`pending` →（分发者建唤醒 run）/（父 run 的 hook 写 state）→ `delivered`；
+    重试耗尽 → `failed`。**没有任何时间窗口**：“谁先把行从 pending 翻成 delivered，
+    谁才有资格投”是一个单行条件 UPDATE，本身就是原子的。
     """
 
-    __tablename__ = "async_task_delivery"
+    __tablename__ = "async_task_outbox"
 
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="异步任务 id（= 子线程 id）")
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True, comment="子 agent 本次执行的 run id")
-    parent_thread_id: Mapped[str] = mapped_column(String(64), index=True, comment="主管线程 id")
-    claimed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), comment="认领时间，长于阈值视为过期可重投"
+    parent_thread_id: Mapped[str] = mapped_column(String(64), comment="主管线程 id")
+    agent_name: Mapped[str | None] = mapped_column(String(64), comment="子 agent 名（子线程的 graph_id）")
+    terminal_status: Mapped[str] = mapped_column(String(32), comment="子 run 的终态：success / error / timeout")
+    summary: Mapped[str | None] = mapped_column(Text, comment="结果摘要（写入时截断，全文走 check_async_task）")
+
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", server_default="pending", comment="pending / delivered / failed"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), comment="投递尝试次数")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), comment="最早何时重试（退避）"
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        default=None,
+        comment="分发者租约：拿批时写，崩溃后过期即可被别人接手",
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # 分发者的领取查询：status + next_attempt_at 过滤，按时间排序
+        Index("ix_async_task_outbox_pending", "status", "next_attempt_at"),
+        Index("ix_async_task_outbox_parent", "parent_thread_id"),
     )
 
     def __repr__(self) -> str:
-        return f"<AsyncTaskDelivery {self.task_id!r}/{self.run_id!r}>"
+        return f"<AsyncTaskOutbox {self.task_id!r}/{self.run_id!r} {self.status} attempts={self.attempts}>"

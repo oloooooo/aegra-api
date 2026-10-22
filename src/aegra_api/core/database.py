@@ -2,6 +2,7 @@
 
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.base import TTLConfig
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -76,8 +77,16 @@ class DatabaseManager:
         store_config = load_store_config()
         index_config = store_config.get("index") if store_config else None
 
-        self._store = AsyncPostgresStore(conn=self.lg_pool, index=index_config)
+        self._store = AsyncPostgresStore(
+            conn=self.lg_pool,
+            index=index_config,
+            # omit_expired: 过期项读时就看不见（不必等 sweep 物理删除）
+            # sweep_interval_minutes: 物理删除的节奏（ADR-0013，会话文件的孤儿兜底）
+            ttl=TTLConfig(omit_expired=True, sweep_interval_minutes=60),
+        )
         await self._store.setup()  # Ensure tables exist
+        # TTL 只写 expires_at 列，物理删除靠这个后台任务；不启动等于永不清理
+        await self._store.start_ttl_sweeper()
 
         if index_config:
             embed_model = index_config.get("embed", "unknown")
@@ -87,6 +96,11 @@ class DatabaseManager:
 
     async def close(self) -> None:
         """Close database connections"""
+        # Stop the store TTL sweeper before the pool closes, or it wakes up on a
+        # dead connection. Must precede lg_pool.close().
+        if self._store is not None:
+            await self._store.stop_ttl_sweeper()
+
         # Close SQLAlchemy engine
         if self.engine:
             await self.engine.dispose()
