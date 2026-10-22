@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -153,6 +154,33 @@ async def list_graphs(user: Annotated[User, Depends(require_auth)]) -> dict[str,
 # ---------- 知识空间 ----------
 
 
+def _count_files(root: Path) -> int:
+    """空间内文件数（同步遍历）。调用方必须用 `asyncio.to_thread`：`rglob` 是阻塞 IO，
+    直接在 `async def` 里跑会卡住事件循环（space 一大，每次打开空间页都卡）。"""
+    return sum(1 for p in root.rglob("*") if p.is_file()) if root.is_dir() else 0
+
+
+def _list_files(root: Path) -> list[dict[str, Any]]:
+    """空间文件树（同步遍历 + stat）。同上，必须经 `asyncio.to_thread` 调用。"""
+    out: list[dict[str, Any]] = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue  # 遍历期间被删除/改名：跳过，不要让整个文件列表 500
+        out.append(
+            {
+                "path": "/" + p.relative_to(root).as_posix(),
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, UTC).isoformat(),
+                "ext": p.suffix.lower(),
+            }
+        )
+    return out
+
+
 @router.get("/spaces")
 async def list_spaces(
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -164,8 +192,7 @@ async def list_spaces(
     is_super = "write" in (user.permissions or [])
     out = []
     for s in spaces:
-        root = _PROJECT_ROOT / s.path
-        files = sum(1 for p in root.rglob("*") if p.is_file()) if root.is_dir() else 0
+        files = await asyncio.to_thread(_count_files, _PROJECT_ROOT / s.path)
         out.append(
             {
                 "name": s.name,
@@ -192,20 +219,7 @@ async def list_space_files(
     root = _PROJECT_ROOT / space.path
     if not root.is_dir():
         return {"space": space_name, "root": space.path, "files": []}
-    files = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        st = p.stat()
-        files.append(
-            {
-                "path": "/" + p.relative_to(root).as_posix(),
-                "size": st.st_size,
-                "modified": datetime.fromtimestamp(st.st_mtime, UTC).isoformat(),
-                "ext": p.suffix.lower(),
-            }
-        )
-    return {"space": space_name, "root": space.path, "files": files}
+    return {"space": space_name, "root": space.path, "files": await asyncio.to_thread(_list_files, root)}
 
 
 @router.get("/spaces/{space_name}/users")
