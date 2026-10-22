@@ -130,3 +130,22 @@ RETURNING task_id          -- 0 行 = 别人已经投了，放弃
   `check_async_task` 或下一次 hook 带出。
 - 主管 run 中途想拿结果仍然只能靠模型自己 `check_async_task`（提示词里写成硬口径）；
   `after_agent` 写进 state 的结果模型已没机会转述，用户看到的是"答案 + 结果卡片"。
+
+## 已知问题与残留风险
+
+按“影响从大到小”排。每一条都注明了触发条件与目前的处理方式，改代码前先对一下。
+
+| # | 问题 | 触发条件 | 影响 | 现状 |
+|---|---|---|---|---|
+| 1 | **超级用户的 space 语义有两套**：`allowed_spaces()` 只读 `user_space` 表，`frontend_api._own_space_names()` 却按“有 write 权限 ⇒ 全部 Space” | `is_super=true` 但 `user_space` 里没有行 | 前端能看到全部 Space，但主管/唤醒 run 算出 `specs = {}` → `Available types:` 为空、`check_async_task` 不在工具表 | 既有不一致，本次未收敛；给账号补 `user_space` 行即可绕过 |
+| 2 | **唤醒 run 用的是“投递时”的权限，不是“派活时”的权限**（`_parent_user` 现查库） | 派活之后回收了某个 Space | 唤醒 run 少一个 spec → guard 的 `_spec_of()` 拿不到那条子 run 的 spec；结果仍由分发者投出，但 `state.async_tasks` 该条不会刷成终态 | 有意取舍（用当前权限更安全）；要严格就按“派活时把 spaces 写进子线程 metadata、顺流到发件箱行” |
+| 3 | **发件箱的 `summary` 列对子 run 恒为 `(no output)`**：子 run 只声明 `stream_mode=["messages","custom"]`，没有 `values` 事件，`finalize_run` 的 `output` 是空字典（`run_executor` 只在 `values` 事件里填 `result.data`） | 恒成立 | 投递正文必须现查子线程；一旦服务自调失败（超时/网络/鉴权），卡片退化成 `(no output)` | 已用 `_child_summary` 现查兜底（5s 超时）；`summary` 列目前只是兜底值 |
+| 4 | **“取全文”只有 `check_async_task` 一条路** | specs 为空（#1/#2）或工具未挂 | 模型无法自救，只能等投递或自己读空间文件 | 卡片只有 500 字摘要（带截断标记），所以这条路断了就是“看不到全文” |
+| 5 | **分发者不知道“父线程长期 busy”** | 用户一直不停发消息 | 发件箱行长期 `pending`（`next_attempt_at` 每 2s 后移），没有告警 | 结果是“晚到”不是“丢”；需要时加 metric/告警 |
+| 6 | **`_claim_batch` 没有 `claimed_by` 列**（只有租约时间） | 两个进程同时领到同一行 | 极小窗口内可能开两轮唤醒 run | 已留 `shortcut:` 注释；要根治就加 `claimed_by`（与 `runs` 表同款租约） |
+| 7 | **ack 与 state 写入不同事务** | 进程在两者之间崩溃 | 可能多一张卡片（不会重复写 state，消息带 `task_id`/`run_id` 标记） | at-least-once 的固有代价 |
+| 8 | **`failed` 行不再被分发者重试** | 连续 10 次建 run 失败 | 只剩父 run 的 hook 能把它写进 state；用户不再说话就一直看不到 | 有意为之（避免无限重试打爆日志/队列）；`delivery_api` 仍允许 guard 抢 `failed` 行 |
+| 9 | **用户手动发起的 run 仍没有幂等键** | 前端重复提交 / 两个标签页 | 可能与唤醒 run 并发写同一线程（aegra 不拦同线程并发 run，`design.md §9 #4`） | `run_id` 幂等键只在分发者内部用；平台层要根治见下方 Considered Options |
+| 10 | **子线程当父线程（嵌套派活）会缺 spaces** | 未来支持嵌套 | 子线程属主是服务账号，`user_space` 里没有它的行 → 唤醒 run specs 为空 | 当前禁止嵌套，不影响 |
+
+配套的用户可见症状与处置见 `README_zh.md §8 常见问题`。

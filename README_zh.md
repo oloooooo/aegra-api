@@ -243,9 +243,11 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 前端登录后一片空白 | 后端没起 / `VITE_API_BASE` 指错；浏览器控制台看 `Failed to fetch` |
 | 改了 `graphs/` 下的图或 `aegra.json` 但没生效 | 后端启动时只读一次注册表，**重启服务** |
 | 子 agent 一直显示 `running` | 父 state 里的状态是快照（只在 check 时更新）。看真实状态用 `GET /custom/tasks/{id}` |
+| 主管说「`check_async_task` 不是有效的工具」/ `Available types:` 为空 | 那一轮 run 的 `user_spaces` 为空 → deepagents 不挂 `AsyncSubAgentMiddleware`（`specs` 空）。检查该账号在 `user_space` 表里有没有行（超级用户也要有）；唤醒 run 的 spaces 由 `custom/outbox_dispatcher.py::_parent_user` 现查库 |
+| 子 agent 返回的卡片只有 `Result: (no output)` | 唤醒 run 取不到子线程正文。日志出现 `outbox_summary_fetch_failed` = 服务自调（`127.0.0.1:{PORT}`）失败或子线程不存在；没有该日志但仍是空 = specs 为空导致 guard 拿不到摘要。卡住时可让主管直接读空间文件（`ls` / `read_file`） |
+| 子 agent 返回后主管不说话（死锁） | Redis 挂了：唤醒 run 同样要入队才能执行。`docker ps` 看 redis6，按 §6.2 启动。旧版（notifier）只试一次所以会永久丢，现版会退避重试，Redis 恢复后自动补投 |
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
 | 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：按 §6.2 启动（`docker start redis6`），或把该开关设回 `false` 并只用单进程启动 |
-| 子 agent 返回后主管不说话（死锁） | Redis 挂了：唤醒 run 由子 agent 进程 POST 创建，入队失败就没人叫主管。`docker ps` 看 redis6，按 §6.2 启动 |
 | 取消后 run 还在继续跑 | 多进程启动但没开 Redis：取消信号跨不了进程（ADR-0009）。开 Redis 或改单进程 |
 | 建会话报 403「会话数已达上限」 | 每个账号默认最多 20 个会话（`MAX_THREADS_PER_USER`，ADR-0012）；删掉不用的会话即可，删会话会连带删它的子线程 |
 

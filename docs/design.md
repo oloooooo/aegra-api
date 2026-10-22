@@ -131,6 +131,20 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
   用户看到「答案 + 一张结果卡片」；想让它开口只能另开一轮 run。
 - 分发者与 state 写入不在同一事务：崩溃窗口内可能多开一轮唤醒 run（不会多写消息，
   因为输入消息本身带 `task_id` / `run_id` 标记，guard 会跳过）。
+- **唤醒 run 的 spaces 来自“投递时”的 `user_space` 表**（`_parent_user`），不是派活时的权限；
+  且超级用户的 space 语义在 `allowed_spaces()` 与 `frontend_api._own_space_names()` 里是两套——
+  前者只认表行，后者“有 write ⇒ 全部 Space”。所以**超级用户没有 `user_space` 行时，
+  UI 看得到 Space 但唤醒 run 算出 0 个子 agent**（`Available types:` 空、`check_async_task`
+  不在工具表、卡片只剩 `(no output)`）。绕过办法：给该账号补 `user_space` 行。
+- **发件箱的 `summary` 列对子 run 恒为 `(no output)`**：子 run 只声明 `stream_mode=["messages","custom"]`，
+  没有 `values` 事件，`finalize_run` 的 `output` 是空字典。所以卡片正文靠
+  `_child_summary` 现查子线程（5s 超时），自调失败时退化成 `(no output)`。
+- **`check_async_task` 是取全文的唯一通道**：它只在 `specs` 非空时才被 deepagents 挂上
+  （`if async_subagents:`）。specs 一空，模型既不能 check 也不能再派活，只能等投递或自己读文件。
+- **主管自己没有命令执行能力**（backend 非 sandbox，`execute` 不可用），所以子 agent 算出的
+  表格统计只在子 agent 自己那边；主管想重算得再派一个子 agent。
+
+完整清单（含触发条件与现状）见 [adr/0010 §已知问题与残留风险](./adr/0010-task-delivery-idempotency.md#已知问题与残留风险)。
 
 以下为接线前核实过的事实，仍然适用：
 

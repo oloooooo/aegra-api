@@ -90,6 +90,11 @@ _Avoid_: workspace、业务空间、微服务空间（口语可用，代码与�
 
 **UserSpace（用户-空间关联）**:
 `user_space` 表：哪个账号能看哪个 Space。写入直接操作本表，不用 `UserTables.spaces`（只读视图）。
+
+> **已知不一致**：`graphs/space_access.allowed_spaces()` 只认本表的行，而
+> `custom/frontend_api._own_space_names()` 对 `is_super` 额外放行“全部 Space”。
+> 所以超级用户如果没被分配 `user_space` 行，前端能看到全部 Space，但图里的子 agent 列表为空
+> （`Available types:` 空、`check_async_task` 不在工具表）。要么给账号补行，要么把两处规则收敛成一套。
 _Avoid_: 把 `user_microservice` 当表名（已改名）
 
 **Space path（空间路径）**:
