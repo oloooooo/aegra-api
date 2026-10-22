@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from langgraph_sdk import get_client
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,8 +40,10 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.models.auth import User
 from aegra_api.models.runs import RunCreate
 from aegra_api.services.run_status import ACTIVE_RUN_STATES
-from custom.models import AsyncTaskOutbox
-from custom.outbox import completion_text
+from aegra_api.settings import settings
+from custom.models import AsyncTaskOutbox, UserSpace, UserTables
+from custom.outbox import completion_text, message_text, shorten
+from custom.services import service_token
 
 logger = structlog.getLogger(__name__)
 
@@ -58,6 +61,14 @@ _MAX_ATTEMPTS = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "10"))
 # 启动延迟：等 core 的 DB / LangGraph 初始化完（lifespan 顺序不确定）
 _STARTUP_DELAY_SECONDS = float(os.getenv("OUTBOX_STARTUP_DELAY_SECONDS", "5"))
 
+# 服务身份客户端（进程级缓存）：子线程属主是服务账号，只有它能读子线程
+_SERVICE_CLIENT: Any = None
+# 自己调自己用 IPv4 回环：`settings.app.SERVER_URL` 推导成 localhost，
+# 而 Windows 下 localhost 优先解成 ::1，uvicorn 只绑了 127.0.0.1 → 请求会挂住。
+_SERVICE_URL = os.getenv("AEGRA_INTERNAL_URL") or f"http://127.0.0.1:{settings.app.PORT}"
+# 读子线程摘要的超时：拿不到就退到存盘摘要，不能把整个 tick 挂死
+_SUMMARY_TIMEOUT = float(os.getenv("OUTBOX_SUMMARY_TIMEOUT_SECONDS", "5"))
+
 
 def _wake_run_id(parent_thread_id: str, rows: list[dict[str, Any]]) -> str:
     """唤醒 run 的确定性 ID = 幂等键。
@@ -72,6 +83,51 @@ def _wake_run_id(parent_thread_id: str, rows: list[dict[str, Any]]) -> str:
 def _backoff_seconds(attempts: int) -> float:
     """指数退避，封顶 60s。"""
     return min(2.0**attempts, 60.0)
+
+
+def _service_client() -> Any:
+    """服务身份 SDK 客户端：只有它能读子 agent 线程（子线程属主是服务账号）。"""
+    global _SERVICE_CLIENT
+    if _SERVICE_CLIENT is None:
+        _SERVICE_CLIENT = get_client(url=_SERVICE_URL, headers={"Authorization": f"Bearer {service_token()}"})
+    return _SERVICE_CLIENT
+
+
+async def _child_summary(row: dict[str, Any]) -> str:
+    """结果正文 = 子线程最后一条消息（现查）。
+
+    不能只用发件箱里的 `summary`：子 run 通常只声明 `stream_mode=["messages","custom"]`，
+    没有 `values` 事件，`finalize_run` 拿到的 output 是空字典——存下来的摘要会是
+    "(no output)"。所以以现查为准，存盘值只当兵底。
+    """
+    try:
+        thread = await asyncio.wait_for(_service_client().threads.get(row["task_id"]), timeout=_SUMMARY_TIMEOUT)
+        messages = ((thread or {}).get("values") or {}).get("messages") or []
+        if messages:
+            return shorten(message_text(messages[-1]))
+    except Exception:  # noqa: BLE001 —— 取不到就退到存盘摘要，不阻断投递
+        logger.warning("outbox_summary_fetch_failed", task_id=row["task_id"])
+    return row.get("summary") or "(no output)"
+
+
+async def _parent_user(session: AsyncSession, thread: ThreadORM) -> User:
+    """唤醒父线程的 run 必须用**这个用户带 space 权限的身份**。
+
+    实测后果（不带）：`domain_specs()` 拿不到 `user_spaces` → specs 为空 →
+    deepagents 根本不挂 `AsyncSubAgentMiddleware`（`graph.py:917`），于是
+    `start/check/list_async_task` 全部不在工具里，guard 的 `_spec_of()` 也返回 None
+    → 卡片正文退化成 "(no output)"，模型的“去 check 全文”这条路也断了。
+
+    口径与 `custom/custom_auth.py` 一致（同一张 user_space 表 + is_super）。
+    """
+    identity = thread.user_id
+    spaces = (await session.execute(select(UserSpace.space_name).where(UserSpace.identity == identity))).scalars().all()
+    is_super = await session.scalar(select(UserTables.is_super).where(UserTables.identity == identity))
+    return User(
+        identity=identity,
+        user_spaces=sorted(spaces),
+        permissions=["read", "write"] if is_super else ["read"],
+    )
 
 
 async def _claim_batch() -> list[dict[str, Any]]:
@@ -218,17 +274,20 @@ async def _dispatch_parent(parent_thread_id: str, rows: list[dict[str, Any]]) ->
             return
 
         body = "\n\n".join(
-            completion_text(
-                r["task_id"],
-                r["run_id"],
-                r.get("agent_name"),
-                r.get("terminal_status"),
-                r.get("summary") or "(no output)",
-            )
-            for r in sorted(rows, key=lambda r: (r.get("task_id") or "", r.get("run_id") or ""))
+            [
+                completion_text(
+                    r["task_id"],
+                    r["run_id"],
+                    r.get("agent_name"),
+                    r.get("terminal_status"),
+                    await _child_summary(r),
+                )
+                for r in sorted(rows, key=lambda r: (r.get("task_id") or "", r.get("run_id") or ""))
+            ]
         )
+        # 唤醒 run 必须带着用户的 space 权限（否则子 agent 工具/列表全没，见 _parent_user）
+        user = await _parent_user(session, thread)
         request = RunCreate(assistant_id=str(assistant_id), input={"messages": [{"role": "user", "content": body}]})
-        user = User(identity=thread.user_id)
 
         try:
             # 延迟导入：run_preparation 会拉起 executor / langgraph 服务，避免与 core 循环依赖

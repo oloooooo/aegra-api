@@ -54,12 +54,16 @@ class FakeSession:
         sql = str(stmt)
         if "FROM thread" in sql:
             return self._thread
+        if "is_super" in sql:
+            return False  # 普通用户
         if "FROM runs" in sql:
             return "some-run" if self._busy else None
         return None
 
     async def execute(self, stmt: Any, params: Any = None) -> Any:
         self.updates.append((str(stmt), dict(stmt.compile().params)))
+        if "FROM user_space" in str(stmt):
+            return _Result(["cbam-reporting"])  # 该用户拥有的 spaces
         return _Result()
 
     async def commit(self) -> None:
@@ -100,8 +104,14 @@ class FakeMaker:
 def patch_infra(monkeypatch: pytest.MonkeyPatch):
     def _install(session: FakeSession) -> None:
         monkeypatch.setattr(disp, "_get_session_maker", lambda: FakeMaker(session))
+        # 不真的去打服务端读子线程（_child_summary 退到存盘摘要）
+        monkeypatch.setattr(disp, "_child_summary", _fallback_summary)
 
     return _install
+
+
+async def _fallback_summary(row: dict[str, Any]) -> str:
+    return row.get("summary") or "(no output)"
 
 
 def _rows() -> list[dict[str, Any]]:
@@ -201,6 +211,30 @@ async def test_parent_without_assistant_id_fails_permanently(patch_infra) -> Non
     patch_infra(session)
     await disp._dispatch_parent(PARENT, _rows())
     assert session.touched("failed"), "没有 assistant_id 就建不了 run"
+
+
+async def test_wake_run_carries_user_spaces(patch_infra, monkeypatch) -> None:
+    """唤醒 run 必须带用户的 space 权限。
+
+    实测坏状态：wake run 里 `check_async_task` 不在工具表、`Available types:` 为空、
+    卡片正文 `(no output)`——全是 specs 为空导致 deepagents 不挂 AsyncSubAgentMiddleware。
+    """
+    session = FakeSession(thread=FakeThread({"assistant_id": "supervisor"}), busy=False)
+    patch_infra(session)
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_prepare(*a: Any, **kw: Any) -> None:
+        calls.append({"user": a[3], **kw})
+
+    import aegra_api.services.run_preparation as rp
+
+    monkeypatch.setattr(rp, "_prepare_run", fake_prepare)
+
+    await disp._dispatch_parent(PARENT, _rows())
+    assert len(calls) == 1
+    assert calls[0]["user"].user_spaces == ["cbam-reporting"], "user_spaces 丢了 → 子 agent 工具/列表全没"
+    assert calls[0]["user"].identity == "root"
 
 
 def test_wake_run_id_is_stable_and_order_independent() -> None:
