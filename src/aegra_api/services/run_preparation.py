@@ -2,6 +2,15 @@
 
 Contains the shared run-creation helper, thread metadata updates,
 resume-command validation, and config/context merging logic.
+
+Why a caller-supplied ``run_id`` exists (ADR-0010):
+    ``_prepare_run`` is the single place that inserts a ``runs`` row and enqueues
+    it. ``custom/outbox_dispatcher.py`` needs to create a “wake run” for a parent
+    thread and must stay idempotent across crashes: it passes a deterministic
+    ``run_id`` (uuid5 of the parent thread plus the pending outbox keys), so a retry
+    after “run created but not yet marked delivered” collides on the primary key
+    instead of starting a second run. Default behaviour (``None`` → ``uuid4()``)
+    is unchanged for the HTTP endpoints, which have no such key from the client.
 """
 
 import asyncio
@@ -306,11 +315,13 @@ async def _prepare_run(
 
     Validates inputs, resolves the assistant, persists the RunORM record,
     builds a RunJob, submits it to the executor, and returns the triple
-    ``(run_id, run_model, job)``.
+    ``(run_id, run_model, job)``. Note it **commits internally** (the run row must
+    be visible before ``executor.submit``), so a caller holding row locks should
+    rely on that commit as its serialization point.
 
     ``run_id`` is an optional idempotency key: pass a deterministic value and a
     retried create collides on the primary key instead of starting a second run
-    (used by ``custom/outbox_dispatcher.py``).
+    (used by ``custom/outbox_dispatcher.py`` for wake runs; see the module docstring).
     """
     await _validate_resume_command(session, thread_id, request.command)
 

@@ -4,6 +4,17 @@ Provides the database-level status update operations used by both the
 API layer (cancel, interrupt) and the execution layer (run_executor,
 worker_executor). Extracted from api/runs.py to eliminate the circular
 dependency where service code imported from the API module.
+
+结果投递的“产生端”（ADR-0010）：
+    `finalize_run` 是**所有** run 转终态的唯一收敛点（worker / local executor / 超时 /
+    取消 / 崩溃恢复都走它）。它除了改状态，还调 `_enqueue_task_result` 往
+    `async_task_outbox` 插一行——那是“子 agent 的结果还没送到主管”的持久记录，
+    也是跨进程幂等的锚点。插行与状态更新在**同一个事务**里提交，所以不会出现
+    “run 已 success 但结果没入账”；主键 `(task_id, run_id)` 使得 worker 租约过期重跑
+    （同一个 run 再次 finalize）不会插第二行。
+
+    投递本身不在这里：消费端是 `graphs/async_task_guard.py`（父 run 首尾写 state +
+    ack）与 `custom/outbox_dispatcher.py`（父线程空闲时开唤醒 run）。
 """
 
 from collections.abc import Collection
@@ -239,6 +250,11 @@ async def _enqueue_task_result(
 
     `interrupted` 不入账：那意味着子 run 被取消或被 `update_async_task` 顶掉，这一轮的
     结果并不完整，后续那次 run 会自己入账。
+
+    **为什么 `summary` 只当兵底**：子 run 通常只声明 `stream_mode=["messages","custom"]`，
+    不产生 `values` 事件，所以这里的 `output` 往往是空字典（见 `run_executor._stream_graph`），
+    存下来的摘要会是 "(no output)"。真正的正文由投递方现查子线程（`_child_summary` /
+    `_summary_async`）。要只用这里的列，得先让子 run 也流 `values`。
     """
     if status == "interrupted":
         return
