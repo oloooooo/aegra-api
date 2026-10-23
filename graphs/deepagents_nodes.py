@@ -160,7 +160,7 @@ if __name__ == "__main__":
             {"role": "user", "content": "hello,表格消融实验1.xlsx中的CER，最低的有哪些"}
         ]
     }
-    # guard 只实现 async hook（abefore_agent / aafter_agent），同步 invoke 会报
+    # guard 只实现 async hook（abefore_agent），同步 invoke 会报
     # "No synchronous function provided"；工厂图要先拿 config 建一次
     response = asyncio.run(graph({}).ainvoke(message))  # pyright: ignore[reportArgumentType]
     print(response["messages"][-1]["content"])

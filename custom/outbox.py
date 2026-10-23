@@ -3,7 +3,7 @@
 三个地方必须产出**逐字一致**的文本，否则前端卡片认不出、跨路径判重也认不出：
 
     custom/outbox_dispatcher.py   建唤醒 run 时把结果当 input（生产端）
-    graphs/async_task_guard.py    父 run 的 before/after_agent 写进 state（消费端）
+    graphs/async_task_guard.py    父 run 的 before_agent 写进 state（消费端）
     src/.../run_status.py         子 run 终态时把摘要存进发件箱行
 
 本模块只放纯函数，不导入任何框架或 DB 代码——`graphs/` 在模块加载期就会 import 它。

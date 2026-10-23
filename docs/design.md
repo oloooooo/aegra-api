@@ -77,20 +77,22 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 ### 2.4 子 agent 结果投递（task delivery）
 
 > 背景：子 agent 跑完后要把结果送回 supervisor 的 thread，让它不必被问就汇报。**已接线**，
-> 当前实现是两条路：主管 run 的首尾由拦截层写进自己的 state；主管已空闲时由服务端的
-> 发件箱分发者（`custom/outbox_dispatcher.py`）开一轮唤醒 run。
+> 当前实现是两条路：主管 run 开始时由拦截层写进自己的 state；主管已空闲时由服务端的
+> 发件箱分发者（`custom/outbox_dispatcher.py`）开一轮唤醒 run。两条路都只在「模型能反应的
+> 时刻」投递。
 
 **为什么不是一条路**：LangGraph 没有向运行中的图投递消息的 API；从外部能做的只有读状态、
 杀 run（`runs/cancel`）、另开 run。所以 run 中途想拿结果只能由模型自己 `check_async_task`，
 而「主管早已答完」只能靠另开一个 run 叫醒。
 
-**投递规则**（`graphs/async_task_guard.py::abefore_agent/aafter_agent` + `custom/outbox_dispatcher.py`）：
+**投递规则**（`graphs/async_task_guard.py::abefore_agent` + `custom/outbox_dispatcher.py`）：
 
 | 父线程当时 | 谁投递 | 行为 |
 |---|---|---|
-| `busy` / 本次 run 内 | 主管侧 guard（`before_agent` / `after_agent`，run 首尾各一次） | 写一条带 `task_id:` 标记的消息进自己的 state；不打断、不开新 run |
-| run 中途 | 模型自己 | `check_async_task`——它返回**全文**，且 guard 会记下 `delivered_run_id`，之后不再重复投 |
-| `interrupted` | 谁都不动 | 硬 resume 会把用户正等着回答的答案顶掉（同 §9 #1）；用户答完后下一次 run 的 hook 自动补上 |
+| run 刚开始 | 主管侧 guard（`before_agent`，run 首一次） | 写一条带 `task_id:` 标记的消息进自己的 state；不打断、不开新 run，本次 run 的模型调用就能看到 |
+| run 中途 | 模型自己 | `check_async_task`——它返回**全文**，且 guard 会记 `delivered_run_id` 并 ack 发件箱行，之后不再重复投 |
+| run 期间才完成 | 谁都不在本次 run 写 | 模型这一轮已答完，写进去没法转述；run 结束后由分发者另开一轮唤醒 run |
+| `interrupted` | 谁都不动 | 硬 resume 会把用户正等着回答的答案顶掉（同 §9 #1）；用户答完后下一次 run 的 `before_agent` 自动补上 |
 | `idle` / `error` | 发件箱分发者（服务端后台循环） | 一批待投递结果合成**一轮**唤醒 run；失败/崩溃会退避重试，不会只试一次就丢 |
 
 **去重**：两条路的消息都以 `[Async subagent '<name>' …] Result: …` 开头（前端 `toView`
@@ -118,18 +120,19 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
 
 **并发与幂等**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md)）：
 
-- 同一轮里多个任务同时终态 → 一次 `after_agent` 合并成一条 state 更新，天然幂等。
-- 多个子 agent 同时收尾而主管**正忙** → 分发者看到活跃 run 就退避，那轮的 hook 会投。
+- 同一轮 run 开始时多个结果待投 → 一次 `before_agent` 合并成一条 state 更新，天然幂等。
+- 多个子 agent 在主管 **run 期间**收尾 → guard 不写 state，分发者在 run 结束后开一轮唤醒 run。
 - 多个子 agent 同时收尾而主管**空闲** → 一个 tick 领到全部 → 只开**一轮**唤醒 run，
   input 拼了所有结果（实测 3 个同时完成 → 1 轮 run、3 张卡片全在）。
 - 主管自己的 hook 一次要投 N 个任务 → 逐个 ack（一行一判），互不阻塞。
-- 同一任务被两个 hook 投递 → 第二个看到 `delivered_run_id` 或翻牌失败，只投一次。
+- 同一任务被两个写入点投递 → 第二个看到 `delivered_run_id` 或翻牌失败，只投一次。
 - 建 run 失败/崩溃 → `attempts++` + 退避重试；确定在 run_id 让重试不会开第二轮。
 
 **仍存在的空隙**：
 
-- 子 agent 恰好在主管生成最终答案的那一刻完成时，`after_agent` 的那条消息模型没机会转述，
-  用户看到「答案 + 一张结果卡片」；想让它开口只能另开一轮 run。
+- run 期间完成的结果**不会**在本次 run 里出现，要等 run 结束后分发者另开一轮；
+  于是每一次“跑题期间子 agent 完成”都要多花一轮 LLM（这是删 `after_agent` 的代价，
+  换来的是模型总能对结果说一句话）。
 - 分发者与 state 写入不在同一事务：崩溃窗口内可能多开一轮唤醒 run（不会多写消息，
   因为输入消息本身带 `task_id` / `run_id` 标记，guard 会跳过）。
 - **唤醒 run 的 spaces 来自“投递时”的 `user_space` 表**（`_parent_user`），不是派活时的权限；

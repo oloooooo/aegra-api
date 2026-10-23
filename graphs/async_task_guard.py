@@ -9,8 +9,8 @@ deepagents 内置的 `start_async_task` / `update_async_task` 建子 run 时不�
 handler，自己用 spec 里的静态服务 token 建 thread/run，把两样东西塞进去：
 权限（只给本任务的 space）与归属（哪个终端用户拥有这个子线程）。
 
-check / cancel / list 不创建 run，直接放行给内置 handler；check 只额外记一笔
-"这个结果已经给过主管了"（见 `_mark_checked`）。
+check / cancel / list 不创建 run，直接放行给内置 handler；check 到终态时额外记一笔
+"这个结果已经给过主管了"并 ack 发件箱行（见 `_amark_checked`）。
 
 ===============================================================================
 二、派活路径
@@ -39,9 +39,10 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 只�
 ===============================================================================
 
 子 agent 跑完，结果要进主管上下文。主管 run 中途没有任何 API 能往里塞消息，
-所以只有两个时刻：run 开始（before_agent）与 run 结束（after_agent），各一次。
+所以只有一个时刻：run 开始（before_agent）。run 期间完成的结果不在这里写——
+那一条模型已经没机会转述，写进去等于少一次能反应的机会；交给分发者开唤醒 run。
 
-    before_agent / after_agent
+    before_agent
       │ 1. _refreshed_async()  向子 run 问真实状态（state 里的 status 只是快照）
       │ 2. _plan()             谁已终态、且结果还没进过主管上下文
       │ 3. POST /custom/tasks/{id}/deliver-claim   抢投递权（与发件箱分发者互斥）
@@ -54,9 +55,10 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 只�
 
 摘要截断到 500 字并带标记，**全文只有 check_async_task 能取**（那边不截断）。
 
-判重两个来源：messages 里的投递消息（跨 run/跨进程都看得见）与 task 上的
-`delivered_run_id`（模型自己 check 过也算已投，见 `_mark_checked`）。发件箱行
-`(task_id, run_id)` 负责与分发者互斥：谁能把行从 pending 翻成 delivered，谁去写 state。
+判重三个来源：发件箱行 `(task_id, run_id)`（与分发者互斥：谁能把行从 pending 翻成
+delivered，谁去写 state）、task 上的 `delivered_run_id`（模型自己 check 过也算已投，
+见 `_amark_checked`）、messages 里的投递消息（唤醒 run 的 input 本身就带标记，
+所以它自带判重，不依赖谁先写过 state）。
 
 ===============================================================================
 四、多进程
@@ -80,7 +82,7 @@ guard 自己不存任何跨请求状态（旧版的名额账本已随 ADR-0008 �
                    _update_sync/_aupdate, _err()
   C. 投递          _spec_of(), _refresh_targets(), _refreshed_sync/_refreshed_async,
                    _summary_async(), _claim_async/_release_async, _plan(),
-                   _deliver(), abefore_agent/aafter_agent, _mark_checked()
+                   _deliver(), abefore_agent, _amark_checked()
   D. 接线          wrap_tool_call / awrap_tool_call
 """
 
@@ -558,8 +560,9 @@ class AsyncTaskGuard(AgentMiddleware):
     async def _deliver(self, state: Any) -> dict[str, Any] | None:
         """把"已完成且未投递"的子任务结果写进本次 run 的 state。
 
-        只有两个调用点（`before_agent` / `after_agent`，一次 run 各一次）：前者补上一个
-        run 结束后才完成的任务，后者落定这次跑动期间完成的任务（模型已没机会转述）。
+        只有 `before_agent` 一个调用点（run 首一次）：补上 run 开始前就已终态、还没进过
+        主管上下文的结果。run 期间完成的结果不在这里写——那时模型这轮的回答已经定了，
+        写进去反而让它没机会反应；那种情况交给发件箱分发者开一轮唤醒 run。
         认领后若写 state 抛异常，会把认领撤掉再抛，避免结果被永久锁成「已投递」。
         """
         tasks = (state or {}).get("async_tasks") or {}
@@ -597,11 +600,11 @@ class AsyncTaskGuard(AgentMiddleware):
         return out
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        """run 开始：补上父线程空闲期间完成、通知路没投出去的结果。"""
-        return await self._deliver(state)
+        """run 开始：补上此前已终态、还没进过主管上下文的结果。
 
-    async def aafter_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        """run 结束：把这次跑动期间完成的子任务结果落进 state。"""
+        刻意不实现 `after_agent`：run 结束时写进去的结果模型已没机会转述，代价是多一条
+        谁也解释不了的卡片；不写则分发者在 run 结束后开一轮唤醒 run，模型能对结果说话。
+        """
         return await self._deliver(state)
 
     @staticmethod
@@ -613,23 +616,38 @@ class AsyncTaskGuard(AgentMiddleware):
             return ""
         return str(conf.get("thread_id") or "")
 
-    def _mark_checked(self, request: ToolCallRequest, result: Any) -> Any:
-        """模型自己 check 到终态结果时补记 delivered_run_id，否则下一个 hook 会再投一遍。
+    @staticmethod
+    def _mark_checked(request: ToolCallRequest, result: Any) -> dict[str, Any] | None:
+        """模型自己 check 到终态结果时补记 `delivered_run_id`；是终态则返回被 check 的任务。
 
         check 返回的是 ToolMessage(json)，扫消息的判重认不出它；这里在 state 的 task 上
         留记号，`_plan` 据此跳过（精确到 run_id，update_async_task 换 run 后照常再投）。
+        返回值供调用方 ack 发件箱行——只记号不 ack 的话，分发者仍当它是待投，
+        父 run 一结束就开唤醒 run 把同一个结果再送一遍（用户看到两张一样的卡片）。
         """
         task_id = str((request.tool_call.get("args") or {}).get("task_id") or "").strip()
         task = ((request.state or {}).get("async_tasks") or {}).get(task_id)
         update = getattr(result, "update", None)
         if task is None or not isinstance(update, dict):
-            return result
+            return None
         checked = (update.get("async_tasks") or {}).get(task_id) or {}
-        if checked.get("status") in _TERMINAL:
-            update["async_tasks"] = {
-                **(update.get("async_tasks") or {}),
-                task_id: {**checked, "delivered_run_id": task.get("run_id")},
-            }
+        if checked.get("status") not in _TERMINAL:
+            return None
+        update["async_tasks"] = {
+            **(update.get("async_tasks") or {}),
+            task_id: {**checked, "delivered_run_id": task.get("run_id")},
+        }
+        return {**task, "status": checked["status"]}
+
+    async def _amark_checked(self, request: ToolCallRequest, result: Any) -> Any:
+        """`_mark_checked` + ack：抢不到行说明分发者已在投（或已投），不再重复。
+
+        shortcut: ack 早于 ToolMessage 落 checkpoint，这轮 run 崩在中间时结果只能从子线程
+        找回（模型已拿到全文，等量信息没丢）；返回 None 表示服务不可达，行留在 pending。
+        """
+        task = self._mark_checked(request, result)
+        if task is not None and await self._claim_async(task, self._parent_thread_id()) is None:
+            logger.warning("task_delivery_claim_undetermined", task_id=task.get("task_id"))
         return result
 
     # =========================== D. 接线 ===========================
@@ -642,7 +660,10 @@ class AsyncTaskGuard(AgentMiddleware):
         if name == "update_async_task":
             return self._update_sync(request)
         result = handler(request)
-        return self._mark_checked(request, result) if name == "check_async_task" else result
+        # 本图只实现 async hook，同步 invoke 在建图时就报错，这条路径实际走不到
+        if name == "check_async_task":
+            self._mark_checked(request, result)
+        return result
 
     async def awrap_tool_call(
         self, request: ToolCallRequest, handler: Callable[..., Awaitable[Any]]
@@ -654,4 +675,4 @@ class AsyncTaskGuard(AgentMiddleware):
         if name == "update_async_task":
             return await self._aupdate(request)
         result = await handler(request)
-        return self._mark_checked(request, result) if name == "check_async_task" else result
+        return await self._amark_checked(request, result) if name == "check_async_task" else result

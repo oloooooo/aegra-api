@@ -69,10 +69,10 @@ ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不
   会对 thread 行取 `FOR KEY SHARE`——多进程下第二个分发者会阻塞到第一个提交，然后看到新
   run 并让路（与 `thread_ttl.py` 处理同一竞态的做法一致）。
 
-### 三、消费：父 run 的 hook 写 state 并 ack（graphs）
+### 三、消费：父 run 的 `before_agent` 写 state 并 ack（graphs）
 
-父线程有活跃 run 时，分发者不动手——那一轮的 `AsyncTaskGuard.abefore_agent` /
-`aafter_agent` 会把终态结果写进 state。写之前先 `POST /custom/tasks/{id}/deliver-claim`
+父线程有活跃 run 时，分发者不动手——那一轮的 `AsyncTaskGuard.abefore_agent` 会把终态结果
+写进 state。写之前先 `POST /custom/tasks/{id}/deliver-claim`
 **把发件箱行从 pending 原子翻成 delivered**：
 
 ```sql
@@ -87,21 +87,43 @@ RETURNING task_id          -- 0 行 = 别人已经投了，放弃
 
 写 state 失败时调 `DELETE` 把行退回 `pending`，分发者会接手。
 
-### 四、判重仍然两层，各管一段
+#### 为什么只有 `before_agent`，没有 `after_agent`
+
+`after_agent` 曾在实现里（写进 state 并 ack），已删除。理由是它解决了错误的那半个问题：
+
+- run 结束时写进 state 的结果，模型这一轮的回答已经定了，**没机会转述**——用户看到的是
+  "答案 + 一张谁也解释不了的卡片"；
+- 更实质的代价：它一 ack，发件箱行就变成 `delivered`，分发者再也不会开唤醒 run，于是
+  "模型能对结果说一句话"这个机会被永久放弃。
+
+删掉之后语义收敛成一条：**结果总是在模型能反应的时刻进上下文**——要么在 run 开始前
+（`before_agent`），要么由分发者另开一轮 run。代价是 run 期间完成的结果要多花一轮 LLM。
+
+`before_agent` 留着是因为它没有替代品：run 开始前已终态的结果若不在这里写，就只能等 run
+结束再由分发者开第二轮，用户会先拿到一个对结果一无所知的答案。
+
+#### `check_async_task` 命中的也要 ack
+
+模型自己 check 到终态结果时（`_amark_checked`）做两件事：记 `delivered_run_id`、
+**ack 发件箱行**。只记号不 ack 是个确定性重复：分发者仍当它是待投，父 run 一结束就开唤醒
+run 把同一个结果再送一遍。
+
+### 四、判重三层，各管一段
 
 | 层 | 位置 | 管什么 |
 |---|---|---|
-| 发件箱行状态 | `async_task_outbox.status` | **这次结果投没投过**（跨进程、跨 run 的唯一真相） |
-| `delivered_run_id` | 父 state 的 `async_tasks[task_id]` | **同一个 run 只投一次**（模型自己 `check_async_task` 也算已投，见 `_mark_checked`） |
-| 投递消息本身 | 父 state 的 messages | 兜底：消息在、行状态丢了（比如 ack 前崩溃）也不重复写 |
+| 发件箱行状态 | `async_task_outbox.status` | **这次结果投没投过**（跨进程、跨 run 的唯一真相；`check_async_task` 命中时也在这里 ack） |
+| `delivered_run_id` | 父 state 的 `async_tasks[task_id]` | **同一个 run 只投一次**（模型自己 `check_async_task` 也算已投） |
+| 投递消息本身 | 父 state 的 messages | 兜底：消息在、行状态丢了（比如 ack 前崩溃）也不重复写；唤醒 run 的 input 自带标记，所以它天然跳过自己那批 |
 
 ## 三种并发场景的行为
 
 | 场景 | 行为 | 幂等 |
 |---|---|---|
-| 同一轮里多个任务几乎同时终态，主管在跑 | 那轮的 `after_agent` 逐个 ack + 合并成一条 state 更新 | 一次 checkpoint，天然幂等 |
+| 主管开始一轮 run 时已有终态结果 | `before_agent` 逐个 ack + 合并成一条 state 更新，模型这次就能看到 | 一次 checkpoint，天然幂等 |
+| 结果在主管 run 期间完成 | guard 不动手（没有 `after_agent`）；run 结束后分发者开一轮唤醒 run，模型能对结果说话 | 一批一个 run，确定性 run_id |
 | 多个子 agent 同时收尾，主管空闲 | 分发者一个 tick 领到全部 → 只开**一轮**唤醒 run，input 拼了所有结果 | 一批一个 run，确定性 run_id |
-| 结果到达时主管正在跑唤醒 run | 分发者看到活跃 run → 退避重看；那轮的 hook 会 ack 并写 state | 不产生第二个 run |
+| 结果到达时主管正在跑唤醒 run | 分发者看到活跃 run → 退避重看；那批已经在那轮 input 里 | 不产生第二个 run |
 | 分发者崩在"建 run 后、标 delivered 前" | 租约过期后重试 → 撞确定性 run_id → 按已投递处理 | 不开第二轮 |
 | 建 run 失败（Redis 挂 / 接口 500） | `attempts++`，指数退避（封顶 60s），最多 10 次后标 `failed` | 结果保留，恢复后补投 |
 | `update_async_task` 后的新 run | 新 `run_id` → 新主键 → 再投一次 | 有意为之 |
@@ -123,13 +145,16 @@ RETURNING task_id          -- 0 行 = 别人已经投了，放弃
 - **多一张表**：`async_task_outbox`，一行 = 一次子 run 的终态结果。仍没有清理任务；
   需要时按 `delivered_at` 定期删旧行（删了最坏效果是"远古任务被重新投一次"）。
 - **多一个后台循环**：每个进程一个，靠 `SKIP LOCKED` + 租约分工；空表时每 tick 一次索引扫描。
-- **延迟**：正常情况下 ≤ 一个轮询间隔（默认 1s）；父线程忙时等那轮 run 的 hook，与旧版一致。
+- **延迟**：正常情况下 ≤ 一个轮询间隔（默认 1s）；父线程忙时等 run 结束后那一轮唤醒 run。
+  没有 `after_agent` 意味着 run 期间完成的结果不会再顺手落进当前 run，**必然多一轮 LLM**——
+  换来的是模型能对结果说话。
 - **保底语义是 at-least-once**：ack 与 state 写入不在同一事务里，崩溃窗口内可能多投一次；
   投递消息带 `task_id` / `run_id` 标记，前端与 guard 都按标记判重，重复卡片比丢结果更可接受。
 - **`interrupted` 的结果不主动投**：取消/被顶掉的子 run 没有完整结论，用户下次发言时由
   `check_async_task` 或下一次 hook 带出。
 - 主管 run 中途想拿结果仍然只能靠模型自己 `check_async_task`（提示词里写成硬口径）；
-  `after_agent` 写进 state 的结果模型已没机会转述，用户看到的是"答案 + 结果卡片"。
+  结果在 run 期间完成时不会有 `after_agent` 顺手带进当前 run，run 结束后由分发者另开一轮，
+  模型那轮能主动转述。
 
 ## 已知问题与残留风险
 

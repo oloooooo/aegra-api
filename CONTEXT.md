@@ -132,11 +132,12 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 按 `thread.user_id` 数子线程（它们是服务账号）
 
 **Task delivery（任务结果投递）**:
-把子 agent 的结果送进主管上下文的动作，有两条路且只发生一次：
-① 主管自己的 run 里 —— `AsyncTaskGuard.abefore_agent` / `aafter_agent` 在 run 首尾把结果写进
-state（不另开 run，模型在这些消息之后的下一次模型调用时看到）；② 主管已空闲（`idle` / `error`）——
+把子 agent 的结果送进主管上下文的动作，只在**模型能反应的时刻**发生，且只发生一次：
+① 主管开始一轮 run 时 —— `AsyncTaskGuard.abefore_agent` 把已终态的结果写进 state
+（不另开 run，模型在本次 run 的第一轮模型调用就能看到）；② 主管已空闲（`idle` / `error`）——
 服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run 投递。`busy` 与 `interrupted`
-一律不投：前者归 ①，后者不能顶掉用户正等着回答的答案。
+一律不投：前者归 ②，后者不能顶掉用户正等着回答的答案。**run 期间完成的结果不在该 run 里写**
+（没有 `after_agent`）——那时模型这一轮已经答完，写进去它没法转述，交给 ② 另开一轮。
 两条路都以 `(task_id, run_id)` 为键：子 run 终态时 `finalize_run` 写一行发件箱
 `async_task_outbox`（主键即幂等键），投递前把行从 `pending` 原子翻成 `delivered`，
 翻不成就说明别人已投。投过的任务在 state 里留 `delivered_run_id`，模型自己

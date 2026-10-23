@@ -5,11 +5,13 @@
 架构（ADR-0010）：
     子 run 终态 → ``finalize_run`` 写发件箱行（pending）
                 ├─ 父线程空闲 → ``custom/outbox_dispatcher.py`` 开一轮唤醒 run
-                └─ 父线程在跑 → 那轮的 before/after_agent 把结果写进 state 并 ack
+                └─ 父线程在跑 → 该 run 的 before_agent 把结果写进 state 并 ack
 
 覆盖：
-1. guard 的 before_agent / after_agent：终态未投递才写、投递过不再写、工具路径已写终态要补投；
-2. 判重键是 `(task_id, run_id)`，且 check 过的任务（delivered_run_id）不再重复投；
+1. guard 的 before_agent：终态未投递才写、投递过不再写、工具路径已写终态要补投；
+   **刻意不实现 after_agent**——run 结束时写的模型已没机会转述，交给分发者开唤醒 run；
+2. 判重键是 `(task_id, run_id)`，且 check 过的任务（delivered_run_id + 发件箱行 ack）
+   不再重复投、分发者也不再开唤醒 run；
 3. 投递文本统一由 `custom/outbox.py` 生成（分发者与 guard 必须逐字一致）；
 4. 同批多个任务各自独立 ack —— 旧版 8s 让路窗口挡住的地方。
 """
@@ -102,18 +104,18 @@ async def guard_checks() -> None:
 
     # 2. 消息已被丢弃、只剩 delivered_run_id：仍不重复投（判重不靠扫消息）
     state2 = {"async_tasks": {"t1": {**task("t1", "success"), "delivered_run_id": "run-t1"}}, "messages": []}
-    check("delivered_run_id 已记 → 不再写", await guard.aafter_agent(state2, None) is None)
+    check("delivered_run_id 已记 → 不再写", await guard.abefore_agent(state2, None) is None)
 
     # 3. 投递消息在对话里 → 不再写（跨进程/跨 run 的判据）
     guard3, _ = make_guard({}, {})
     delivered = "[Async subagent 'cbam_reporting' has completed] Result: x\n\ntask_id: t3\nrun_id: run-t3"
     state3 = {"async_tasks": {"t3": task("t3", "success")}, "messages": [HumanMessage(content=delivered)]}
-    check("消息里已有投递记录 → 不再写", await guard3.aafter_agent(state3, None) is None)
+    check("消息里已有投递记录 → 不再写", await guard3.abefore_agent(state3, None) is None)
 
     # 4. 工具路径已把 state 写成终态但没投递 → 补投
     guard4, _ = make_guard({}, {})
     state4 = {"async_tasks": {"t4": task("t4", "success")}, "messages": []}
-    check("state 已是终态但未投递 → 补投", bool(((await guard4.aafter_agent(state4, None)) or {}).get("messages")))
+    check("state 已是终态但未投递 → 补投", bool(((await guard4.abefore_agent(state4, None)) or {}).get("messages")))
 
     # 5. 还在跑 → 什么都不做
     guard5, _ = make_guard({"run-t5": "running"}, {})
@@ -125,21 +127,42 @@ async def guard_checks() -> None:
     text6 = (out6 or {})["messages"][0].content
     check("超长摘要带截断标记", "结果已截断" in text6 and "check_async_task" in text6, text6[-60:])
 
-    # 7. 模型自己 check 到终态结果 → 记 delivered_run_id，之后不再重复投
+    # 7. 模型自己 check 到终态结果 → 记 delivered_run_id + ack 发件箱行（之后不再投）
     guard7, _ = make_guard({"run-t7": "success"}, {"t7": "x"})
+    claims7: list[str] = []
+
+    async def claim7(task_: dict, parent: str) -> bool:
+        claims7.append(task_["task_id"])
+        return True
+
+    guard7._claim_async = claim7  # type: ignore[method-assign]
     checked = Command(update={"messages": [], "async_tasks": {"t7": {**task("t7", "success")}}})
     request = type(
         "Req", (), {"tool_call": {"args": {"task_id": "t7"}}, "state": {"async_tasks": {"t7": task("t7", "running")}}}
     )()
-    guard7._mark_checked(request, checked)
+    await guard7._amark_checked(request, checked)
     check(
         "check 到终态结果 → 记 delivered_run_id",
         (checked.update["async_tasks"]["t7"]).get("delivered_run_id") == "run-t7",
     )
+    check("check 到终态结果 → 同时 ack 发件箱行（分发者不会再开唤醒 run）", claims7 == ["t7"], str(claims7))
     check(
         "check 过之后不再补投",
-        await guard7.aafter_agent({"async_tasks": checked.update["async_tasks"], "messages": []}, None) is None,
+        await guard7.abefore_agent({"async_tasks": checked.update["async_tasks"], "messages": []}, None) is None,
     )
+
+    # 7b. check 到非终态 → 既不记号也不 ack（发件箱行还没入账）
+    guard7b, _ = make_guard({"run-t7b": "running"}, {})
+    claims7b: list[str] = []
+
+    async def claim7b(task_: dict, parent: str) -> bool:
+        claims7b.append(task_["task_id"])
+        return True
+
+    guard7b._claim_async = claim7b  # type: ignore[method-assign]
+    running = Command(update={"messages": [], "async_tasks": {"t7b": {**task("t7b", "running")}}})
+    await guard7b._amark_checked(request, running)
+    check("check 到运行中 → 不记号、不 ack", claims7b == [] and "delivered_run_id" not in running.update["async_tasks"]["t7b"])
 
     # 8. ack 失败（分发者或别的 run 已经投了）→ 不写投递消息
     guard8, _ = make_guard({"run-t8": "success"}, {"t8": "x"}, claimed=False)
@@ -167,6 +190,15 @@ async def guard_checks() -> None:
     with contextlib.suppress(RuntimeError):
         await guard9.abefore_agent({"async_tasks": {"t9": task("t9", "running")}, "messages": []}, None)
     check("写 state 失败 → 撤销 ack", releases == ["t9"], str(releases))
+
+
+    # 10. 故意不实现 after_agent：run 结束时不写，留给分发者开唤醒 run
+    guard10, _ = make_guard({"run-t10": "success"}, {"t10": "x"})
+    state10 = {"async_tasks": {"t10": task("t10", "running")}, "messages": []}
+    from langchain.agents.middleware import AgentMiddleware
+
+    check("after_agent 未被实现（基类空实现）", AsyncTaskGuard.aafter_agent is AgentMiddleware.aafter_agent)
+    check("run 结束时不写 → 结果留给分发者", await guard10.aafter_agent(state10, None) is None)
 
 
 def outbox_checks() -> None:

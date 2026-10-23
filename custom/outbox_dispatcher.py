@@ -263,7 +263,8 @@ async def _dispatch_parent(parent_thread_id: str, rows: list[dict[str, Any]]) ->
             .limit(1)
         )
         if busy is not None:
-            # 活跃 run 的 before/after_agent 会把结果写进 state 并 ack，这里不抢
+            # 活跃 run 的 before_agent 会把已终态结果写进 state 并 ack；run 期间完成的
+            # 等它结束后再投（没有 after_agent），这里不抢
             await _defer(session, rows, seconds=_BUSY_BACKOFF_SECONDS)
             return
 

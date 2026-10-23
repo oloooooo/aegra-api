@@ -271,7 +271,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 │  工具：start / check / update / cancel / list_async_task、write_todos        │
 └───┬──────────────────────────────────────────────────────────▲─────────────┘
     │ ① 任务描述（消息，单向给出）                                │ ③ 结果投递（消息，单向送回）
-    │  runs.create(thread_id=子线程,                              │  主管 run 首尾 → before_agent/after_agent 写一条消息
+    │  runs.create(thread_id=子线程,                              │  主管 run 开始 → before_agent 写一条消息
     │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → 发件箱分发者开新一轮（custom/outbox_dispatcher.py）
     │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"
     │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
@@ -296,7 +296,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 |---|---|---|---|---|---|
 | ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
 | ② | 父 → 子 | `config.configurable` | 拦截层 | 同上 `_config_for()` | 无权限时直接拒绝派活 |
-| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 发件箱分发者 | `async_task_guard.py::abefore_agent/aafter_agent`（主管 run 首尾）/ `custom/outbox_dispatcher.py`（主管空闲） | 分发者会重试；仍失败时靠 `check_async_task` 兜底 |
+| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 发件箱分发者 | `async_task_guard.py::abefore_agent`（run 开始）/ `custom/outbox_dispatcher.py`（主管空闲或 run 期间完成的） | 分发者会重试；仍失败时靠 `check_async_task` 兜底 |
 | ④ | 子 → 父 | 工具返回值 + state 更新 | 主管主动调用 | `deepagents/…/async_subagents.py::_build_check_result` | 返回 `Failed to get run status` |
 | ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/frontend_api.py::stream_task` | 发 `error` 帧后 `end` |
 
@@ -310,7 +310,8 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 | 主管此刻 | 谁投递 | 行为 |
 |---|---|---|
-| 正在跑（run 首尾） | 主管侧 guard（`abefore_agent` / `aafter_agent`） | run 开始时补上上个 run 之后完成的，run 结束时落定这次跑动期间完成的；**不打断**、不另开 run |
+| run 刚开始 | 主管侧 guard（`abefore_agent`） | 把已终态的结果写进 state；**不打断**、不另开 run，本次 run 的模型调用就能看到 |
+| run 期间才完成 | 分发者（run 结束后） | **不在该 run 里写**：那时模型这一轮已答完，写进去没法转述；run 结束后另开一轮唤醒 run |
 | run 跑到一半需要结果 | 模型自己 | 调 `check_async_task`——它返回**全文**，而且 guard 会记下已投递，之后不再重复投 |
 | `interrupted`（图在等 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，下一次 run 的 hook 自动补上 |
 | `idle` / `error`（主管已经答完） | 发件箱分发者（服务端） | 子 run 终态时 `finalize_run` 已写了一行发件箱；分发者把一个 tick 里同一父线程的待投结果合成**一轮**唤醒 run |
@@ -329,8 +330,8 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 | 情形 | 结果 |
 |---|---|
-| 同一轮里几个任务一起完成，主管正在跑 | 它们在**一次** `after_agent` 里合并成一条 state 更新，各一条消息，不多跑一轮模型 |
-| 几个子 agent 几乎同时收尾，主管正忙 | 发件箱行留在 `pending`，分发者看到活跃 run 就退避；结果由那轮的 `after_agent` 写进 state |
+| run 开始时已有几个结果待投 | 它们在**一次** `before_agent` 里合并成一条 state 更新，各一条消息，不多跑一轮模型 |
+| 几个任务在主管 run 期间收尾 | guard 不写 state；run 结束后分发者开一轮唤醒 run，模型这轮能主动转述 |
 | 几个子 agent 几乎同时收尾，主管空闲 | 分发者一个 tick 领到全部 → 只开**一轮**唤醒 run，input 拼了所有结果（同一时刻最多一个投递 run，跨 worker 也成立） |
 
 子 agent 自身不受影响：每个任务在自己的线程里独立执行，同时完成只是把结果一起排队送到主管。
@@ -338,8 +339,8 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 投递的重试退避与领取租约是 `custom/outbox_dispatcher.py` 的模块常量（`OUTBOX_*` 环境变量
 可覆盖），语义见 [adr/0010](./docs/adr/0010-task-delivery-idempotency.md)。
 
-**仍然存在的空隙**：子 agent 恰好在主管「正在生成最终答案」的那一刻完成时，`after_agent`
-写的消息模型没机会转述，用户会看到「答案 + 一张结果卡片」；主管一直忙且用户不停说话时，
+**仍然存在的空隙**：结果在主管 run 期间完成时不会插进那一轮，而要等 run 结束后另开一轮
+唤醒 run（多花一轮 LLM，换来模型能对结果说一句话）；主管一直忙且用户不停说话时，
 发件箱行会一直 `pending`（结果晚到，不丢）；卡片正文靠现查子线程获取，自调失败时退化成
 `(no output)`——完整清单见 [adr/0010 §已知问题与残留风险](./docs/adr/0010-task-delivery-idempotency.md#已知问题与残留风险)。
 

@@ -153,20 +153,21 @@ agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null
 开头，末尾带 `task_id: <id>` 与 `run_id: <id>`。它有两种来源，**格式完全一致**，前端不需要区分
 （判重在服务端做，见 `POST /custom/tasks/{id}/deliver-claim`）：
 
-- 主管的 run 首尾 → `AsyncTaskGuard.abefore_agent` / `aafter_agent` 写进自己的 state（不开新 run）；
+- 主管的 run 开始 → `AsyncTaskGuard.abefore_agent` 写进自己的 state（不开新 run）；
 - 主管已答完（线程 `idle`）→ 服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run
   （ADR-0010；不再有子 agent 侧的通知中间件，也不需要现铸父身份 token）。
 
 两种都**渲染成「子任务返回结果」区块**，不要当作用户输入。主管在等用户回答（线程 `interrupted`）时
-不会投递，结果会等用户答完后补上——前端不要为此做特殊处理。
+不会投递，结果会等用户答完后补上——前端不要为此做特殊处理。结果在主管**run 期间**完成时
+不会插进那一轮，而是等 run 结束后由分发者开一轮唤醒 run 送来（多一条独立回复）。
 
 结果可能被截断：摘要上限 500 字，超长时末尾带 `…[结果已截断（仅前 500 字），调 check_async_task 取全文]`。
 前端直接原样展示即可（全文由主管调工具取，不会进这条消息）。
 
 ### 5.4 状态可能滞后
 
-父 state 的 `async_tasks.status` 只在主管调用 `check_async_task`、或者主管 run 首尾
-（`AsyncTaskGuard.abefore_agent` / `aafter_agent`）核实时更新；即使子 agent 已完成、
+父 state 的 `async_tasks.status` 只在主管调用 `check_async_task`、或者主管 run 开始
+（`AsyncTaskGuard.abefore_agent`）核实时更新；即使子 agent 已完成、
 线程已 `idle` 也没人改它。要展示实时状态就用 `GET /custom/tasks/{id}`（内部会向子 run 核实）。
 
 ## 6. 定时任务
