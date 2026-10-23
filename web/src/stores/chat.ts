@@ -203,7 +203,12 @@ export const useChat = defineStore("chat", () => {
     streaming.value = "";
     runAbort = new AbortController();
     try {
-      for await (const ev of api.runStream(id, { ...body, stream_mode: ["messages", "updates", "values", "custom"] }, runAbort.signal)) {
+      // on_disconnect=continue：刷新/切页断开 SSE 不杀 run，取消只走显式 cancelRun
+      for await (const ev of api.runStream(
+        id,
+        { ...body, stream_mode: ["messages", "updates", "values", "custom"], on_disconnect: "continue" },
+        runAbort.signal,
+      )) {
         handleEvent(ev);
       }
     } catch (e) {
