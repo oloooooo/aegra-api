@@ -63,14 +63,14 @@ class FakeClient:
 
 
 def make_guard(
-    statuses: dict[str, str], texts: dict[str, str], claimed: bool = True
+    statuses: dict[str, str], texts: dict[str, str], claimed: bool | None = True
 ) -> tuple[AsyncTaskGuard, FakeClient]:
     guard = AsyncTaskGuard({"cbam_reporting": {"url": "http://fake", "graph_id": "cbam_reporting"}})
     client = FakeClient(statuses, texts)
     guard._async_client = lambda spec: client  # type: ignore[method-assign]
     guard._parent_thread_id = lambda: "parent"  # type: ignore[method-assign]
 
-    async def claim(task: dict, parent: str) -> bool:
+    async def claim(task: dict, parent: str) -> bool | None:
         return claimed
 
     guard._claim_async = claim  # type: ignore[method-assign]
@@ -95,22 +95,36 @@ async def guard_checks() -> None:
     msgs = (out or {}).get("messages") or []
     check("running→success 会写结果", bool(msgs))
     text = msgs[0].content if msgs else ""
-    check("投递文本以 [Async subagent 开头（前端认它是子 agent 返回）", text.startswith("[Async subagent 'cbam_reporting'"))
+    check(
+        "投递文本以 [Async subagent 开头（前端认它是子 agent 返回）",
+        text.startswith("[Async subagent 'cbam_reporting'"),
+    )
     check("投递文本带 task_id/run_id 标记", "task_id: t1" in text and "run_id: run-t1" in text)
     check("投递文本带结果摘要", "12.3" in text)
     updated = (out or {}).get("async_tasks", {}).get("t1", {})
     check("同时把 state 里的状态刷成 success", updated.get("status") == "success")
     check("并在 task 上记 delivered_run_id", updated.get("delivered_run_id") == "run-t1")
 
-    # 2. 消息已被丢弃、只剩 delivered_run_id：仍不重复投（判重不靠扫消息）
+    # 2. delivered_run_id 是唯一路内判据：记过就不再投
     state2 = {"async_tasks": {"t1": {**task("t1", "success"), "delivered_run_id": "run-t1"}}, "messages": []}
     check("delivered_run_id 已记 → 不再写", await guard.abefore_agent(state2, None) is None)
+    state2b = {"async_tasks": {"t1": {**task("t1", "success"), "run_id": "run-t1b", "delivered_run_id": "run-t1"}}}
+    check("run_id 变了 → 再投一次", bool(((await guard.abefore_agent(state2b, None)) or {}).get("messages")))
 
-    # 3. 投递消息在对话里 → 不再写（跨进程/跨 run 的判据）
+    # 3. 对话里已有投递卡片但 state 没记 → 仍然补投（消息不可信，宁可重复不可漏）
     guard3, _ = make_guard({}, {})
-    delivered = "[Async subagent 'cbam_reporting' has completed] Result: x\n\ntask_id: t3\nrun_id: run-t3"
-    state3 = {"async_tasks": {"t3": task("t3", "success")}, "messages": [HumanMessage(content=delivered)]}
-    check("消息里已有投递记录 → 不再写", await guard3.abefore_agent(state3, None) is None)
+    card = "[Async subagent 'cbam_reporting' has completed] Result: x\n\ntask_id: t3\nrun_id: run-t3"
+    state3 = {"async_tasks": {"t3": task("t3", "success")}, "messages": [HumanMessage(content=card)]}
+    out3 = await guard3.abefore_agent(state3, None)
+    check("卡片在对话里也不再作为判据（摘要会删掉它）", bool((out3 or {}).get("messages")), str(out3))
+
+    # 3b. 模型复述带同样前缀 + task_id/run_id 的句子，不能把真结果挡掉
+    guard3b, _ = make_guard({}, {})
+    forged = HumanMessage(
+        content="刚才那次是 [Async subagent 'cbam_reporting' has completed] Result: 假的\n\ntask_id: t3b\nrun_id: run-t3b"
+    )
+    state3b = {"async_tasks": {"t3b": task("t3b", "success")}, "messages": [forged]}
+    check("伪造前缀不导致漏投", bool(((await guard3b.abefore_agent(state3b, None)) or {}).get("messages")))
 
     # 4. 工具路径已把 state 写成终态但没投递 → 补投
     guard4, _ = make_guard({}, {})
@@ -162,35 +176,63 @@ async def guard_checks() -> None:
     guard7b._claim_async = claim7b  # type: ignore[method-assign]
     running = Command(update={"messages": [], "async_tasks": {"t7b": {**task("t7b", "running")}}})
     await guard7b._amark_checked(request, running)
-    check("check 到运行中 → 不记号、不 ack", claims7b == [] and "delivered_run_id" not in running.update["async_tasks"]["t7b"])
-
-    # 8. ack 失败（分发者或别的 run 已经投了）→ 不写投递消息
-    guard8, _ = make_guard({"run-t8": "success"}, {"t8": "x"}, claimed=False)
-    out8 = await guard8.abefore_agent({"async_tasks": {"t8": task("t8", "running")}, "messages": []}, None)
-    check("ack 失败 → 不写投递消息", not (out8 or {}).get("messages"), str(out8))
     check(
-        "ack 失败 → 不记 delivered_run_id",
-        not (out8 or {}).get("async_tasks", {}).get("t8", {}).get("delivered_run_id"),
-        str(out8),
+        "check 到运行中 → 不记号、不 ack",
+        claims7b == [] and "delivered_run_id" not in running.update["async_tasks"]["t7b"],
     )
 
-    # 9. ack 成功但写 state 失败 → 撤销 ack（行退回 pending，分发者接手）
+    # 8. claim 说别人已投（False）→ 不写消息，但把"查过了"写回 state，下次不再问
+    guard8, _ = make_guard({"run-t8": "success"}, {"t8": "x"}, claimed=False)
+    out8 = await guard8.abefore_agent({"async_tasks": {"t8": task("t8", "running")}, "messages": []}, None)
+    check("claim False → 不写投递消息", not (out8 or {}).get("messages"), str(out8))
+    check(
+        "claim False → 记下 delivered_run_id（自校准，下次 O(1) 跳过）",
+        (out8 or {}).get("async_tasks", {}).get("t8", {}).get("delivered_run_id") == "run-t8",
+        str(out8),
+    )
+    claims8: list[str] = []
+
+    async def claim8(task_: dict, parent: str) -> bool:
+        claims8.append(task_["task_id"])
+        return False
+
+    guard8._claim_async = claim8  # type: ignore[method-assign]
+    state8b = {"async_tasks": (out8 or {}).get("async_tasks") or {}, "messages": []}
+    await guard8.abefore_agent(state8b, None)
+    check("自校准之后不再打 claim", claims8 == [], str(claims8))
+
+    # 8b. claim 结果未知（None）→ 不投：行留在 pending，下一轮再试（多投会重复，漏投才致命）
+    guard8b, _ = make_guard({"run-t8b": "success"}, {"t8b": "x"}, claimed=None)
+    out8b = await guard8b.abefore_agent({"async_tasks": {"t8b": task("t8b", "running")}, "messages": []}, None)
+    check("claim 不确定 → 不写投递消息", not (out8b or {}).get("messages"), str(out8b))
+    check(
+        "claim 不确定 → 也不记 delivered_run_id（下一轮还要再试）",
+        "delivered_run_id" not in (out8b or {}).get("async_tasks", {}).get("t8b", {}),
+        str(out8b),
+    )
+
+    # 9. 查摘要失败 → 根本没 claim（慢 await 前置），行不受影响，交给分发者
     guard9, _ = make_guard({"run-t9": "success"}, {"t9": "x"})
+    claims9: list[str] = []
     releases: list[str] = []
+
+    async def claim9(task_: dict, parent: str) -> bool:
+        claims9.append(task_["task_id"])
+        return True
 
     async def release(task_: dict, parent: str) -> None:
         releases.append(task_["task_id"])
 
-    guard9._release_async = release  # type: ignore[method-assign]
-
     async def broken_summary(task_: dict) -> str:
         raise RuntimeError("summary failed")
 
+    guard9._claim_async = claim9  # type: ignore[method-assign]
+    guard9._release_async = release  # type: ignore[method-assign]
     guard9._summary_async = broken_summary  # type: ignore[method-assign]
     with contextlib.suppress(RuntimeError):
         await guard9.abefore_agent({"async_tasks": {"t9": task("t9", "running")}, "messages": []}, None)
-    check("写 state 失败 → 撤销 ack", releases == ["t9"], str(releases))
-
+    check("慢 await 在 claim 之前：查摘要失败时还没 claim", claims9 == [], str(claims9))
+    check("没 claim 就不用 release", releases == [], str(releases))
 
     # 10. 故意不实现 after_agent：run 结束时不写，留给分发者开唤醒 run
     guard10, _ = make_guard({"run-t10": "success"}, {"t10": "x"})

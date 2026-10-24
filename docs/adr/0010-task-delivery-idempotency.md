@@ -92,6 +92,18 @@ RETURNING task_id          -- 0 行 = 别人已经投了，放弃
 
 写 state 失败时调 `DELETE` 把行退回 `pending`，分发者会接手。
 
+**claim 的三种结果分开处理，误差只允许朝“晚一点”**：
+
+| claim 返回 | 含义 | 动作 |
+|---|---|---|
+| `True` | 抢到了 | 投 |
+| `False` | 分发者/别的 run 已投 | 跳过，并把 `delivered_run_id` 写回 state（自校准：下次 O(1) 跳过，不再为同一条打 claim） |
+| `None` | 服务不可达/超时，不知道 | **不投**。行还在 `pending`，下一轮分发者或下一个 run 会再试 |
+
+第三行是本轮修正的一个重复源：旧实现把 `None` 当作“没投过，照投”，于是白投一遍、行还是
+`pending`，分发者随后再送一次——用户看到两张卡片。“下一次再问”跟“漏投”的区别在于行没被
+卖掉：延迟到端点恢复或下一轮，不是永久丢。
+
 #### 为什么只有 `before_agent`，没有 `after_agent`
 
 `after_agent` 曾在实现里（写进 state 并 ack），已删除。理由是它解决了错误的那半个问题：
@@ -113,13 +125,35 @@ RETURNING task_id          -- 0 行 = 别人已经投了，放弃
 **ack 发件箱行**。只记号不 ack 是个确定性重复：分发者仍当它是待投，父 run 一结束就开唤醒
 run 把同一个结果再送一遍。
 
-### 四、判重三层，各管一段
+#### 为什么不再扫 messages 找投递痕迹
+
+旧实现在 `_plan` 里扫 `state["messages"]`，找以 `[Async subagent` 开头的卡片，拿
+`task_id:` / `run_id:` 当“已投”的证据。这是把消息日志当状态源（log-as-state），两个都会
+真实发生的失效：
+
+1. **摘要会把痕迹删掉**。`create_deep_agent` 默认挂 `SummarizationMiddleware`，它的
+   `before_model` 用 `RemoveMessage(id=REMOVE_ALL_MESSAGES)` 重写整段历史；投递卡片会变成一段
+   自然语言总结，前缀和 `task_id:` 都不在了。会话一长（正是最需要判重的时候）扫描就返回空，
+   已投结果再投一遍。
+2. **模型能伪造它**。扫描不分角色，`AIMessage` 也在 `messages` 里。用户问“刚才那个结果呢”，
+   模型复述一段带 `[Async subagent …` / `task_id:` / `run_id:` 的文本就被当成已投——真结果
+   反而永远不投。
+
+现在判重只认 `delivered_run_id`（state 里的键控字段，随 checkpoint 走）。代价：state 里
+没记的已投任务，下一次 run 会走一次 claim；`False` 时把 `delivered_run_id` 写回，之后收敛
+到 O(1)。**这条账也顺手把 O(n) 消息扫描删掉了**（每 run 扫全部历史），理由不是性能，而是
+扫的是一个不可信的来源。
+
+### 四、判重两层，各管一段
 
 | 层 | 位置 | 管什么 |
 |---|---|---|
 | 发件箱行状态 | `async_task_outbox.status` | **这次结果投没投过**（跨进程、跨 run 的唯一真相；`check_async_task` 命中时也在这里 ack） |
-| `delivered_run_id` | 父 state 的 `async_tasks[task_id]` | **同一个 run 只投一次**（模型自己 `check_async_task` 也算已投） |
-| 投递消息本身 | 父 state 的 messages | 兜底：消息在、行状态丢了（比如 ack 前崩溃）也不重复写；唤醒 run 的 input 自带标记，所以它天然跳过自己那批 |
+| `delivered_run_id` | 父 state 的 `async_tasks[task_id]` | **同一个 run 只投一次**（模型自己 `check_async_task` 也算已投）；同时是发件箱行的本地缓存，省掉重复 claim |
+
+“消息历史里有没有那张卡片”不再是判据。它只是个 UI 产物，能被摘要删掉、能被模型复述伪造；
+唤醒 run 的 input 自带标记这件事也不再需要——那一轮 `abefore_agent` 会因为
+`delivered_run_id` 已记而跳过。
 
 ## 三种并发场景的行为
 
@@ -154,7 +188,10 @@ run 把同一个结果再送一遍。
   没有 `after_agent` 意味着 run 期间完成的结果不会再顺手落进当前 run，**必然多一轮 LLM**——
   换来的是模型能对结果说话。
 - **保底语义是 at-least-once**：ack 与 state 写入不在同一事务里，崩溃窗口内可能多投一次；
-  投递消息带 `task_id` / `run_id` 标记，前端与 guard 都按标记判重，重复卡片比丢结果更可接受。
+  投递消息带 `task_id` / `run_id` 标记，前端按标记渲染，重复卡片比丢结果更可接受。
+  慢 await（查子线程摘要）已全部前置到 claim 之前，claim 成功到写 state 之间没有 await，
+  取消（Ctrl+C 两下 / drain 超时）也插不进去；万一真撞上，`except BaseException` 会尽力
+  把行退回 `pending`。
 - **`interrupted` 的结果不主动投**：取消/被顶掉的子 run 没有完整结论，用户下次发言时由
   `check_async_task` 或下一次 hook 带出。
 - 主管 run 中途想拿结果仍然只能靠模型自己 `check_async_task`（提示词里写成硬口径）；
@@ -173,11 +210,12 @@ run 把同一个结果再送一遍。
 | 4 | **“取全文”只有 `check_async_task` 一条路** | specs 为空（#1/#2）或工具未挂 | 模型无法自救，只能等投递或自己读空间文件 | 卡片只有 500 字摘要（带截断标记），所以这条路断了就是“看不到全文” |
 | 5 | **分发者不知道“父线程长期 busy”** | 用户一直不停发消息 | 发件箱行长期 `pending`（`next_attempt_at` 每 2s 后移），没有告警 | 结果是“晚到”不是“丢”；需要时加 metric/告警 |
 | 6 | **`_claim_batch` 没有 `claimed_by` 列**（只有租约时间） | 两个进程同时领到同一行 | 极小窗口内可能开两轮唤醒 run | 已留 `shortcut:` 注释；要根治就加 `claimed_by`（与 `runs` 表同款租约） |
-| 7 | **ack 与 state 写入不同事务** | 进程在两者之间崩溃 | 可能多一张卡片（不会重复写 state，消息带 `task_id`/`run_id` 标记） | at-least-once 的固有代价 |
+| 7 | **ack 与 state 写入不同事务** | 进程在两者之间被硬杀（kill -9 / OOM / drain 超时被 cancel） | 行已是 `delivered`、消息没写进对话 → 结果永久丢 | 已缩窗口：慢 await 全部前置到 claim 之前，claim 后无 await；`except BaseException` + 尽力 release。仍剩“claim 成功后进程瞬死”的理论缺口（cross-storage dual write，无单库解法） |
 | 8 | **`failed` 行不再被分发者重试** | 连续 10 次建 run 失败 | 只剩父 run 的 hook 能把它写进 state；用户不再说话就一直看不到 | 有意为之（避免无限重试打爆日志/队列）；`delivery_api` 仍允许 guard 抢 `failed` 行 |
 | 9 | **用户手动发起的 run 仍没有幂等键** | 前端重复提交 / 两个标签页 | 可能与唤醒 run 并发写同一线程（aegra 不拦同线程并发 run，`design.md §9 #4`） | `run_id` 幂等键只在分发者内部用；平台层要根治见下方 Considered Options |
 | 10 | **子线程当父线程（嵌套派活）会缺 spaces** | 未来支持嵌套 | 子线程属主是服务账号，`user_space` 里没有它的行 → 唤醒 run specs 为空 | 当前禁止嵌套，不影响 |
-| 11 | **guard 的 spec 必须带 `headers`**：`_claim_async` 用 `spec['headers']` 鉴权，缺了就是 401，而 401 与网络错误一样被归为 `None`（“无法判定，宁可多一条”） | `domain_specs()` 漏给 headers，或它在 run config 里被覆盖 | 行永远停在 `pending`：这次不重复，但父 run 一结束分发者会再投一遍 → 用户看到两张一样的卡片，且日志只有 `task_delivery_claim_undetermined` | 线上 `domain_specs()` 恒带服务 token，暂不触发；要根治就让 `_claim_async` 把 401/403 当 `False`（= 别人已投，明确不写），而不是 `None` |
+| 11 | **guard 的 spec 必须带 `headers`**：`_claim_async` 用 `spec['headers']` 鉴权，缺了就是 401，而 401 与连不上一样被归为 `None`（不知道） | `domain_specs()` 漏给 headers，或它在 run config 里被覆盖 | guard 永远抢不到 → 这一轮投不出去（不重复），行留给分发者；分发者是服务端内部调用，不受这个鉴权影响，所以结果最终会到，只是晚一步 | 线上 `domain_specs()` 恒带服务 token，暂不触发；要根治就让 `_claim_async` 把 401/403 当 `False`（“我投不出去，让人接手”）而不是 `None` |
+| 12 | **claim 端点长期不可用时结果会一直推迟** | 服务自调挂了（自己打自己的 `deliver-claim`） | 行停在 `pending`、`next_attempt_at` 不断后移；结果晚到而不是丢（端点恢复、下一轮 run 或分发者接手） | 有意为之：比“不确定就投”好——后者会重复。日志 `task_delivery_claim_undetermined` 是排查入口，需要时加 metric |
 
 配套的用户可见症状与处置见 `README_zh.md §8 常见问题`。
 

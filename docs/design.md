@@ -108,12 +108,18 @@ run_id 是确定性的，重试赚主键即视为已投）。guard 写 state 前
 `POST /custom/tasks/{task_id}/deliver-claim` 把行从 `pending` 原子翻成 `delivered`
 （`custom/delivery_api.py`）——**没有 advisory lock、没有时间窗口**，一行一判，
 同一批 N 个任务互不影响。
-同一路内（hook 与 hook）的判重靠 state 里的 `delivered_run_id` 字段，**不靠扫消息**
-——`check_async_task` 返回的是 `ToolMessage(json)`，扫不到会被当成未投递再投一遍。
+同一路内（hook 与 hook）的判重只靠 state 里的 `delivered_run_id` 字段。**不扫 messages**：
+摘要中间件会用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 重写历史（卡片随之消失），而模型能
+自己复述出一段带 `[Async subagent … task_id: … run_id: …` 的文本（扫到就会被当成已投递，
+真结果反而永不投）。代价：state 里没记的已投任务本轮会多一次 claim，返回 `False` 时把
+`delivered_run_id` 写回，之后收敛到 O(1) 跳过。
+
+claim 返回 `None`（服务不可达）时**不投**：行还在 `pending`，下一轮分发者或下一个 run
+会再试——多投会重复，漏投才致命，而“晚一点”两者都不是。
 
 另一个隐含要求：guard 的 spec 必须带 `headers`（服务 token）——它用同一份 spec 去
-`deliver-claim`。缺 headers 会 401，而 401 与网络错一样被归为“无法判定”，行停在
-`pending`，父 run 结束后分发者会再投一遍（`ADR-0010 §已知问题 #11`）。
+`deliver-claim`。缺 headers 就是 401，本轮抢不到（不重复），行留给分发者接手
+（`ADR-0010 §已知问题 #11`）。
 
 **成本**：每次 run 只在首尾两次核对非终态任务的真实状态（无 TTL 缓存，任务终态后不再查）；
 run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表），不读 thread state；

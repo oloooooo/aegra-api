@@ -118,7 +118,8 @@ _Avoid_: 把子 agent 的数量或名字写成固定值、把 prompt 写在代�
 键是 `task_id`，值同时就是子执行所在的 thread id；`agent_name` 是当时的 space 名。
 它的 `status` 是**快照**，只由
 `check_async_task`、派活前的核实或 run 首尾的投递节点刷新，不保证实时。
-`delivered_run_id` 记的是“这个 run 的结果已经进过主管上下文”。
+`delivered_run_id` 记的是“这个 run 的结果已入上下文”（与发件箱行的“已兑付”区分：前者是
+本地的判重位点，丢了能重建；后者才是跨进程的唯一真相）。
 一个主管能派多少个并发异步任务**没有业务上限**，它们会在服务端排队（见 Thread quota）。
 _Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态查 `GET /custom/tasks/{id}`）
 
@@ -141,9 +142,12 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 这里的 `busy` 指**父线程上有活跃 run 行**（`runs.status` 为 `pending` / `running`），
 不是 `thread.status`：前者是分发者的判据，后者只是给人看的状态字。
 两条路都以 `(task_id, run_id)` 为键：子 run 终态时 `finalize_run` 写一行发件箱
-`async_task_outbox`（主键即幂等键），投递前把行从 `pending` 原子翻成 `delivered`，
-翻不成就说明别人已投。投过的任务在 state 里留 `delivered_run_id`，模型自己
-`check_async_task` 拿到终态结果的也算已投。
+`async_task_outbox`（主键即幂等键）。投递前把行从 `pending` 原子翻成 `delivered`——这一步叫
+**已兑付**，是跨进程、跨 run 的唯一真相：翻不成就说明别人已投，放弃；**返回不了结果时也不投**
+（行没卖掉，下一轮再试，最坏是晚而不是丢）。投过的任务在父 state 里留 `delivered_run_id`，
+叫**已入上下文**：它只是已兑付的本地缓存，丢失能重建（最多多一次 claim），所以不能拿它
+当唯一依据，更不能拿“消息历史里有没有那张卡片”当依据——摘要会删掉它，模型也能复述伪造它。
+模型自己 `check_async_task` 拿到终态结果的，同样记为已入上下文并发起已兑付。
 投递消息只带前 500 字摘要与截断标记，**全文只从 `check_async_task` 取**。
 发件箱表 / ack 接口 / 分发者见 `custom/models.py`、`custom/delivery_api.py`、
 `custom/outbox_dispatcher.py`（ADR-0010）。

@@ -74,7 +74,7 @@ guard 自己不存任何跨请求状态（旧版的名额账本已随 ADR-0008 �
 ===============================================================================
 
   A. 文本与判重    _TERMINAL, _now(), _shorten(), _message_text(),
-                   _delivered_pairs(), _is_delivered(), _completion_text(),
+                   _delivered(), _completion_text(),
                    _thread_summary()
   B. 派活          AsyncTaskGuard._key/_sync_client/_async_client, _prepare(),
                    _config_for(), _thread_meta(), _task(), _launched(),
@@ -88,7 +88,7 @@ guard 自己不存任何跨请求状态（旧版的名额账本已随 ADR-0008 �
 
 from __future__ import annotations
 
-import re
+import contextlib
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -112,9 +112,6 @@ _TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"
 
 # 投递账本标记：格式定义在 custom/outbox.py（与分发者、finalize_run 共用同一口径）
 _TASK_MARK = "task_id: "
-_TASK_ID_RE = re.compile(r"task_id: ([0-9a-zA-Z_-]+)")
-# 判重键含 run_id：update_async_task 会给同一任务开新 run，只认 task_id 会吞掉第二次结果
-_RUN_ID_RE = re.compile(r"run_id: ([0-9a-zA-Z_-]+)")
 
 
 # ============================ A. 文本与判重（纯函数） ============================
@@ -134,32 +131,20 @@ def _message_text(msg: Any) -> str:
     return message_text(msg)
 
 
-def _delivered_pairs(messages: Any) -> set[tuple[str, str]]:
-    """messages 里已投递过的 (task_id, run_id)。
+def _delivered(task: dict[str, Any]) -> bool:
+    """这个 run 的结果是否已经入过主管上下文。
 
-    只认**投递消息**（`[Async subagent …` 前缀）：派活工具消息里也有 `task_id:`，
-    拿它当判据会把"还没投递"误判成"已投递"，结果永远不投。
-    """
-    out: set[tuple[str, str]] = set()
-    for msg in messages or []:
-        text = _message_text(msg)
-        if not text.startswith("[Async subagent"):
-            continue
-        task = _TASK_ID_RE.search(text)
-        run = _RUN_ID_RE.search(text)
-        if task and run:
-            out.add((task.group(1), run.group(1)))
-    return out
+    只认 `delivered_run_id`（state 里的键控字段，随 checkpoint 走），**不扫 messages**：
+    ① 摘要中间件用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 重写整段历史，投递卡片的痕迹
+    会消失，扫不到就再投一遍；② 模型自己能写出一条带同样前缀的消息，扫到就当成已
+    投递，真结果反而永远不投。判重必须偏保守（倾向判"未投"）：多投可见，漏投静默
+    且不可恢复。
 
-
-def _is_delivered(task: dict[str, Any], pairs: set[tuple[str, str]]) -> bool:
-    """这个 run 的结果是否已经进过主管上下文。
-
-    两个来源：投递消息（跨 run/跨进程都看得见），以及 `delivered_run_id`
-    （模型自己 check 拿到终态结果时记下的，见 `_mark_checked`）。
+    代价：state 里没记下的已投任务，本轮会走一次 claim（见 `_deliver`），判过一次就
+    写回这里，之后 O(1) 跳过。
     """
     run_id = task.get("run_id") or ""
-    return task.get("delivered_run_id") == run_id or (task["task_id"], run_id) in pairs
+    return bool(run_id) and task.get("delivered_run_id") == run_id
 
 
 def _completion_text(task: dict[str, Any], summary: str) -> str:
@@ -260,9 +245,7 @@ class AsyncTaskGuard(AgentMiddleware):
         }
 
     @staticmethod
-    def _launched(
-        request: ToolCallRequest, task: dict[str, Any], refreshed: dict[str, dict[str, Any]]
-    ) -> Command[Any]:
+    def _launched(request: ToolCallRequest, task: dict[str, Any], refreshed: dict[str, dict[str, Any]]) -> Command[Any]:
         """派活成功的 state 更新：工具消息 + 新任务 + 顺手刷新的旧任务状态。"""
         return Command(
             update={
@@ -504,13 +487,21 @@ class AsyncTaskGuard(AgentMiddleware):
         if not parent_thread_id or spec is None or not spec.get("url"):
             return None
         endpoint = f"{str(spec['url']).rstrip('/')}/custom/tasks/{task['task_id']}/deliver-claim"
-        return endpoint, {
-            "parent_thread_id": parent_thread_id,
-            "run_id": task.get("run_id"),
-        }, dict(spec.get("headers") or {})
+        return (
+            endpoint,
+            {
+                "parent_thread_id": parent_thread_id,
+                "run_id": task.get("run_id"),
+            },
+            dict(spec.get("headers") or {}),
+        )
 
     async def _claim_async(self, task: dict[str, Any], parent_thread_id: str) -> bool | None:
-        """抢投递权：True 抢到 / False 别人投过 / None 无法判定（照常投，宁可多一条）。"""
+        """抢投递权：True 抢到 / False 别人投过 / None 不知道（调用方据此**不投**，等下一轮）。
+
+        None 不能当“没投过”：投了行还是 pending，分发者会再送一遍（两张卡片）。
+        行没卖掉就不算漏——端点恢复、下一轮 run 或分发者接手时会再试。
+        """
         req = self._claim_endpoint(self._spec_of(task), task, parent_thread_id)
         if req is None:
             return None
@@ -537,12 +528,9 @@ class AsyncTaskGuard(AgentMiddleware):
             logger.warning("task_delivery_release_failed", task_id=task.get("task_id"))
 
     @staticmethod
-    def _plan(
-        state: Any, fresh: dict[str, str | None]
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    def _plan(state: Any, fresh: dict[str, str | None]) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
         """(要写回 state 的状态更新, 待投递任务)。fresh 只含本轮查到的非终态任务新状态。"""
         tasks = (state or {}).get("async_tasks") or {}
-        delivered = _delivered_pairs((state or {}).get("messages") or [])
         changed: dict[str, dict[str, Any]] = {}
         pending: list[dict[str, Any]] = []
         for task_id, task in tasks.items():
@@ -553,43 +541,65 @@ class AsyncTaskGuard(AgentMiddleware):
                     status = new
                     changed[task_id] = {**task, "status": status, "last_checked_at": _now()}
             # 工具路径可能已把 state 写成终态却没投递（_refreshed_* 只改状态），这里补投
-            if status in _TERMINAL and not _is_delivered(task, delivered):
+            if status in _TERMINAL and not _delivered(task):
                 pending.append({**task, "status": status})
         return changed, pending
 
     async def _deliver(self, state: Any) -> dict[str, Any] | None:
         """把"已完成且未投递"的子任务结果写进本次 run 的 state。
 
-        只有 `before_agent` 一个调用点（run 首一次）：补上 run 开始前就已终态、还没进过
+        只有 `before_agent` 一个调用点（run 首一次）：补上 run 开始前就已终态、还没入过
         主管上下文的结果。run 期间完成的结果不在这里写——那时模型这轮的回答已经定了，
         写进去反而让它没机会反应；那种情况交给发件箱分发者开一轮唤醒 run。
-        认领后若写 state 抛异常，会把认领撤掉再抛，避免结果被永久锁成「已投递」。
+
+        claim 的三种结果分开处理，误差只允许朝"晚一点"，不允许朝"漏"：
+
+        - `True`（抢到）：投。
+        - `False`（分发者/别的 run 已投）：跳过，并把 `delivered_run_id` 写回 state。
+          没这一步，每个 run 都要为同一条已投结果再打一次 claim。
+        - `None`（服务不可达/超时）：**不投**。行还在 pending，下一轮分发者或下一个 run
+          会再试。投了反而会让分发者再投一遍（行没翻，对方不知道）。
         """
         tasks = (state or {}).get("async_tasks") or {}
         fresh = {tid: t["status"] for tid, t in (await self._refreshed_async(tasks)).items()}
         changed, pending = self._plan(state, fresh)
+        if not pending:
+            return {"async_tasks": changed} if changed else None
         parent = self._parent_thread_id()
+        # 慢 await（查子线程摘要，5s 超时）全部前置：claim 成功之后到这里返回之间不能再有
+        # await，否则取消（Ctrl+C 两次 / drain 超时）会留下"行已 delivered、消息没写"的永久漏。
+        summaries = [await self._summary_async(task) for task in pending]
         texts: list[str] = []
         claimed: list[dict[str, Any]] = []
         try:
-            for task in pending:
-                if await self._claim_async(task, parent) is False:  # 分发者或别的 run 已投过
-                    logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
+            for task, summary in zip(pending, summaries, strict=True):
+                got = await self._claim_async(task, parent)
+                if got is not True:
+                    if got is False:  # 已投过：记下来，下次 O(1) 跳过
+                        logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
+                        changed[task["task_id"]] = {
+                            **changed.get(task["task_id"], task),
+                            "status": task["status"],
+                            "delivered_run_id": task.get("run_id"),
+                        }
+                    else:  # 不知道投没投：不投，行留 pending 等下一轮
+                        logger.warning("task_delivery_claim_undetermined", task_id=task.get("task_id"))
                     continue
                 claimed.append(task)
-                texts.append(_completion_text(task, await self._summary_async(task)))
-                # 记在 task 上：同路判重不再靠扫消息，check 过的也不会被再投一次
+                texts.append(_completion_text(task, summary))
                 changed[task["task_id"]] = {
                     **changed.get(task["task_id"], task),
                     "status": task["status"],
                     "delivered_run_id": task.get("run_id"),
                 }
-        except Exception:
+        except BaseException:
+            # CancelledError 不是 Exception：优雅关停 drain 超时后 cancel、Ctrl+C 两下都走
+            # 这条路。用 except Exception 会跳过 release，行就永远停在 delivered（结果再也
+            # 投不出去）。硬取消下 release 尽力而为，失败只记日志。
             for task in claimed:
-                await self._release_async(task, parent)
+                with contextlib.suppress(BaseException):
+                    await self._release_async(task, parent)
             raise
-        if not changed and not texts:
-            return None
         out: dict[str, Any] = {}
         if changed:
             out["async_tasks"] = changed
@@ -597,7 +607,7 @@ class AsyncTaskGuard(AgentMiddleware):
             out["messages"] = [HumanMessage(content=t) for t in texts]
             # 投递成功才留痕：查日志时能分清"这轮谁投的"与"分发者另开的"
             logger.info("task_results_delivered", tasks=[t["task_id"] for t in claimed], count=len(texts))
-        return out
+        return out or None
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         """run 开始：补上此前已终态、还没进过主管上下文的结果。
@@ -620,8 +630,8 @@ class AsyncTaskGuard(AgentMiddleware):
     def _mark_checked(request: ToolCallRequest, result: Any) -> dict[str, Any] | None:
         """模型自己 check 到终态结果时补记 `delivered_run_id`；是终态则返回被 check 的任务。
 
-        check 返回的是 ToolMessage(json)，扫消息的判重认不出它；这里在 state 的 task 上
-        留记号，`_plan` 据此跳过（精确到 run_id，update_async_task 换 run 后照常再投）。
+        判重只认这个字段（不扫 messages：摘要会删掉卡片、模型又能伪造前缀），所以模型
+        自己看到终态结果也得在这里留记号，否则下一个 run 会认为它没投过。
         返回值供调用方 ack 发件箱行——只记号不 ack 的话，分发者仍当它是待投，
         父 run 一结束就开唤醒 run 把同一个结果再送一遍（用户看到两张一样的卡片）。
         """

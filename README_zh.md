@@ -319,11 +319,14 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 两条路不重复：发件箱行 `async_task_outbox` 的主键就是 `(task_id, run_id)`，投递前先用
 `POST /custom/tasks/{id}/deliver-claim` 把行从 `pending` **原子翻成 `delivered`**，
 翻不成就说明别人已投（单行条件 UPDATE，没有时间窗口、没有 advisory lock）。
-投过的任务在 state 里留 `delivered_run_id`，所以模型自己 check 过的结果不会被再投一遍。
+**抢不到就直接不投**（包括请求超时、服务不可达）——行还在 `pending`，下一轮分发者或下一轮
+run 会再试；只有“确实抢到”才投，所以同一个结果不会出两张卡片。
+投过的任务在 state 里留 `delivered_run_id`（它的作用只是省掉下次的 claim，丢了能重建）。
+判重只认这个字段，**不翻聊天记录找卡片**：摘要会把旧消息压成一段总结、模型自己也能复述
+一段带 `task_id:` / `run_id:` 的文本，两种都会让判重说谎。
 判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run。
 
 投递消息只带前 500 字摘要，超长时末尾带 `…[结果已截断…]`；**全文只能从 `check_async_task` 取**。
-判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run，只认 task_id 会把更新后的第二次结果当成重复丢掉。
 用表而不是读 state 判重，是因为跨进程才原子，而且不用为了查一个标记把整份对话读回来。主 prompt 另外要求模型对重复通知只更新 todo。
 
 ### 多个子任务同时完成会怎样
