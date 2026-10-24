@@ -32,9 +32,17 @@ function toView(m: api.ChatMessage, i: number): ViewMessage {
   const type = m.type ?? m.role ?? "ai";
   if (type === "human" && raw.startsWith("[Async subagent")) {
     const name = /\[Async subagent '([^']+)'/.exec(raw)?.[1] ?? "subagent";
-    // 状态通知（was cancelled / was interrupted）不带 Result:，渲染成灰色状态条而不是结果卡片
-    const role = /Result:/.test(raw) ? "callback" : "notice";
-    return { key: m.id ?? `cb-${i}`, role, content: raw.replace(/^\[Async subagent[^\]]*\]\s*(Result:\s*)?/, ""), name };
+    // 状态通知（was cancelled / was interrupted）不带 Result:，渲染成灰色状态条而不是结果卡片。
+    // 通知没有正文，所以内容要用一句人话，而不是剩下的 task_id/run_id 两行。
+    const isResult = raw.includes("Result:");
+    const content = isResult
+      ? raw.replace(/^\[Async subagent[^\]]*\]\s*(Result:\s*)?/, "")
+      : raw.includes("was cancelled")
+        ? "这个任务被取消了，没有结果"
+        : raw.includes("was interrupted")
+          ? "这个任务中途停了，没有结果"
+          : "这个任务已停止，没有结果";
+    return { key: m.id ?? `cb-${i}`, role: isResult ? "callback" : "notice", content, name };
   }
   if (type === "tool") return { key: m.id ?? `t-${i}`, role: "tool", content: raw.slice(0, 300), name: m.name ?? undefined };
   return { key: m.id ?? `${type}-${i}`, role: type === "human" ? "human" : "ai", content: raw, toolCalls: !!m.tool_calls?.length };
