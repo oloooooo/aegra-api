@@ -70,7 +70,18 @@ def notice_text(
 
     和 `completion_text` 共用 `[Async subagent` 前缀（前端靠它识别成子任务事件），
     但第二段是状态而不是结果——前端据此渲染灰色状态条，而不是「子任务返回结果」卡片。
+
+    `cancelled` 额外带一句“别自己重派”：用户点停止就是不想再跑，而主管被唤醒时
+    看到待办还差这一项，会自作主张重新派发（实测过一次：取消后主管 3 秒又派了同名任务）。
+    `interrupted`（HITL）不加——那种现场还在，本来就该续。
     """
     name = agent_name or "subagent"
     reason = {"cancelled": "was cancelled", "interrupted": "was interrupted"}.get(status or "", f"stopped ({status})")
-    return f"{PREFIX} '{name}' {reason}]\n\ntask_id: {task_id}\nrun_id: {run_id or ''}"
+    body = f"{PREFIX} '{name}' {reason}]\n\ntask_id: {task_id}\nrun_id: {run_id or ''}"
+    if status == "cancelled":
+        body += (
+            "\n\nThe user cancelled this task, so it will never produce a conclusion."
+            " Do not re-dispatch or retry it on your own; if the user's request still"
+            " needs it, ask the user first."
+        )
+    return body
