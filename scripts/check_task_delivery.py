@@ -26,7 +26,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from custom.outbox import completion_text, is_long_result, result_body
-from graphs.async_task_guard import AsyncTaskGuard, _completion_text
+from graphs.async_task_guard import AsyncTaskGuard, _completion_text, _status_of_run
 
 FAILS: list[str] = []
 
@@ -235,6 +235,59 @@ async def guard_checks() -> None:
         await guard9.abefore_agent({"async_tasks": {"t9": task("t9", "running")}, "messages": []}, None)
     check("慢 await 在 claim 之前：查摘要失败时还没 claim", claims9 == [], str(claims9))
     check("没 claim 就不用 release", releases == [], str(releases))
+
+    # 9b. 取消（cancelled）：只发状态通知，不当结果投、不占发件箱行
+    guard9b, _ = make_guard({}, {})
+    claims9b: list[str] = []
+
+    async def claim9b(task_: dict, parent: str) -> bool:
+        claims9b.append(task_["task_id"])
+        return True
+
+    guard9b._claim_async = claim9b  # type: ignore[method-assign]
+    state9b = {"async_tasks": {"t9b": {**task("t9b", "cancelled")}}, "messages": []}
+    out9b = await guard9b.abefore_agent(state9b, None)
+    texts9b = [m.content for m in (out9b or {}).get("messages") or []]
+    check("cancelled → 写一条状态通知", len(texts9b) == 1, str(texts9b))
+    check("状态通知不带 Result:", "Result:" not in texts9b[0], texts9b[0])
+    check("状态通知文案标明 cancelled", "was cancelled" in texts9b[0], texts9b[0])
+    check("cancelled 不去抢发件箱行", claims9b == [], str(claims9b))
+    check(
+        "cancelled 记 notified_run_id，不写 delivered_run_id",
+        (out9b or {}).get("async_tasks", {}).get("t9b", {}).get("notified_run_id") == "run-t9b"
+        and "delivered_run_id" not in (out9b or {}).get("async_tasks", {}).get("t9b", {}),
+        str(out9b),
+    )
+
+    # 9c. 同一条通知不重复发；但换了 run 就要重新通知
+    check(
+        "已通知过 → 不再重复",
+        await guard9b.abefore_agent({"async_tasks": (out9b or {}).get("async_tasks") or {}, "messages": []}, None)
+        is None,
+    )
+    rerun = {"async_tasks": {"t9b": {**task("t9b", "cancelled"), "run_id": "run-t9b-2", "notified_run_id": "run-t9b"}}}
+    check("换了 run → 重新通知", bool(((await guard9b.abefore_agent(rerun, None)) or {}).get("messages")))
+
+    # 9d. 服务端 interrupted_by 映射成两个词
+    check(
+        "interrupted_by=cancel → cancelled",
+        _status_of_run({"status": "interrupted", "interrupted_by": "cancel"}) == "cancelled",
+    )
+    check(
+        "interrupted_by=hitl → interrupted",
+        _status_of_run({"status": "interrupted", "interrupted_by": "hitl"}) == "interrupted",
+    )
+    check("其他状态原样通过", _status_of_run({"status": "success"}) == "success")
+
+    # 9e. check 到 cancelled 不算"已入上下文"（没有结果可记）
+    guard9e, _ = make_guard({}, {})
+    cancelled_cmd = Command(update={"messages": [], "async_tasks": {"t9e": {**task("t9e", "cancelled")}}})
+    await guard9e._amark_checked(request, cancelled_cmd)
+    check(
+        "check 到 cancelled → 不记 delivered_run_id",
+        "delivered_run_id" not in cancelled_cmd.update["async_tasks"]["t9e"],
+        str(cancelled_cmd.update),
+    )
 
     # 10. 故意不实现 after_agent：run 结束时不写，留给分发者开唤醒 run
     guard10, _ = make_guard({"run-t10": "success"}, {"t10": "x"})

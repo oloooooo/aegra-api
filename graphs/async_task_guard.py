@@ -102,18 +102,37 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
-from custom.outbox import completion_text, is_long_result, message_text, result_body
+from custom.outbox import completion_text, is_long_result, message_text, notice_text, result_body
 from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
 
-_TERMINAL = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
+# 子 run 的终态分成两类：能当"结果"投的，和只能当"状态"通知的。
+# interrupted 单独归通知类——它意味着这一轮没跑完，把半截内容当结论投给主管是误导。
+_RESULTS = frozenset({"success", "error", "timeout"})
+_NOTICES = frozenset({"cancelled", "interrupted"})
+_TERMINAL = _RESULTS | _NOTICES
 
 # 投递账本标记：格式定义在 custom/outbox.py（与分发者、finalize_run 共用同一口径）
 _TASK_MARK = "task_id: "
 
 
 # ============================ A. 文本与判重（纯函数） ============================
+
+
+def _status_of_run(run: dict[str, Any]) -> str | None:
+    """服务端 run → 父 state 里的任务状态。
+
+    `interrupted` 在服务端是一个词，靠 `interrupted_by` 区分两件事：
+    - `cancel`（客户端取消 / 被顶掉）→ `cancelled`：这一轮作废，没有结果
+    - `hitl`（图停在人工确认点）→ `interrupted`：现场还在，理论上可续
+    不映射的话父 state 里 `cancelled`（工具写的）会被刷成 `interrupted`（服务端写的），
+    同一个状态两个词，判重和通知都会错。
+    """
+    status = run.get("status")
+    if status != "interrupted":
+        return status
+    return "cancelled" if run.get("interrupted_by") == "cancel" else "interrupted"
 
 
 def _now() -> str:
@@ -139,6 +158,17 @@ def _delivered(task: dict[str, Any]) -> bool:
     """
     run_id = task.get("run_id") or ""
     return bool(run_id) and task.get("delivered_run_id") == run_id
+
+
+def _notified(task: dict[str, Any]) -> bool:
+    """这个 run 的**状态**是否已经告诉过主管（取消 / 中断）。
+
+    和 `_delivered` 分开两个键：cancelled 没有"结果"，不能写 `delivered_run_id`
+    （那会让这条 run 后续真出了结果时被永久跳过）；反过来，结果投递也不该把
+    `notified_run_id` 当成证据。
+    """
+    run_id = task.get("run_id") or ""
+    return bool(run_id) and task.get("notified_run_id") == run_id
 
 
 def _completion_text(task: dict[str, Any], summary: str) -> str:
@@ -434,7 +464,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 run = self._sync_client(spec).runs.get(task["thread_id"], task["run_id"])
             except Exception:  # noqa: BLE001
                 continue
-            status = run.get("status")
+            status = _status_of_run(run)
             if status and status != task.get("status"):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out
@@ -449,7 +479,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 run = await self._async_client(spec).runs.get(task["thread_id"], task["run_id"])
             except Exception:  # noqa: BLE001
                 continue
-            status = run.get("status")
+            status = _status_of_run(run)
             if status and status != task.get("status"):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out
@@ -525,67 +555,66 @@ class AsyncTaskGuard(AgentMiddleware):
             logger.warning("task_delivery_release_failed", task_id=task.get("task_id"))
 
     @staticmethod
-    def _plan(state: Any, fresh: dict[str, str | None]) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-        """(要写回 state 的状态更新, 待投递任务)。fresh 只含本轮查到的非终态任务新状态。"""
+    def _plan(
+        state: Any, fresh: dict[str, str | None]
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """(要写回 state 的状态更新, 待投递结果, 待发状态通知)。
+
+        结果和通知分成两路，因为判重键不同、投递通道也不同：
+
+        - **结果**（`success` / `error` / `timeout`）：占发件箱行，靠 claim 互斥，
+          记 `delivered_run_id`；
+        - **状态**（`cancelled` / `interrupted`）：这一轮没跑完，**不能**把半截内容
+          当结论。只通知状态，记 `notified_run_id`。
+
+        `fresh` 只含本轮查到的非终态任务新状态。
+        """
         tasks = (state or {}).get("async_tasks") or {}
         changed: dict[str, dict[str, Any]] = {}
-        pending: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+        notices: list[dict[str, Any]] = []
         for task_id, task in tasks.items():
-            status = task.get("status")
+            status = task.get("status") or ""
             if status not in _TERMINAL:
                 new = fresh.get(task_id)
                 if new and new != status:
                     status = new
                     changed[task_id] = {**task, "status": status, "last_checked_at": _now()}
-            # 工具路径可能已把 state 写成终态却没投递（_refreshed_* 只改状态），这里补投
-            if status in _TERMINAL and not _delivered(task):
-                pending.append({**task, "status": status})
-        return changed, pending
+            # 工具路径可能已把 state 写成终态却没投递/没通知（_refreshed_* 只改状态），这里补
+            current = {**task, "status": status}
+            if status in _RESULTS and not _delivered(current):
+                results.append(current)
+            elif status in _NOTICES and not _notified(current):
+                notices.append(current)
+        return changed, results, notices
 
-    async def _deliver(self, state: Any) -> dict[str, Any] | None:
-        """把"已完成且未投递"的子任务结果写进本次 run 的 state。
-
-        只有 `before_agent` 一个调用点（run 首一次）：补上 run 开始前就已终态、还没入过
-        主管上下文的结果。run 期间完成的结果不在这里写——那时模型这轮的回答已经定了，
-        写进去反而让它没机会反应；那种情况交给发件箱分发者开一轮唤醒 run。
-
-        claim 的三种结果分开处理，误差只允许朝"晚一点"，不允许朝"漏"：
-
-        - `True`（抢到）：投。
-        - `False`（分发者/别的 run 已投）：跳过，并把 `delivered_run_id` 写回 state。
-          没这一步，每个 run 都要为同一条已投结果再打一次 claim。
-        - `None`（服务不可达/超时）：**不投**。行还在 pending，下一轮分发者或下一个 run
-          会再试。投了反而会让分发者再投一遍（行没翻，对方不知道）。
-        """
-        tasks = (state or {}).get("async_tasks") or {}
-        fresh = {tid: t["status"] for tid, t in (await self._refreshed_async(tasks)).items()}
-        changed, pending = self._plan(state, fresh)
-        if not pending:
-            return {"async_tasks": changed} if changed else None
+    async def _deliver_results(self, tasks: list[dict[str, Any]], changed: dict[str, dict[str, Any]]) -> list[str]:
+        """对终态结果抢发件箱行并生成投递正文。claim 三态见 `_deliver` 的 docstring。"""
         parent = self._parent_thread_id()
-        # 慢 await（查子线程摘要，5s 超时）全部前置：claim 成功之后到这里返回之间不能再有
-        # await，否则取消（Ctrl+C 两次 / drain 超时）会留下"行已 delivered、消息没写"的永久漏。
-        summaries = [await self._summary_async(task) for task in pending]
+        # 慢 await（查子线程摘要）全部前置：claim 成功之后到返回之间不能再有 await，
+        # 否则取消（Ctrl+C 两次 / drain 超时）会留下"行已 delivered、消息没写"的永久漏。
+        summaries = [await self._summary_async(task) for task in tasks]
         texts: list[str] = []
         claimed: list[dict[str, Any]] = []
         try:
-            for task, summary in zip(pending, summaries, strict=True):
+            for task, summary in zip(tasks, summaries, strict=True):
                 got = await self._claim_async(task, parent)
+                task_id = task["task_id"]
                 if got is not True:
                     if got is False:  # 已投过：记下来，下次 O(1) 跳过
-                        logger.info("task_delivery_skipped_claim", task_id=task.get("task_id"))
-                        changed[task["task_id"]] = {
-                            **changed.get(task["task_id"], task),
+                        logger.info("task_delivery_skipped_claim", task_id=task_id)
+                        changed[task_id] = {
+                            **changed.get(task_id, task),
                             "status": task["status"],
                             "delivered_run_id": task.get("run_id"),
                         }
                     else:  # 不知道投没投：不投，行留 pending 等下一轮
-                        logger.warning("task_delivery_claim_undetermined", task_id=task.get("task_id"))
+                        logger.warning("task_delivery_claim_undetermined", task_id=task_id)
                     continue
                 claimed.append(task)
                 texts.append(_completion_text(task, summary))
-                changed[task["task_id"]] = {
-                    **changed.get(task["task_id"], task),
+                changed[task_id] = {
+                    **changed.get(task_id, task),
                     "status": task["status"],
                     "delivered_run_id": task.get("run_id"),
                 }
@@ -597,13 +626,53 @@ class AsyncTaskGuard(AgentMiddleware):
                 with contextlib.suppress(BaseException):
                     await self._release_async(task, parent)
             raise
+        if texts:
+            logger.info("task_results_delivered", tasks=[t["task_id"] for t in claimed], count=len(texts))
+        return texts
+
+    @staticmethod
+    def _notices(tasks: list[dict[str, Any]], changed: dict[str, dict[str, Any]]) -> list[str]:
+        """状态通知：不占发件箱行、不查子线程，直接生成一条独立文案。"""
+        out: list[str] = []
+        for task in tasks:
+            out.append(notice_text(task["task_id"], task.get("run_id"), task.get("agent_name"), task.get("status")))
+            changed[task["task_id"]] = {
+                **changed.get(task["task_id"], task),
+                "status": task["status"],
+                "notified_run_id": task.get("run_id"),
+            }
+        logger.info("task_status_notified", tasks=[t["task_id"] for t in tasks], count=len(out))
+        return out
+
+    async def _deliver(self, state: Any) -> dict[str, Any] | None:
+        """把"已经终态、主管还不知道"的子任务写进本次 run 的 state。
+
+        只有 `before_agent` 一个调用点（run 首一次）：补上 run 开始前就已终态、还没入过
+        主管上下文的结果/状态。run 期间完成的等分发者开唤醒 run——那时模型这轮的回答
+        已经定了，写进去它没机会反应。
+
+        结果投递的 claim 三态，误差只允许朝"晚一点"，不允许朝"漏"：
+
+        - `True`（抢到）：投。
+        - `False`（分发者/别的 run 已投）：跳过，并把 `delivered_run_id` 写回 state。
+          没这一步，每个 run 都要为同一条已投结果再打一次 claim。
+        - `None`（服务不可达/超时）：**不投**。行还在 pending，下一轮分发者或下一个 run
+          会再试。投了反而会让分发者再投一遍（行没翻，对方不知道）。
+
+        状态通知（cancelled / interrupted）没有发件箱行，也不调 claim：它告知的是"这轮
+        没跑完"，不是结论，所以不存在"谁先投"的竞争。
+        """
+        tasks = (state or {}).get("async_tasks") or {}
+        fresh = {tid: t["status"] for tid, t in (await self._refreshed_async(tasks)).items()}
+        changed, results, notices = self._plan(state, fresh)
+        texts = await self._deliver_results(results, changed) if results else []
+        if notices:
+            texts.extend(self._notices(notices, changed))
         out: dict[str, Any] = {}
         if changed:
             out["async_tasks"] = changed
         if texts:
             out["messages"] = [HumanMessage(content=t) for t in texts]
-            # 投递成功才留痕：查日志时能分清"这轮谁投的"与"分发者另开的"
-            logger.info("task_results_delivered", tasks=[t["task_id"] for t in claimed], count=len(texts))
         return out or None
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
@@ -638,7 +707,7 @@ class AsyncTaskGuard(AgentMiddleware):
         if task is None or not isinstance(update, dict):
             return None
         checked = (update.get("async_tasks") or {}).get(task_id) or {}
-        if checked.get("status") not in _TERMINAL:
+        if checked.get("status") not in _RESULTS:  # cancelled/interrupted 没有结果可记
             return None
         update["async_tasks"] = {
             **(update.get("async_tasks") or {}),

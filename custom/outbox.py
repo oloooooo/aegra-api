@@ -20,6 +20,7 @@ PREFIX = "[Async subagent"
 # 提醒调大上下文 / 拆任务，不静默切文本。
 LONG_RESULT_WARN = 3000
 
+
 def result_body(text: str) -> str:
     """投递正文：原文返回，不截断。"""
     return text
@@ -57,3 +58,19 @@ def completion_text(
         else f"{PREFIX} '{name}' has stopped ({status})] Result: {summary}"
     )
     return f"{head}\n\ntask_id: {task_id}\nrun_id: {run_id or ''}"
+
+
+def notice_text(
+    task_id: str,
+    run_id: str | None,
+    agent_name: str | None,
+    status: str | None,
+) -> str:
+    """状态通知正文：只说"它停了/它被取消了"，**不带 Result**。
+
+    和 `completion_text` 共用 `[Async subagent` 前缀（前端靠它识别成子任务事件），
+    但第二段是状态而不是结果——前端据此渲染灰色状态条，而不是「子任务返回结果」卡片。
+    """
+    name = agent_name or "subagent"
+    reason = {"cancelled": "was cancelled", "interrupted": "was interrupted"}.get(status or "", f"stopped ({status})")
+    return f"{PREFIX} '{name}' {reason}]\n\ntask_id: {task_id}\nrun_id: {run_id or ''}"
