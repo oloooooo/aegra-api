@@ -111,7 +111,6 @@ class AsyncTaskOutbox(Base):
     parent_thread_id: Mapped[str] = mapped_column(String(64), comment="主管线程 id")
     agent_name: Mapped[str | None] = mapped_column(String(64), comment="子 agent 名（子线程的 graph_id）")
     terminal_status: Mapped[str] = mapped_column(String(32), comment="子 run 的终态：success / error / timeout")
-    summary: Mapped[str | None] = mapped_column(Text, comment="结果摘要（写入时截断，全文走 check_async_task）")
 
     status: Mapped[str] = mapped_column(
         String(16), default="pending", server_default="pending", comment="pending / delivered / failed"

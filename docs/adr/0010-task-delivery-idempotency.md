@@ -33,13 +33,13 @@
 就在**同一个事务**里插一行 `async_task_outbox`：
 
 ```sql
-INSERT INTO async_task_outbox (task_id, run_id, parent_thread_id, agent_name, terminal_status, summary)
+INSERT INTO async_task_outbox (task_id, run_id, parent_thread_id, agent_name, terminal_status)
 ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不会插第二行
 ```
 
 - `task_id` = 子线程 id，`run_id` = 这次执行；
-- `summary` = 终态 state 里最后一条消息（截断 500 字，**只是现查失败时的兜底值**；
-  投递正文不走这一列，见下方《正文为什么不截断》）；
+- **不存结果正文**：子 run 不流 `values`，`output` 是空字典，存进去只会是 `(no output)`。
+  正文由投递方现查子线程（还能拿到子 agent 在 run 里后追加的内容）；
 - `interrupted` 不入账：那说明子 run 被取消或被 `update_async_task` 顶掉，这一轮结果不完整，
   后面那次 run 会自己入账。
 
@@ -207,7 +207,7 @@ run 把同一个结果再送一遍。
 |---|---|---|---|---|
 | 1 | **超级用户的 space 语义有两套**：`allowed_spaces()` 只读 `user_space` 表，`frontend_api._own_space_names()` 却按“有 write 权限 ⇒ 全部 Space” | `is_super=true` 但 `user_space` 里没有行 | 前端能看到全部 Space，但主管/唤醒 run 算出 `specs = {}` → `Available types:` 为空、`check_async_task` 不在工具表 | 既有不一致，本次未收敛；给账号补 `user_space` 行即可绕过 |
 | 2 | **唤醒 run 用的是“投递时”的权限，不是“派活时”的权限**（`_parent_user` 现查库） | 派活之后回收了某个 Space | 唤醒 run 少一个 spec → guard 的 `_spec_of()` 拿不到那条子 run 的 spec；结果仍由分发者投出，但 `state.async_tasks` 该条不会刷成终态 | 有意取舍（用当前权限更安全）；要严格就按“派活时把 spaces 写进子线程 metadata、顺流到发件箱行” |
-| 3 | **发件箱的 `summary` 列对子 run 恒为 `(no output)`**：子 run 只声明 `stream_mode=["messages","custom"]`，没有 `values` 事件，`finalize_run` 的 `output` 是空字典（`run_executor` 只在 `values` 事件里填 `result.data`） | 恒成立 | 投递正文必须现查子线程；一旦服务自调失败（超时/网络/鉴权），卡片退化成 `(no output)` | 已用 `_child_summary` 现查兜底（5s 超时）；`summary` 列目前只是兜底值 |
+| 3 | **发件箱不存结果正文**（原 `summary` 列已删）：子 run 只声明 `stream_mode=["messages","custom"]`，没有 `values` 事件，`finalize_run` 的 `output` 是空字典 | 恒成立 | 投递正文必须现查子线程；一旦服务自调失败（超时/网络/鉴权），卡片退化成 `(no output)` | 现查 `_child_summary` / `_summary_async`（5s 超时）；失败时卡片是 `(no output)`，可让主管直接读空间文件兜底 |
 | 4 | **结果过长时没有任何上限保护**（本轮已取消截断） | 子 agent 输出整份表格/日志 | 卡片会很长、长期占主管上下文，更早触发 summarization；极端情况可能让摘要本身超限 | 只打 `task_result_long` 告警（>3000 字），不静默切文本；要收就调 `LONG_RESULT_WARN` 或让子 agent 自己精简 |
 | 5 | **分发者不知道“父线程长期 busy”** | 用户一直不停发消息 | 发件箱行长期 `pending`（`next_attempt_at` 每 2s 后移），没有告警 | 结果是“晚到”不是“丢”；需要时加 metric/告警 |
 | 6 | **`_claim_batch` 没有 `claimed_by` 列**（只有租约时间） | 两个进程同时领到同一行 | 极小窗口内可能开两轮唤醒 run | 已留 `shortcut:` 注释；要根治就加 `claimed_by`（与 `runs` 表同款租约） |

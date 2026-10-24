@@ -128,8 +128,7 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
 **正文不截断**：投递消息带子 agent 的最后一条消息**原文**（`custom/outbox.py::result_body`），
 模型一次就能看到全量，不用再调 `check_async_task`。超过 3000 字只打一条
 `task_result_long` / `outbox_result_long` 告警，不静默切文本——截断会让模型把“被切了”
-当成“写完了”，还多花一轮工具调用。发件箱 `summary` 列仍截断 500 字（`shorten`），
-但它只是“现查子线程失败”时的兜底值。
+当成“写完了”，还多花一轮工具调用。发件箱**不存结果正文**（子 run 不流 `values`，存了也是空）。
 
 **并发与幂等**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md)）：
 
@@ -153,9 +152,9 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
   前者只认表行，后者“有 write ⇒ 全部 Space”。所以**超级用户没有 `user_space` 行时，
   UI 看得到 Space 但唤醒 run 算出 0 个子 agent**（`Available types:` 空、`check_async_task`
   不在工具表、卡片只剩 `(no output)`）。绕过办法：给该账号补 `user_space` 行。
-- **发件箱的 `summary` 列对子 run 恒为 `(no output)`**：子 run 只声明 `stream_mode=["messages","custom"]`，
-  没有 `values` 事件，`finalize_run` 的 `output` 是空字典。所以卡片正文靠
-  `_child_summary` 现查子线程（5s 超时），自调失败时退化成 `(no output)`。
+- **发件箱不存结果正文**：子 run 只声明 `stream_mode=["messages","custom"]`，没有 `values`
+  事件，`finalize_run` 的 `output` 是空字典。所以卡片正文靠 `_child_summary` 现查子线程
+  （5s 超时），自调失败时退化成 `(no output)`。
 - **`check_async_task` 是取全文的唯一通道**：它只在 `specs` 非空时才被 deepagents 挂上
   （`if async_subagents:`）。specs 一空，模型既不能 check 也不能再派活，只能等投递或自己读文件。
 - **主管自己没有命令执行能力**（backend 非 sandbox，`execute` 不可用），所以子 agent 算出的

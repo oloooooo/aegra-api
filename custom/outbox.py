@@ -20,19 +20,6 @@ PREFIX = "[Async subagent"
 # 提醒调大上下文 / 拆任务，不静默切文本。
 LONG_RESULT_WARN = 3000
 
-# **只给发件箱 `summary` 列用**（现查子线程失败时的兜底值）：DB 行没理由存几 MB 文本，
-# 而这一列目前恒为 "(no output)"（子 run 不流 values，ADR-0010 已知问题 #3）。
-SUMMARY_LIMIT = 500
-
-
-def shorten(text: str) -> str:
-    """截断并显式留标记——静默硬切会让模型分不清「写完了」和「被切了」。
-
-    只用于发件箱 `summary` 列的兜底值；投递正文用 `result_body()`，不截断。
-    """
-    return text if len(text) <= SUMMARY_LIMIT else text[:SUMMARY_LIMIT] + f"…[截断，仅前 {SUMMARY_LIMIT} 字]"
-
-
 def result_body(text: str) -> str:
     """投递正文：原文返回，不截断。"""
     return text
@@ -53,17 +40,6 @@ def message_text(msg: Any) -> str:
     if isinstance(content, list):
         return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
     return str(content) if content is not None else ""
-
-
-def summary_from_output(output: Any) -> str:
-    """子 run 的结论 = 它终态时最后一条消息（截断后）；拿不到给占位。
-
-    只用于发件箱 `summary` 列的兜底值，所以留截断；投递正文不截断。
-    """
-    messages = output.get("messages") if isinstance(output, dict) else None
-    if not messages:
-        return "(no output)"
-    return shorten(message_text(messages[-1]))
 
 
 def completion_text(

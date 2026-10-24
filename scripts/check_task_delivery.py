@@ -25,7 +25,7 @@ import sys
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from custom.outbox import completion_text, is_long_result, result_body, shorten
+from custom.outbox import completion_text, is_long_result, result_body
 from graphs.async_task_guard import AsyncTaskGuard, _completion_text
 
 FAILS: list[str] = []
@@ -251,7 +251,6 @@ def outbox_checks() -> None:
     guard_side = _completion_text(task("t1", "success"), "x")
     check("分发者与 guard 的投递文本逐字一致", text == guard_side, f"{text!r} != {guard_side!r}")
     check("非 success 也带前缀", completion_text("t1", "r", "a", "error", "x").startswith("[Async subagent"))
-    check("发件箱 summary 列仍截断（DB 行不存巨量文本）", len(shorten("表" * 900)) < 900)
     check("投递正文不截断", result_body("表" * 900) == "表" * 900)
 
 

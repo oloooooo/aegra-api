@@ -153,7 +153,7 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 发件箱表 / ack 接口 / 分发者见 `custom/models.py`、`custom/delivery_api.py`、
 `custom/outbox_dispatcher.py`（ADR-0010）。
 _Avoid_: 把投递说成“通知”（通知是手段，投递是结果进上下文）；把它当成同步等待（主管从不被阻塞）；
-把发件箱 `summary` 列（兜底用的 500 字）当成投递正文
+以为发件箱里存了结果正文（它不存，正文靠投递时现查子线程）
 
 **Task proxy（任务代理）**:
 `custom/frontend_api.py` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread

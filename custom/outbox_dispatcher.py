@@ -96,9 +96,8 @@ def _service_client() -> Any:
 async def _child_summary(row: dict[str, Any]) -> str:
     """结果正文 = 子线程最后一条消息（现查，**原文不截断**）。
 
-    不能只用发件箱里的 `summary`：子 run 通常只声明 `stream_mode=["messages","custom"]`，
-    没有 `values` 事件，`finalize_run` 拿到的 output 是空字典——存下来的摘要会是
-    "(no output)"。所以以现查为准，存盘值只当兵底。
+    发件箱行**不存结果正文**（子 run 不流 `values`，存了也是空），所以只能现查。
+    现查还能拿到子 agent 在 run 里后追加的内容，比写入时刻的快照准。
     """
     try:
         thread = await asyncio.wait_for(_service_client().threads.get(row["task_id"]), timeout=_SUMMARY_TIMEOUT)
@@ -110,7 +109,7 @@ async def _child_summary(row: dict[str, Any]) -> str:
             return text
     except Exception:  # noqa: BLE001 —— 取不到就退到存盘摘要，不阻断投递
         logger.warning("outbox_summary_fetch_failed", task_id=row["task_id"])
-    return row.get("summary") or "(no output)"
+    return "(no output)"
 
 
 async def _parent_user(session: AsyncSession, thread: ThreadORM) -> User:
@@ -173,7 +172,6 @@ async def _claim_batch() -> list[dict[str, Any]]:
                 "parent_thread_id": r.parent_thread_id,
                 "agent_name": r.agent_name,
                 "terminal_status": r.terminal_status,
-                "summary": r.summary,
                 "attempts": r.attempts,
             }
             for r in rows
