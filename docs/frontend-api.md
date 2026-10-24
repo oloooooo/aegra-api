@@ -4,9 +4,15 @@
 
 实现位置：`custom/frontend_api.py`（路由前缀 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
 
-另有 **2 个内部接口**（前端不调用，供主管侧拦截层与发件箱分发者做投递 ack）：
-`POST /custom/tasks/{task_id}/deliver-claim` 与 `DELETE` 同名接口。
-它们的鉴权只允许父线程属主或服务身份，语义见 [adr/0010](./adr/0010-task-delivery-idempotency.md)。
+另有 **3 个内部接口**：
+
+| 接口 | 调用方 | 说明 |
+|---|---|---|
+| `POST /custom/tasks/{task_id}/deliver-claim` | 主管侧拦截层 / 分发者 | 把发件箱行从 `pending` 原子翻成 `delivered`（[adr/0010](./adr/0010-task-delivery-idempotency.md)） |
+| `DELETE` 同名 | 同上 | 撤销认领 |
+| `POST /custom/tasks/{task_id}/cancel` | **前端**（侧栏任务卡「停止」） | 取消一个子任务。子线程属主是服务账号，用户 token 打不通原生 `cancel`，所以后端代理一次（[adr/0014](./adr/0014-no-hitl-for-eval.md)） |
+
+前者鉴权只允许父线程属主或服务身份；`cancel` 同样。
 
 ## 1. 为什么需要这一层
 
@@ -164,6 +170,18 @@ agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null
 **结果正文不截断**：消息里就是子 agent 最后一条消息的原文，可能很长（几千字）。前端建议
 默认折叠成“展开查看全文”，否则一条卡片会占满整屏。超过 3000 字服务端会打
 `task_result_long` 告警，但消息内容不做任何删减。
+
+**状态通知是另一种消息**：前缀同样以 `[Async subagent` 开头，但**不含 `Result:`**：
+
+```
+[Async subagent 'cbam-reporting' was cancelled]
+
+task_id: …
+run_id: …
+```
+
+它表示"这一轮没跑完，没有结果"，渲染成灰色状态条，不要当结论展示（`web/src/stores/chat.ts`
+的 `toView` 用是否含 `Result:` 区分 `callback` / `notice` 两种 role）。
 
 ### 5.4 状态可能滞后
 

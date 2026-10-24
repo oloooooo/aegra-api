@@ -108,6 +108,11 @@ run_id 是确定性的，重试赚主键即视为已投）。guard 写 state 前
 `POST /custom/tasks/{task_id}/deliver-claim` 把行从 `pending` 原子翻成 `delivered`
 （`custom/delivery_api.py`）——**没有 advisory lock、没有时间窗口**，一行一判，
 同一批 N 个任务互不影响。
+子任务终态分两类、走两条路（ADR-0014）：**结果**（`success`/`error`/`timeout`）占发件箱行、
+靠 claim 互斥、记 `delivered_run_id`；**状态**（`cancelled`/`interrupted`，后者指被取消而不是
+HITL 暂停）只发一条不带 `Result:` 的状态通知、不占任何行、记 `notified_run_id`。
+服务端的 `interrupted` 靠 `interrupted_by` 映射成父 state 的 `cancelled` / `interrupted`。
+
 同一路内（hook 与 hook）的判重只靠 state 里的 `delivered_run_id` 字段。**不扫 messages**：
 摘要中间件会用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 重写历史（卡片随之消失），而模型能
 自己复述出一段带 `[Async subagent … task_id: … run_id: …` 的文本（扫到就会被当成已投递，

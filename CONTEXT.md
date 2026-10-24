@@ -30,7 +30,8 @@ _Avoid_: 把 Cancel action 当成 Run status
 
 **Cancel（取消）**:
 客户端请求某个 Run 立刻停止。Run 落终态 interrupted，Thread 归 idle，**不可续跑**。
-_Avoid_: 撤销、中止
+父 state 里记作 `cancelled`（服务端只有 interrupted，靠 `interrupted_by` 区分，见 ADR-0014）。
+_Avoid_: 撤销、中止；不要把它当成"暂停"
 
 **HITL interrupt（人工中断）**:
 图自己在需要人工审批处暂停（`interrupt_on` + checkpointer）。Run 落终态 interrupted，Thread 落 interrupted，**可续跑**。
@@ -149,6 +150,13 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 叫**已入上下文**：它只是已兑付的本地缓存，丢失能重建（最多多一次 claim），所以不能拿它
 当唯一依据，更不能拿“消息历史里有没有那张卡片”当依据——摘要会删掉它，模型也能复述伪造它。
 模型自己 `check_async_task` 拿到终态结果的，同样记为已入上下文并发起已兑付。
+**Status notice（状态通知）**:
+把子任务的状态变化（被取消 / 被中断）告诉主管的一条消息，前缀同样是
+`[Async subagent`，但**不带 `Result:`**，前端渲染成灰色状态条。它和投递是两条路：
+投递送结论、占发件箱行；状态通知只说"这轮没跑完"、不占任何行，判重键是
+`async_tasks[tid].notified_run_id`（投递用 `delivered_run_id`）。
+_Avoid_: 把状态通知叫投递；把 cancelled 当结果去投（那会把半截内容当结论）
+
 投递消息带子 agent 最后一条消息的**原文**（不截断）；过长只告警不切文本，避免模型把“被切了”
 当成“写完了”。
 发件箱表 / ack 接口 / 分发者见 `custom/models.py`、`custom/delivery_api.py`、
