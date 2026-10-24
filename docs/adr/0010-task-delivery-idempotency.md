@@ -69,6 +69,11 @@ ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不
   会对 thread 行取 `FOR KEY SHARE`——多进程下第二个分发者会阻塞到第一个提交，然后看到新
   run 并让路（与 `thread_ttl.py` 处理同一竞态的做法一致）。
 
+**“父线程忙”的准确含义**：指 `runs` 表里存在 `pending` / `running` 的行（`ACTIVE_RUN_STATES`），
+**不看 `thread.status`**。两者在正常流程里同时变化（`_prepare_run` 先 `set_thread_status(busy)`
+再插 run 行），但只有 runs 表是分发者的判据：线程状态可能因 `interrupted`、手工改库、
+或 aegra 之外的写入而不一致，而“有没有活跃 run 行”直接决定“新开一轮会不会和它并发”。
+
 ### 三、消费：父 run 的 `before_agent` 写 state 并 ack（graphs）
 
 父线程有活跃 run 时，分发者不动手——那一轮的 `AsyncTaskGuard.abefore_agent` 会把终态结果
@@ -172,5 +177,15 @@ run 把同一个结果再送一遍。
 | 8 | **`failed` 行不再被分发者重试** | 连续 10 次建 run 失败 | 只剩父 run 的 hook 能把它写进 state；用户不再说话就一直看不到 | 有意为之（避免无限重试打爆日志/队列）；`delivery_api` 仍允许 guard 抢 `failed` 行 |
 | 9 | **用户手动发起的 run 仍没有幂等键** | 前端重复提交 / 两个标签页 | 可能与唤醒 run 并发写同一线程（aegra 不拦同线程并发 run，`design.md §9 #4`） | `run_id` 幂等键只在分发者内部用；平台层要根治见下方 Considered Options |
 | 10 | **子线程当父线程（嵌套派活）会缺 spaces** | 未来支持嵌套 | 子线程属主是服务账号，`user_space` 里没有它的行 → 唤醒 run specs 为空 | 当前禁止嵌套，不影响 |
+| 11 | **guard 的 spec 必须带 `headers`**：`_claim_async` 用 `spec['headers']` 鉴权，缺了就是 401，而 401 与网络错误一样被归为 `None`（“无法判定，宁可多一条”） | `domain_specs()` 漏给 headers，或它在 run config 里被覆盖 | 行永远停在 `pending`：这次不重复，但父 run 一结束分发者会再投一遍 → 用户看到两张一样的卡片，且日志只有 `task_delivery_claim_undetermined` | 线上 `domain_specs()` 恒带服务 token，暂不触发；要根治就让 `_claim_async` 把 401/403 当 `False`（= 别人已投，明确不写），而不是 `None` |
 
 配套的用户可见症状与处置见 `README_zh.md §8 常见问题`。
+
+## 验收脚本
+
+- `scripts/check_task_delivery.py`：纯函数 / 单进程级（guard 判重、文本口径、ack 回滚），
+  不需要服务也不调 LLM。
+- `scripts/check_outbox_multiprocess.py`：打**真服务 + 多 worker**，验只有多进程才暴露的几条
+  （活跃 run 退避、只开一轮唤醒 run、check 命中即 ack、并发 claim 唯一赢家）。
+  前置：`docker start redis6` + `uvicorn aegra_api.main:app --workers 2
+  --loop "asyncio:SelectorEventLoop"`（Windows）或 `--loop asyncio`（Linux/macOS）。

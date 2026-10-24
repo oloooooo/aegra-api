@@ -102,13 +102,18 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 事务性发件箱（ADR-0010）：子 run 终态时 `finalize_run` 在**同一个事务**里插一行
 `async_task_outbox(task_id, run_id)`（主键即幂等键）；分发者
 `custom/outbox_dispatcher.py` 用 `FOR UPDATE SKIP LOCKED` + 租约领批，父线程
-**无活跃 run** 才建一轮唤醒 run（`SELECT thread FOR UPDATE` 关掉 check-then-act 竞态，
+**无活跃 run** 才建一轮唤醒 run（“活跃” = `runs` 表有 `pending`/`running` 行，
+**不看 `thread.status`**；`SELECT thread FOR UPDATE` 关掉 check-then-act 竞态，
 run_id 是确定性的，重试赚主键即视为已投）。guard 写 state 前先
 `POST /custom/tasks/{task_id}/deliver-claim` 把行从 `pending` 原子翻成 `delivered`
 （`custom/delivery_api.py`）——**没有 advisory lock、没有时间窗口**，一行一判，
 同一批 N 个任务互不影响。
 同一路内（hook 与 hook）的判重靠 state 里的 `delivered_run_id` 字段，**不靠扫消息**
 ——`check_async_task` 返回的是 `ToolMessage(json)`，扫不到会被当成未投递再投一遍。
+
+另一个隐含要求：guard 的 spec 必须带 `headers`（服务 token）——它用同一份 spec 去
+`deliver-claim`。缺 headers 会 401，而 401 与网络错一样被归为“无法判定”，行停在
+`pending`，父 run 结束后分发者会再投一遍（`ADR-0010 §已知问题 #11`）。
 
 **成本**：每次 run 只在首尾两次核对非终态任务的真实状态（无 TTL 缓存，任务终态后不再查）；
 run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表），不读 thread state；

@@ -138,6 +138,8 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run 投递。`busy` 与 `interrupted`
 一律不投：前者归 ②，后者不能顶掉用户正等着回答的答案。**run 期间完成的结果不在该 run 里写**
 （没有 `after_agent`）——那时模型这一轮已经答完，写进去它没法转述，交给 ② 另开一轮。
+这里的 `busy` 指**父线程上有活跃 run 行**（`runs.status` 为 `pending` / `running`），
+不是 `thread.status`：前者是分发者的判据，后者只是给人看的状态字。
 两条路都以 `(task_id, run_id)` 为键：子 run 终态时 `finalize_run` 写一行发件箱
 `async_task_outbox`（主键即幂等键），投递前把行从 `pending` 原子翻成 `delivered`，
 翻不成就说明别人已投。投过的任务在 state 里留 `delivered_run_id`，模型自己
