@@ -879,10 +879,11 @@ class TestDequeue:
         executor._poll_postgres.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_idle_socket_timeout_returns_none_without_fallback(self) -> None:
+    async def test_socket_timeout_returns_none_with_warning(self) -> None:
         """A blocking BLPOP that hits the socket timeout raises redis TimeoutError
-        (a RedisError subclass). That is a normal idle expiry, not a connectivity
-        failure: it must return None silently, never poll Postgres (GH #bug)."""
+        (a RedisError subclass). It is not a connectivity failure, so no Postgres
+        fallback — but it must be logged: a job dequeued into a dropped socket is
+        only recoverable by the stuck-pending reaper, so silence hides the loss."""
         blpop = AsyncMock(side_effect=RedisTimeoutError("Timeout reading from redis:6379"))
         executor = self._make_executor_with_blpop(blpop)
 
@@ -894,7 +895,23 @@ class TestDequeue:
 
         assert result is None
         executor._poll_postgres.assert_not_awaited()
-        mock_warning.assert_not_called()
+        mock_warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_blpop_timeout_stays_under_socket_timeout(self) -> None:
+        """Regression: the server-side BLPOP block must end before redis-py's
+        client-side socket timeout (DEFAULT_SOCKET_TIMEOUT, 5s). When both are 5s
+        the client abandons the socket just before the nil reply, and a run_id
+        pushed in that window is popped into the dead socket and lost."""
+        from redis._defaults import DEFAULT_SOCKET_TIMEOUT
+
+        blpop = AsyncMock(return_value=None)
+        executor = self._make_executor_with_blpop(blpop)
+
+        with patch(f"{MODULE}.redis_manager.get_client", return_value=self._client):
+            await executor._dequeue()
+
+        assert blpop.await_args.kwargs["timeout"] < DEFAULT_SOCKET_TIMEOUT
 
     @pytest.mark.asyncio
     async def test_connection_error_falls_back_to_postgres(self) -> None:

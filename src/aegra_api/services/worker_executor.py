@@ -322,16 +322,23 @@ class WorkerExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     async def _dequeue(self) -> str | None:
-        """BLPOP with 5s timeout. Falls back to Postgres polling if Redis is down."""
+        """BLPOP with 4s timeout. Falls back to Postgres polling if Redis is down."""
         try:
             client = redis_manager.get_client()
-            result = await client.blpop(settings.worker.WORKER_QUEUE_KEY, timeout=5)  # type: ignore[arg-type]
+            # The server-side block must stay well under redis-py's socket timeout
+            # (DEFAULT_SOCKET_TIMEOUT = 5s). When the two are equal the client gives
+            # up a few ms before the nil reply lands, and a run_id pushed into that
+            # window is handed to the already-abandoned socket and silently lost
+            # (run stays pending, no worker claim, recovered only by the reaper).
+            result = await client.blpop(settings.worker.WORKER_QUEUE_KEY, timeout=4)  # type: ignore[arg-type]
             if result is None:
                 return None
             return result[1]
         except RedisTimeoutError:
-            # Idle expiry: a blocking BLPOP hit the socket timeout with no jobs.
-            # Normal when the queue is empty, not a connectivity failure — re-loop.
+            # Not a connectivity failure, so still no Postgres fallback — but with
+            # the margin above this should never fire. If it does, a dequeued job
+            # may have died with the socket; the stuck-pending reaper recovers it.
+            logger.warning("Job queue BLPOP hit the socket timeout", queue=settings.worker.WORKER_QUEUE_KEY)
             return None
         except RedisError as exc:
             logger.warning("Redis BLPOP failed, falling back to Postgres poll", error=str(exc))
