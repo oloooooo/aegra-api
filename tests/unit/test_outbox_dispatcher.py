@@ -18,17 +18,6 @@ from custom import outbox_dispatcher as disp
 PARENT = "parent-thread"
 
 
-class FakeRun:
-    def __init__(self, task_id: str, run_id: str) -> None:
-        self.task_id = task_id
-        self.run_id = run_id
-        self.parent_thread_id = PARENT
-        self.agent_name = "cbam_reporting"
-        self.terminal_status = "success"
-        self.summary = "结果"
-        self.attempts = 0
-
-
 class _Result:
     def __init__(self, value: Any = None) -> None:
         self._value = value
@@ -74,16 +63,15 @@ class FakeSession:
 
     def touched(self, needle: str) -> bool:
         """SQL 文本或绑定参数里出现过这个值（字段名或字面量都算）。"""
-        return any(
-            needle in sql or any(needle in str(v) for v in params.values()) for sql, params in self.updates
-        )
+        return any(needle in sql or any(needle in str(v) for v in params.values()) for sql, params in self.updates)
 
 
 class FakeThread:
-    def __init__(self, metadata: dict[str, Any]) -> None:
+    def __init__(self, metadata: dict[str, Any], status: str = "idle") -> None:
         self.thread_id = PARENT
         self.user_id = "root"
         self.metadata_json = metadata
+        self.status = status  # 分发者要据此跳过 interrupted（HITL 等 resume）
 
 
 class FakeMaker:
@@ -104,14 +92,15 @@ class FakeMaker:
 def patch_infra(monkeypatch: pytest.MonkeyPatch):
     def _install(session: FakeSession) -> None:
         monkeypatch.setattr(disp, "_get_session_maker", lambda: FakeMaker(session))
-        # 不真的去打服务端读子线程（_child_summary 退到存盘摘要）
+        # 不真的去打服务端读子线程
         monkeypatch.setattr(disp, "_child_summary", _fallback_summary)
 
     return _install
 
 
 async def _fallback_summary(row: dict[str, Any]) -> str:
-    return row.get("summary") or "(no output)"
+    # 发件箱行不存结果正文（summary 列已删），现查失败时就是占位
+    return "(no output)"
 
 
 def _rows() -> list[dict[str, Any]]:
@@ -122,10 +111,33 @@ def _rows() -> list[dict[str, Any]]:
             "parent_thread_id": PARENT,
             "agent_name": "cbam_reporting",
             "terminal_status": "success",
-            "summary": "结果",
             "attempts": 0,
         }
     ]
+
+
+async def test_interrupted_parent_defers_without_creating_a_run(patch_infra, monkeypatch) -> None:
+    """父线程在等 resume（HITL）：不能插 run。
+
+    `_prepare_run` 会无条件 `set_thread_status(busy)`，把 `interrupted` 覆盖掉；
+    之后用户点“回答”时 `_validate_resume_command` 找不到 interrupted 状态，
+    直接 400 `Cannot resume`——整条人工问答链路就废了。
+    """
+    session = FakeSession(thread=FakeThread({"assistant_id": "supervisor"}, status="interrupted"), busy=False)
+    patch_infra(session)
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_prepare(*a: Any, **kw: Any) -> None:
+        calls.append(kw)
+
+    import aegra_api.services.run_preparation as rp
+
+    monkeypatch.setattr(rp, "_prepare_run", fake_prepare)
+
+    await disp._dispatch_parent(PARENT, _rows())
+    assert calls == [], "HITL 等待期间不能开唤醒 run"
+    assert not session.touched("delivered_at"), "行要留 pending，等用户答完再投"
 
 
 async def test_busy_parent_defers_without_creating_a_run(patch_infra, monkeypatch) -> None:

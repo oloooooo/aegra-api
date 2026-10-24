@@ -70,10 +70,16 @@ ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不
   会对 thread 行取 `FOR KEY SHARE`——多进程下第二个分发者会阻塞到第一个提交，然后看到新
   run 并让路（与 `thread_ttl.py` 处理同一竞态的做法一致）。
 
-**“父线程忙”的准确含义**：指 `runs` 表里存在 `pending` / `running` 的行（`ACTIVE_RUN_STATES`），
-**不看 `thread.status`**。两者在正常流程里同时变化（`_prepare_run` 先 `set_thread_status(busy)`
-再插 run 行），但只有 runs 表是分发者的判据：线程状态可能因 `interrupted`、手工改库、
-或 aegra 之外的写入而不一致，而“有没有活跃 run 行”直接决定“新开一轮会不会和它并发”。
+**“父线程忙”的判据有两条**（`custom/outbox_dispatcher.py::_dispatch_parent`）：
+
+1. `runs` 表里有 `pending` / `running` 的行（`ACTIVE_RUN_STATES`）——那一轮的 `before_agent`
+   会负责投，这里让路；
+2. `thread.status == 'interrupted'`——有人在等 resume（HITL `ask_user_question`）。
+   **这条必须显式判断**：`interrupted` 的 run 不在 `ACTIVE_RUN_STATES` 里，光看 runs 表会漏；
+   而 `_prepare_run` 会无条件 `set_thread_status(busy)`，把 `interrupted` 覆盖掉，之后用户
+   点“回答”时 `_validate_resume_command` 直接 400（`Cannot resume: thread is not in
+   interrupted state`），整条人工问答链路就废了。等用户答完，那次 resume 的 `before_agent`
+   会把这些结果投出去。
 
 ### 三、消费：父 run 的 `before_agent` 写 state 并 ack（graphs）
 
@@ -216,7 +222,8 @@ run 把同一个结果再送一遍。
 | 9 | **用户手动发起的 run 仍没有幂等键** | 前端重复提交 / 两个标签页 | 可能与唤醒 run 并发写同一线程（aegra 不拦同线程并发 run，`design.md §9 #4`） | `run_id` 幂等键只在分发者内部用；平台层要根治见下方 Considered Options |
 | 10 | **子线程当父线程（嵌套派活）会缺 spaces** | 未来支持嵌套 | 子线程属主是服务账号，`user_space` 里没有它的行 → 唤醒 run specs 为空 | 当前禁止嵌套，不影响 |
 | 11 | **guard 的 spec 必须带 `headers`**：`_claim_async` 用 `spec['headers']` 鉴权，缺了就是 401，而 401 与连不上一样被归为 `None`（不知道） | `domain_specs()` 漏给 headers，或它在 run config 里被覆盖 | guard 永远抢不到 → 这一轮投不出去（不重复），行留给分发者；分发者是服务端内部调用，不受这个鉴权影响，所以结果最终会到，只是晚一步 | 线上 `domain_specs()` 恒带服务 token，暂不触发；要根治就让 `_claim_async` 把 401/403 当 `False`（“我投不出去，让人接手”）而不是 `None` |
-| 12 | **claim 端点长期不可用时结果会一直推迟** | 服务自调挂了（自己打自己的 `deliver-claim`） | 行停在 `pending`、`next_attempt_at` 不断后移；结果晚到而不是丢（端点恢复、下一轮 run 或分发者接手） | 有意为之：比“不确定就投”好——后者会重复。日志 `task_delivery_claim_undetermined` 是排查入口，需要时加 metric |
+| 12 | **HITL 等待期间结果会一直 `pending`**（本轮修了“会打断 resume”的 bug，但“等多久”没解） | 用户迟迟不回答 `ask_user_question` | 结果是“晚到”不是“丢”；`next_attempt_at` 每 2s 后移，用户答完 resume 后那轮 `before_agent` 补投 | 与 #5 同形；要更省可以给 interrupted 拉长退避（现在沿用 busy 的 2s） |
+| 13 | **claim 端点长期不可用时结果会一直推迟** | 服务自调挂了（自己打自己的 `deliver-claim`） | 行停在 `pending`、`next_attempt_at` 不断后移；结果晚到而不是丢（端点恢复、下一轮 run 或分发者接手） | 有意为之：比“不确定就投”好——后者会重复。日志 `task_delivery_claim_undetermined` 是排查入口，需要时加 metric |
 
 配套的用户可见症状与处置见 `README_zh.md §8 常见问题`。
 

@@ -313,7 +313,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | run 刚开始 | 主管侧 guard（`abefore_agent`） | 把已终态的结果写进 state；**不打断**、不另开 run，本次 run 的模型调用就能看到 |
 | run 期间才完成 | 分发者（run 结束后） | **不在该 run 里写**：那时模型这一轮已答完，写进去没法转述；run 结束后另开一轮唤醒 run |
 | run 跑到一半需要结果 | 模型自己 | 调 `check_async_task`——它返回**全文**，而且 guard 会记下已投递，之后不再重复投 |
-| `interrupted`（图在等 resume，例如正问用户问题） | 谁都不动 | 硬 resume 会把用户要回答的答案顶掉；等用户答完，下一次 run 的 hook 自动补上 |
+| `interrupted`（图在等 resume，例如正问用户问题） | 谁都不动 | 插一轮 run 会把线程从 `interrupted` 翻成 `busy`，用户点“回答”时会被 400 拒掉；等用户答完，那次 resume 的 hook 自动补上 |
 | `idle` / `error`（主管已经答完） | 发件箱分发者（服务端） | 子 run 终态时 `finalize_run` 已写了一行发件箱；分发者把一个 tick 里同一父线程的待投结果合成**一轮**唤醒 run |
 
 两条路不重复：发件箱行 `async_task_outbox` 的主键就是 `(task_id, run_id)`，投递前先用

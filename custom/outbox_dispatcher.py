@@ -269,6 +269,14 @@ async def _dispatch_parent(parent_thread_id: str, rows: list[dict[str, Any]]) ->
             await _defer(session, rows, seconds=_BUSY_BACKOFF_SECONDS)
             return
 
+        if thread.status == "interrupted":
+            # 有人在等 resume（HITL ask_user_question）。此时插一轮 run 会把
+            # thread.status 从 interrupted 改成 busy，用户点“回答”时
+            # `_validate_resume_command` 直接 400，整条问答链路就废了。
+            # 等用户答完，那次 resume 的 before_agent 会把这些结果投出去。
+            await _defer(session, rows, seconds=_BUSY_BACKOFF_SECONDS)
+            return
+
         metadata = thread.metadata_json or {}
         assistant_id = metadata.get("assistant_id") or metadata.get("graph_id")
         if not assistant_id:

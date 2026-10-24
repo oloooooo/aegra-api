@@ -200,6 +200,21 @@ async def main() -> None:
         await asyncio.sleep(5)
         check("父线程 busy 时分发者不动手", await wake_runs(busy_parent) == [], str(await wake_runs(busy_parent)))
 
+        # 2b. 父线程 interrupted（HITL 等 resume）→ 也不投：插一轮 run 会把
+        #     thread.status 改成 busy，用户点“回答”时 _validate_resume_command 会 400
+        hitl_parent = await make_thread(status="interrupted", with_active_run=False)
+        hitl_child, _ = await terminal_child(hitl_parent)
+        await wait(lambda: rows_of(hitl_child), what="interrupted child row")
+        await asyncio.sleep(5)
+        hitl_wakes = await wake_runs(hitl_parent)
+        check("父线程 interrupted 时分发者不动手", hitl_wakes == [], str(hitl_wakes))
+        check("行仍是 pending（等用户答完再投）", (await rows_of(hitl_child))[0]["status"] == "pending")
+        await end_parent_run(hitl_parent)
+        await wait(lambda: wake_runs(hitl_parent), what="interrupted 后放行")
+        await wait(lambda: is_delivered(hitl_child), what="interrupted child delivered")
+        check("interrupted 解除后才投", bool(await is_delivered(hitl_child)))
+        await cancel_wakes(hitl_parent)
+
         # 3. 父 run 结束 → 只开一轮
         await end_parent_run(busy_parent)
         wakes = await wait(lambda: wake_runs(busy_parent), what="wake run")
@@ -243,8 +258,9 @@ async def main() -> None:
         await asyncio.sleep(5)
         check("guard 已 ack → 不再开唤醒 run", await wake_runs(ack_parent) == [], str(await wake_runs(ack_parent)))
 
-        # 5. 并发 claim 唯一赢家
-        cc_parent = await make_thread()
+        # 5. 并发 claim 唯一赢家。父线程必须“忙”，否则分发者会在 8 路 claim 之前就把行投掉，
+        #    测到的就是“行已 delivered”而不是并发互斥。
+        cc_parent = await make_thread(status="busy", with_active_run=True)
         cc_child, cc_run = await terminal_child(cc_parent)
         await wait(lambda: rows_of(cc_child), what="claim child row")
 

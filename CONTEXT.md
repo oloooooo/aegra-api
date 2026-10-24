@@ -137,7 +137,8 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 ① 主管开始一轮 run 时 —— `AsyncTaskGuard.abefore_agent` 把已终态的结果写进 state
 （不另开 run，模型在本次 run 的第一轮模型调用就能看到）；② 主管已空闲（`idle` / `error`）——
 服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run 投递。`busy` 与 `interrupted`
-一律不投：前者归 ②，后者不能顶掉用户正等着回答的答案。**run 期间完成的结果不在该 run 里写**
+一律不投：前者归 ②，后者不能顶掉用户正等着回答的答案（插一轮 run 会把线程从 `interrupted`
+改成 `busy`，用户点“回答”时会被 400 拒掉）。**run 期间完成的结果不在该 run 里写**
 （没有 `after_agent`）——那时模型这一轮已经答完，写进去它没法转述，交给 ② 另开一轮。
 这里的 `busy` 指**父线程上有活跃 run 行**（`runs.status` 为 `pending` / `running`），
 不是 `thread.status`：前者是分发者的判据，后者只是给人看的状态字。
