@@ -42,7 +42,7 @@ from aegra_api.models.runs import RunCreate
 from aegra_api.services.run_status import ACTIVE_RUN_STATES
 from aegra_api.settings import settings
 from custom.models import AsyncTaskOutbox, UserSpace, UserTables
-from custom.outbox import completion_text, message_text, shorten
+from custom.outbox import completion_text, is_long_result, message_text, result_body
 from custom.services import service_token
 
 logger = structlog.getLogger(__name__)
@@ -94,7 +94,7 @@ def _service_client() -> Any:
 
 
 async def _child_summary(row: dict[str, Any]) -> str:
-    """结果正文 = 子线程最后一条消息（现查）。
+    """结果正文 = 子线程最后一条消息（现查，**原文不截断**）。
 
     不能只用发件箱里的 `summary`：子 run 通常只声明 `stream_mode=["messages","custom"]`，
     没有 `values` 事件，`finalize_run` 拿到的 output 是空字典——存下来的摘要会是
@@ -104,7 +104,10 @@ async def _child_summary(row: dict[str, Any]) -> str:
         thread = await asyncio.wait_for(_service_client().threads.get(row["task_id"]), timeout=_SUMMARY_TIMEOUT)
         messages = ((thread or {}).get("values") or {}).get("messages") or []
         if messages:
-            return shorten(message_text(messages[-1]))
+            text = result_body(message_text(messages[-1]))
+            if is_long_result(text):
+                logger.warning("outbox_result_long", task_id=row["task_id"], chars=len(text))
+            return text
     except Exception:  # noqa: BLE001 —— 取不到就退到存盘摘要，不阻断投递
         logger.warning("outbox_summary_fetch_failed", task_id=row["task_id"])
     return row.get("summary") or "(no output)"
@@ -310,9 +313,7 @@ async def _dispatch_parent(parent_thread_id: str, rows: list[dict[str, Any]]) ->
             return
         except Exception as exc:  # noqa: BLE001 —— 任何失败都要退避重试，不能丢结果
             await session.rollback()
-            logger.warning(
-                "outbox_dispatch_failed", parent_thread_id=parent_thread_id, error=str(exc), exc_info=True
-            )
+            logger.warning("outbox_dispatch_failed", parent_thread_id=parent_thread_id, error=str(exc), exc_info=True)
             await _fail(session, rows, error=str(exc))
             return
 

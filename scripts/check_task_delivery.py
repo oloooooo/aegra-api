@@ -25,7 +25,7 @@ import sys
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from custom.outbox import completion_text, shorten
+from custom.outbox import completion_text, is_long_result, result_body, shorten
 from graphs.async_task_guard import AsyncTaskGuard, _completion_text
 
 FAILS: list[str] = []
@@ -135,11 +135,13 @@ async def guard_checks() -> None:
     guard5, _ = make_guard({"run-t5": "running"}, {})
     check("running → 不动", await guard5.abefore_agent({"async_tasks": {"t5": task("t5", "running")}}, None) is None)
 
-    # 6. 摘要超长 → 带截断标记（模型才知道该去 check 取全文）
+    # 6. 结果超长 → 全文进卡片，不截断（模型一次看到全量，不用再调 check）
     guard6, _ = make_guard({"run-t6": "success"}, {"t6": "表" * 900})
     out6 = await guard6.abefore_agent({"async_tasks": {"t6": task("t6", "running")}, "messages": []}, None)
     text6 = (out6 or {})["messages"][0].content
-    check("超长摘要带截断标记", "结果已截断" in text6 and "check_async_task" in text6, text6[-60:])
+    check("超长结果不截断（全文都在卡片里）", "表" * 900 in text6, f"len={len(text6)}")
+    check("不截断就不带截断标记", "截断" not in text6, text6[-60:])
+    check("超过 3000 字要告警（用真实长度判定）", is_long_result("表" * 3001) and not is_long_result("表" * 3000))
 
     # 7. 模型自己 check 到终态结果 → 记 delivered_run_id + ack 发件箱行（之后不再投）
     guard7, _ = make_guard({"run-t7": "success"}, {"t7": "x"})
@@ -249,7 +251,8 @@ def outbox_checks() -> None:
     guard_side = _completion_text(task("t1", "success"), "x")
     check("分发者与 guard 的投递文本逐字一致", text == guard_side, f"{text!r} != {guard_side!r}")
     check("非 success 也带前缀", completion_text("t1", "r", "a", "error", "x").startswith("[Async subagent"))
-    check("摘要超长被截断", shorten("表" * 900).endswith(shorten("表" * 900)[-20:]) and len(shorten("表" * 900)) < 900)
+    check("发件箱 summary 列仍截断（DB 行不存巨量文本）", len(shorten("表" * 900)) < 900)
+    check("投递正文不截断", result_body("表" * 900) == "表" * 900)
 
 
 async def main() -> None:

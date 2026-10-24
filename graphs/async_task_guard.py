@@ -53,12 +53,11 @@ check / cancel / list 不创建 run，直接放行给内置 handler；check 到�
     本次 run 的 checkpoint 里多一条 human 消息
     （前端 `toView` 靠 `[Async subagent` 前缀渲染成「子 agent 返回」卡片）
 
-摘要截断到 500 字并带标记，**全文只有 check_async_task 能取**（那边不截断）。
+结果正文**不截断**（超过 3000 字只打告警），模型一次就能看到全量。
 
-判重三个来源：发件箱行 `(task_id, run_id)`（与分发者互斥：谁能把行从 pending 翻成
+判重两个来源：发件箱行 `(task_id, run_id)`（与分发者互斥：谁能把行从 pending 翻成
 delivered，谁去写 state）、task 上的 `delivered_run_id`（模型自己 check 过也算已投，
-见 `_amark_checked`）、messages 里的投递消息（唤醒 run 的 input 本身就带标记，
-所以它自带判重，不依赖谁先写过 state）。
+见 `_amark_checked`）。**不再扫 messages**：摘要会删掉卡片、模型又能复述伪造它。
 
 ===============================================================================
 四、多进程
@@ -73,7 +72,7 @@ guard 自己不存任何跨请求状态（旧版的名额账本已随 ADR-0008 �
 五、代码分区（改代码前先看这张表）
 ===============================================================================
 
-  A. 文本与判重    _TERMINAL, _now(), _shorten(), _message_text(),
+  A. 文本与判重    _TERMINAL, _now(), _message_text(),
                    _delivered(), _completion_text(),
                    _thread_summary()
   B. 派活          AsyncTaskGuard._key/_sync_client/_async_client, _prepare(),
@@ -103,7 +102,7 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
-from custom.outbox import completion_text, message_text, shorten
+from custom.outbox import completion_text, is_long_result, message_text, result_body
 from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
@@ -119,11 +118,6 @@ _TASK_MARK = "task_id: "
 
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _shorten(text: str) -> str:
-    """截断摘要——口径在 custom/outbox.py，三处必须逐字一致。"""
-    return shorten(text)
 
 
 def _message_text(msg: Any) -> str:
@@ -153,9 +147,9 @@ def _completion_text(task: dict[str, Any], summary: str) -> str:
 
 
 def _thread_summary(thread: Any) -> str:
-    """子 agent 的结论 = 它自己线程的最后一条消息（截断后）。"""
+    """子 agent 的结论 = 它自己线程的最后一条消息，**原文不截断**。"""
     messages = ((thread or {}).get("values") or {}).get("messages") or []
-    return _shorten(_message_text(messages[-1])) if messages else "(no output)"
+    return result_body(_message_text(messages[-1])) if messages else "(no output)"
 
 
 class AsyncTaskGuard(AgentMiddleware):
@@ -461,19 +455,22 @@ class AsyncTaskGuard(AgentMiddleware):
         return out
 
     async def _summary_async(self, task: dict[str, Any]) -> str:
-        """取子 agent 的最终结论（摘要）。拿不到就给占位，不阻断投递。
+        """取子 agent 的最终结论，**原文不截断**（模型一次看到全量，不用再调 check）。
 
         注：发件箱行里也存了一份写入时的摘要快照（分发者用的）；这里现查线程是为了
         拿到**当下**的最后一条消息（同一条 run 里模型可能后来又追加了内容）。
-        快照与现查是同一套截断口径（custom/outbox.py），不会出现两种格式。
+        过长只告警、不切文本：静默截断会让模型把“被切了”当成“写完了”。
         """
         spec = self._spec_of(task)
         if spec is None or not task.get("thread_id"):
             return "(no output)"
         try:
-            return _thread_summary(await self._async_client(spec).threads.get(task["thread_id"]))
+            text = _thread_summary(await self._async_client(spec).threads.get(task["thread_id"]))
         except Exception:  # noqa: BLE001
             return "(summary unavailable)"
+        if is_long_result(text):
+            logger.warning("task_result_long", task_id=task.get("task_id"), chars=len(text))
+        return text
 
     @staticmethod
     def _claim_endpoint(

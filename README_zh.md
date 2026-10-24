@@ -258,7 +258,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 1. 在中间输入框问：「CBAM 默认排放因子里铝的因子是多少？」
 2. 主管先 `write_todos` 拆任务 → `start_async_task` 派给 `cbam-reporting` → 回你一句「已派给 CBAM 领域 agent（task_id: …）」。
 3. 右侧「任务」面板出现一张卡：状态从 `running` → `success`，卡片里能看到子 agent 的实时输出与工具步骤（`xlsx_info` / `xlsx_query`）。
-4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则由服务端的**发件箱分发者**（`custom/outbox_dispatcher.py`）开一轮新 run 把它叫醒（失败/崩溃会退避重试，不会丢）。所以你不用手动催「跑完了吗」；但结果消息只带前 500 字摘要，要全文让主管 `check_async_task`。
+4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则由服务端的**发件箱分发者**（`custom/outbox_dispatcher.py`）开一轮新 run 把它叫醒（失败/崩溃会退避重试，不会丢）。所以你不用手动催「跑完了吗」；结果消息带的是子 agent 的**完整最后一条消息**，不用再让主管去取。
 
 ## 10. 父子 agent 之间的信息流通
 
@@ -274,7 +274,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
     │  runs.create(thread_id=子线程,                              │  主管 run 开始 → before_agent 写一条消息
     │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → 发件箱分发者开新一轮（custom/outbox_dispatcher.py）
     │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"
-    │                                                            │  结果取子 agent 最后一条消息，截断 500 字符
+    │                                                            │  结果 = 子 agent 最后一条消息原文（不截断）
     │ ② config.configurable（元数据，不进消息）                   │  身份：以父线程属主的身份建 run（服务端按 user_space 复原权限）
     │  user_spaces = [ 本任务的那一个 space ]                      │
     │  ❗服务端注入的 user_spaces 收窄成单空间，越权由后端拒绝         │ ④ 拉取（工具调用，非推送）
@@ -326,7 +326,7 @@ run 会再试；只有“确实抢到”才投，所以同一个结果不会出�
 一段带 `task_id:` / `run_id:` 的文本，两种都会让判重说谎。
 判重键含 `run_id`，因为 `update_async_task` 会给同一任务开新 run。
 
-投递消息只带前 500 字摘要，超长时末尾带 `…[结果已截断…]`；**全文只能从 `check_async_task` 取**。
+投递消息带子 agent 最后一条消息的**原文，不截断**（超过 3000 字记一条告警，但内容不删减）。
 用表而不是读 state 判重，是因为跨进程才原子，而且不用为了查一个标记把整份对话读回来。主 prompt 另外要求模型对重复通知只更新 todo。
 
 ### 多个子任务同时完成会怎样

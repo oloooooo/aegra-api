@@ -125,9 +125,11 @@ claim 返回 `None`（服务不可达）时**不投**：行还在 `pending`，�
 run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表），不读 thread state；
 分发者空表时每 tick 一次索引扫描，**不依赖 Redis**（Redis 只用于 `executor.submit`）。
 
-**摘要与全文**：投递消息只带前 500 字摘要，超长时追加 `…[结果已截断…调 check_async_task 取全文]`
-（`custom/outbox.py::shorten`，三处写入点同一口径）。全文只有 `check_async_task` 能取
-（deepagents 侧不截断）。
+**正文不截断**：投递消息带子 agent 的最后一条消息**原文**（`custom/outbox.py::result_body`），
+模型一次就能看到全量，不用再调 `check_async_task`。超过 3000 字只打一条
+`task_result_long` / `outbox_result_long` 告警，不静默切文本——截断会让模型把“被切了”
+当成“写完了”，还多花一轮工具调用。发件箱 `summary` 列仍截断 500 字（`shorten`），
+但它只是“现查子线程失败”时的兜底值。
 
 **并发与幂等**（详见 [adr/0010](./adr/0010-task-delivery-idempotency.md)）：
 

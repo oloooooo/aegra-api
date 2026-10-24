@@ -16,14 +16,31 @@ from typing import Any
 # 投递消息的判重/识别前缀：前端 `web/src/stores/chat.ts::toView` 靠它渲染「子 agent 返回」
 PREFIX = "[Async subagent"
 
-# 摘要上限：投递消息只带开头，全文只有 check_async_task 能取（那边不截断）
+# 正文不截断（模型一次就能看到完整结果，不用再调 check_async_task）；超过这个长度只告警，
+# 提醒调大上下文 / 拆任务，不静默切文本。
+LONG_RESULT_WARN = 3000
+
+# **只给发件箱 `summary` 列用**（现查子线程失败时的兜底值）：DB 行没理由存几 MB 文本，
+# 而这一列目前恒为 "(no output)"（子 run 不流 values，ADR-0010 已知问题 #3）。
 SUMMARY_LIMIT = 500
-TRUNCATED = f"…[结果已截断（仅前 {SUMMARY_LIMIT} 字），调 check_async_task 取全文]"
 
 
 def shorten(text: str) -> str:
-    """截断摘要并显式留标记——静默硬切会让模型分不清「写完了」和「被切了」。"""
-    return text if len(text) <= SUMMARY_LIMIT else text[:SUMMARY_LIMIT] + TRUNCATED
+    """截断并显式留标记——静默硬切会让模型分不清「写完了」和「被切了」。
+
+    只用于发件箱 `summary` 列的兜底值；投递正文用 `result_body()`，不截断。
+    """
+    return text if len(text) <= SUMMARY_LIMIT else text[:SUMMARY_LIMIT] + f"…[截断，仅前 {SUMMARY_LIMIT} 字]"
+
+
+def result_body(text: str) -> str:
+    """投递正文：原文返回，不截断。"""
+    return text
+
+
+def is_long_result(text: str) -> bool:
+    """要不要为“子 agent 结果过长”打一条告警（调用方负责记日志）。"""
+    return len(text) > LONG_RESULT_WARN
 
 
 def message_text(msg: Any) -> str:
@@ -39,7 +56,10 @@ def message_text(msg: Any) -> str:
 
 
 def summary_from_output(output: Any) -> str:
-    """子 run 的结论 = 它终态时最后一条消息（截断后）；拿不到给占位。"""
+    """子 run 的结论 = 它终态时最后一条消息（截断后）；拿不到给占位。
+
+    只用于发件箱 `summary` 列的兜底值，所以留截断；投递正文不截断。
+    """
     messages = output.get("messages") if isinstance(output, dict) else None
     if not messages:
         return "(no output)"
