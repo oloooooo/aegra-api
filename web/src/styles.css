@@ -75,6 +75,9 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .msg.tool .body { background: transparent; border-style: dashed; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
 .msg.callback .body { border-color: #2c5c45; background: #14251d; }
 .msg.callback .who { color: var(--ok); }
+/* 状态通知（取消/中断）：只说"它停了"，不是结果 */
+.msg.notice .body { border-color: #4a4a4a; background: #1c1c1c; color: var(--muted, #999); }
+.msg.notice .who { color: var(--muted, #999); }
 
 .msg .body p { margin: 0 0 8px; }
 .msg .body p:last-child { margin-bottom: 0; }

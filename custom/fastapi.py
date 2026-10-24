@@ -6,6 +6,7 @@ from custom.delivery_api import router as delivery_router
 from custom.frontend_api import router as frontend_router
 from custom.outbox_dispatcher import dispatcher as outbox_dispatcher
 from custom.routers import router as userspace_router
+from custom.task_control_api import router as task_control_router
 from custom.threads_delete import (
     assert_shadows_core_delete,
 )
@@ -35,6 +36,7 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(userspace_router)
 app.include_router(frontend_router)
 app.include_router(delivery_router)
+app.include_router(task_control_router)
 app.include_router(uploads_router)
 # 必须在核心路由 include 之前注册，才盖得住原生 delete_thread
 app.include_router(threads_delete_router)

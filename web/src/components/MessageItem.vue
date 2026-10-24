@@ -9,6 +9,7 @@ const who = computed(() => {
   if (props.message.role === "human") return "你";
   if (props.message.role === "tool") return props.message.name ?? "工具";
   if (props.message.role === "callback") return `子 agent「${props.message.name}」返回`;
+  if (props.message.role === "notice") return `子 agent「${props.message.name}」状态`;
   return "assistant";
 });
 

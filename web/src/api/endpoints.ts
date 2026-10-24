@@ -91,6 +91,13 @@ export const runStream = (threadId: string, body: unknown, signal?: AbortSignal)
 export const taskStream = (taskId: string, parentThreadId: string, signal?: AbortSignal) =>
   sse(`/custom/tasks/${taskId}/stream?parent_thread_id=${encodeURIComponent(parentThreadId)}`, { method: "GET" }, signal);
 
+/** 取消一个子任务（子线程属主是服务账号，后端代理一次 cancel）。 */
+export const cancelTask = (taskId: string, parentThreadId: string, runId: string) =>
+  api<{ cancelled: boolean }>(`/custom/tasks/${taskId}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ parent_thread_id: parentThreadId, run_id: runId }),
+  });
+
 export const cancelRun = (threadId: string, runId: string) =>
   api<unknown>(`/threads/${threadId}/runs/${runId}/cancel`, { method: "POST", body: JSON.stringify({ action: "interrupt" }) });
 

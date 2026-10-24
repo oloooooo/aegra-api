@@ -123,6 +123,18 @@ watch(tab, (t) => {
 });
 
 const taskList = computed(() => Object.values(chat.tasks));
+
+// 与服务端 _TERMINAL 对齐：终态任务不再显示"停止"
+const DONE = new Set(["cancelled", "success", "error", "timeout", "interrupted"]);
+const done = (status: string) => DONE.has(status);
+
+async function stop(taskId: string) {
+  try {
+    await chat.cancelTask(taskId);
+  } catch (e) {
+    notice.value = e instanceof Error ? e.message : String(e);
+  }
+}
 </script>
 
 <template>
@@ -143,6 +155,9 @@ const taskList = computed(() => Object.values(chat.tasks));
           <div class="row" style="justify-content: space-between">
             <h4>{{ t.agent_name }}</h4>
             <span :class="['badge', t.status]">{{ t.status }}</span>
+          </div>
+          <div class="row" style="justify-content: flex-end; margin-top: 2px">
+            <button v-if="!done(t.status)" class="tiny ghost" @click="stop(t.task_id)">停止</button>
           </div>
           <div class="meta">{{ t.task_id.slice(0, 8) }} · {{ t.message_count ?? "-" }} 条消息</div>
           <div v-if="t.events.length" class="meta" style="margin-top: 6px">

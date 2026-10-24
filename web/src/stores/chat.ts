@@ -8,7 +8,7 @@ const TERMINAL = new Set(["cancelled", "success", "error", "timeout", "interrupt
 
 export type ViewMessage = {
   key: string;
-  role: "human" | "ai" | "tool" | "callback";
+  role: "human" | "ai" | "tool" | "callback" | "notice";
   content: string;
   name?: string;
   toolCalls?: boolean;
@@ -32,7 +32,9 @@ function toView(m: api.ChatMessage, i: number): ViewMessage {
   const type = m.type ?? m.role ?? "ai";
   if (type === "human" && raw.startsWith("[Async subagent")) {
     const name = /\[Async subagent '([^']+)'/.exec(raw)?.[1] ?? "subagent";
-    return { key: m.id ?? `cb-${i}`, role: "callback", content: raw.replace(/^\[Async subagent[^\]]*\]\s*(Result:\s*)?/, ""), name };
+    // 状态通知（was cancelled / was interrupted）不带 Result:，渲染成灰色状态条而不是结果卡片
+    const role = /Result:/.test(raw) ? "callback" : "notice";
+    return { key: m.id ?? `cb-${i}`, role, content: raw.replace(/^\[Async subagent[^\]]*\]\s*(Result:\s*)?/, ""), name };
   }
   if (type === "tool") return { key: m.id ?? `t-${i}`, role: "tool", content: raw.slice(0, 300), name: m.name ?? undefined };
   return { key: m.id ?? `${type}-${i}`, role: type === "human" ? "human" : "ai", content: raw, toolCalls: !!m.tool_calls?.length };
@@ -248,6 +250,15 @@ export const useChat = defineStore("chat", () => {
     running.value = false;
   }
 
+  /** 取消一个子任务；成功后不再订阅它的流（状态会随下一次 refreshState 更新）。 */
+  async function cancelTask(id: string) {
+    const t = tasks[id];
+    if (!t || !threadId.value) return;
+    taskAborts[id]?.abort();
+    await api.cancelTask(id, threadId.value, t.run_id);
+    t.status = "cancelled";
+  }
+
   async function cancel() {
     if (!threadId.value || !currentRun.value) return;
     try {
@@ -296,7 +307,7 @@ export const useChat = defineStore("chat", () => {
   return {
     identity, permissions, isSuper, threads, threadId, messages, streaming, interrupts, tasks,
     activeTasks, running, error, currentRun,
-    login, bootstrap, logout, loadThreads, openThread, refreshState, send, resume, cancel,
+    login, bootstrap, logout, loadThreads, openThread, refreshState, send, resume, cancel, cancelTask,
     removeThread, isAuthError,
   };
 });
