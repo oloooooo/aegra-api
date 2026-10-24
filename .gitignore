@@ -232,3 +232,6 @@ references/
 # 前端（web/）：依赖与产物不入库
 web/node_modules/
 web/dist/
+
+# 临时草稿（如 tmp_ascii.md）
+tmp_*
