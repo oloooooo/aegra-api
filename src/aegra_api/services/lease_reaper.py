@@ -18,7 +18,7 @@ from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.observability.metrics import REAPER_RECOVERED_RUNS
-from aegra_api.services.run_status import set_thread_status_if_no_active_runs
+from aegra_api.services.run_status import _enqueue_task_result, set_thread_status_if_no_active_runs
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -182,6 +182,9 @@ class LeaseReaper:
                 if is_exhausted:
                     exhausted.append(run_id)
                     exhausted_threads_by_user.setdefault(user_id, set()).add(thread_id)
+                    # 子 agent 崩溃重试用尽 = 结果确定没了。必须入发件箱，否则主管永远
+                    # 等一个再也不会来的结果（它是最后一个能发现这件事的地方）。
+                    await _enqueue_task_result(session, run_id=run_id, thread_id=thread_id, status="error")
                     logger.error(
                         "Run exceeded max retries, marking as permanently failed",
                         run_id=run_id,
