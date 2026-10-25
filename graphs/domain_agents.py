@@ -31,7 +31,7 @@ from langgraph.graph.state import RunnableConfig
 from graphs import session_scope
 from graphs.llms import model
 from graphs.space_access import allowed_spaces
-from graphs.space_agents import KNOWLEDGE_ROOT, has_tables, load_agent_spec
+from graphs.space_agents import has_tables, knowledge_root, load_agent_spec
 from graphs.space_backend import SpaceBackend
 from graphs.tools import XLSX_TOOLS
 
@@ -79,7 +79,7 @@ def graph(config: RunnableConfig) -> Any:  # noqa: ANN401 — 返回编译后的
         # `/uploads/` 路由到本会话的 store 命名空间（ADR-0015 §4.1）。xlsx 的字节走工具直读
         # 对象存储，不经过 backend。
         backend=CompositeBackend(
-            default=SpaceBackend(root_dir=KNOWLEDGE_ROOT),
+            default=SpaceBackend(root_dir=knowledge_root()),
             routes={"/uploads/": StoreBackend(namespace=session_scope.uploads_namespace)},
         ),
         permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],

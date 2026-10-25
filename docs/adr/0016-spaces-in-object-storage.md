@@ -19,24 +19,33 @@ deepagents 的 `FilesystemBackend` 读取，8 个 fs 工具全部经它。两个
 
 ### 2. `OKF_BACKEND` env 二选一：`local` | `s3`
 
-- `local`（缺省，本地开发）：`SpaceBackend(FilesystemBackend)`，与今天完全一致；
-- `s3`：只读的 `SpaceObjectBackend`，`BackendProtocol` 的 S3 实现。
+- `local`（缺省，本地开发）：直接读 `graphs/okf/`；
+- `s3`：读 S3 `okf/` 前缀的**本地镜像**（`OKF_MIRROR_DIR`，缺省 `.cache/okf`），
+  镜像缺失或 `OKF_MIRROR_TTL_SECONDS` 到期时自动拉一次。
 
-两条实现**共用同一套路径判定**：`_check_read` / `_check_write` / 内部驱逐前缀
-（`graphs/space_backend.py` 现在是单点，搬走后必须还是单点）。做法是把判定抽成 mixin，
-两个类只差存储层。
+两条实现共用同一个 `SpaceBackend` 与同一套路径判定（`_check_read` / `_check_write` /
+内部驱逐前缀仍是单点）。差别只在 `root_dir` 指向哪里：`graphs/okf` 或镜像目录。
+
+> **决定变更（2026-10-25 实现时）**
+>
+> 初稿写的是“手写一个 `BackendProtocol` 的只读 S3 实现”。实现时否掉了：协议有 14 个方法
+> （`ls` / `read` / `grep` / `glob` / `write` / `edit` / `delete` / `upload` / `download` 加各自的 async 版），
+> 而 `ls` 的 virtual_mode 语义、`grep` 的 glob 契约、`read` 的分页与二进制判定都很细。
+> 重写一遍的正确性风险远大于收益，而且任何偏差都会**静默**改变 agent 行为（读到少一行、
+> 漏一个命中，没人会报错）。镜像方案换来同样的性质（多副本看到同一份空间内容）且
+> 零语义风险：8 个 fs 工具走的还是已经在用的那份实现。
+>
+> **升级触发**：空间大到不能整体镜像（闀值 ~100 MB）或要求“改完立即对所有副本生效”。
 
 ### 3. 只读（Q6a 不变）
 
 写全部 deny。`SpaceObjectBackend` 的 `write_file` / `edit_file` / `delete` 一律返回拒绝，
 与现在的 `permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")]` 一致。
 
-### 4. 一键上传脚本 `scripts/okf_push_s3.py`
+### 4. 两个脚本
 
-- 遍历 `graphs/okf/`，逐个 PUT 到 `okf/<相对路径>`；
-- 幂等：先比本地 md5 与 S3 ETag（单次 PUT 的 ETag 就是 md5），相同则跳过；
-- `--dry-run` 只打印；`--prune` 删掉 S3 上本地已不存在的对象；
-- 退出码：0 成功、1 有失败（供 CI 用）。
+- `scripts/okf_push_s3.py`：`graphs/okf` → S3 `okf/`，幂等（大小相同跳过），`--dry-run` / `--prune`；
+- `scripts/okf_pull_s3.py`：S3 `okf/` → 本地镜像，同样幂等（`knowledge_root()` 自动调用它）。
 
 ### 5. 为什么自己写
 
@@ -58,12 +67,10 @@ deepagents 0.7.23 的 `backends/` 里没有 S3；PyPI 0.7.32 的依赖里也没�
 
 **要接受的**：
 
-- 多约 200 行 `BackendProtocol` 实现 + 一组单测；**`grep`/`glob` 在 S3 上没有索引**，
-  只能 list + 逐个 GET，空间大了会慢（现在总计 145 K，暂时无妨）。
-- 双实现意味着以后改路径判定要两边一起测。
-- 部署多一个组件（SeaweedFS），但它在 ADR-0015 里已经要了，不重复计。
-- `has_tables()`（决定装不装 xlsx 四件套）在 `s3` 模式下要改成查前缀，
-  不能再用 `space_dir(space).glob("*.xlsx")`。
+- 多一个拉取步骤：`s3` 模式下镜像不存在时会在第一次构图时拉一次（阻塞），或显式跑
+  `scripts/okf_pull_s3.py`。改了空间内容需要重新拉（或设 `OKF_MIRROR_TTL_SECONDS`）。
+- 镜像占本地磁盘（现在 145 K），且**不是**实时同步。
+- `has_tables()`（决定装不装 xlsx 四件套）跟着镜像走，无需改代码。
 
 ## 怎么验证（本地）
 

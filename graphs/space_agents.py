@@ -22,10 +22,13 @@ import os
 import re
 from pathlib import Path
 
+from graphs.okf_mirror import knowledge_root
+
 # 项目根（= 仓库根）。space.path 存的相对路径以它为基准（frontend_api 也这么解）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# 知识空间根：与 graphs/deepagents_nodes.py 同一套 OKF_DIR（绝对路径会覆盖前面的拼接）
+# 知识空间根：`OKF_BACKEND=local` 是 `graphs/okf`，`=s3` 是 S3 的本地镜像（ADR-0016）。
+# 保留 `KNOWLEDGE_ROOT` 这个常量名给老调用点，真正的解析统一走 `okf_mirror.knowledge_root()`。
 KNOWLEDGE_ROOT = Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf")
 
 AGENT_FILE = "AGENT.md"
@@ -50,8 +53,8 @@ def valid_space_name(name: str) -> bool:
 
 
 def space_dir(space: str) -> Path:
-    """空间对应的目录：知识空间根下的同名文件夹。"""
-    return KNOWLEDGE_ROOT / space
+    """空间对应的目录：知识空间根下的同名文件夹（s3 模式下是本地镜像）。"""
+    return knowledge_root() / space
 
 
 def space_rel_path(space: str) -> str:
@@ -60,7 +63,6 @@ def space_rel_path(space: str) -> str:
     统一用 POSIX 分隔符：这个值会入库，不能随构建平台变成反斜线。
     """
     return Path(os.path.relpath(space_dir(space), PROJECT_ROOT)).as_posix()
-
 
 def parse_agent_md(text: str) -> tuple[dict[str, str], str]:
     """拆 frontmatter 与正文；没有 frontmatter 时返回 ({}, 原文)。"""

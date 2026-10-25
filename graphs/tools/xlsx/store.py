@@ -35,11 +35,11 @@ class Remote:
 def cache_dir() -> Path:
     return Path(os.getenv("XLSX_CACHE_DIR") or ".cache/xlsx").resolve()
 
-
 def root() -> Path:
-    """与 FilesystemBackend 同一根：虚拟路径 /a.xlsx 落到 <okf>/a.xlsx。"""
-    # __file__ = <仓库>/graphs/tools/xlsx/store.py → parents[3] = <仓库>，再拼 graphs/OKF_DIR
-    return (Path(__file__).resolve().parents[3] / "graphs" / os.getenv("OKF_DIR", "okf")).resolve()
+    """与 backend 同一根：虚拟路径 /a.xlsx 落到 <okf>/a.xlsx（s3 模式下是本地镜像）。"""
+    from graphs.okf_mirror import knowledge_root  # 懒导入：避免 tools 包启动时拖上 blobs
+
+    return knowledge_root()
 
 
 def resolve_local(path: str | Path) -> Path:

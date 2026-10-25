@@ -29,7 +29,7 @@ from graphs import session_scope
 from graphs.async_task_guard import AsyncTaskGuard
 from graphs.session_files import SessionFilesMiddleware
 from graphs.space_access import allowed_spaces
-from graphs.space_agents import KNOWLEDGE_ROOT, list_spaces, load_agent_spec, space_dir
+from graphs.space_agents import knowledge_root, list_spaces, load_agent_spec, space_dir
 from graphs.space_backend import SpaceBackend
 from graphs.prompts import MAIN_SYSTEM_PROMPT
 from graphs.tools import MAIN_TOOLS, XLSX_TOOLS
@@ -125,7 +125,7 @@ def supervisor_backend() -> CompositeBackend:
     路由是另一件事；`CompositeBackend` 是纯前缀匹配，`/uploads/x.md` 根本不会到它那里。
     """
     return CompositeBackend(
-        default=SpaceBackend(root_dir=KNOWLEDGE_ROOT),
+        default=SpaceBackend(root_dir=knowledge_root()),
         routes={"/uploads/": StoreBackend(namespace=_uploads_namespace)},
     )
 
