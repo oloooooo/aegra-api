@@ -26,7 +26,8 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from custom.outbox import completion_text, is_long_result, result_body
-from graphs.async_task_guard import AsyncTaskGuard, _completion_text, _status_of_run
+from custom.outbox import task_status_of_run as _status_of_run
+from graphs.async_task_guard import AsyncTaskGuard, _completion_text
 
 FAILS: list[str] = []
 

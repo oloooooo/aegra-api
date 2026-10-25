@@ -102,7 +102,7 @@ from langgraph.types import Command
 from langgraph_sdk import get_client, get_sync_client
 from langgraph_sdk.client import LangGraphClient, SyncLangGraphClient
 
-from custom.outbox import completion_text, is_long_result, message_text, notice_text, result_body
+from custom.outbox import completion_text, is_long_result, message_text, notice_text, result_body, task_status_of_run
 from graphs.space_access import allowed_spaces, current_identity
 
 logger = structlog.getLogger(__name__)
@@ -118,21 +118,6 @@ _TASK_MARK = "task_id: "
 
 
 # ============================ A. 文本与判重（纯函数） ============================
-
-
-def _status_of_run(run: dict[str, Any]) -> str | None:
-    """服务端 run → 父 state 里的任务状态。
-
-    `interrupted` 在服务端是一个词，靠 `interrupted_by` 区分两件事：
-    - `cancel`（客户端取消 / 被顶掉）→ `cancelled`：这一轮作废，没有结果
-    - `hitl`（图停在人工确认点）→ `interrupted`：现场还在，理论上可续
-    不映射的话父 state 里 `cancelled`（工具写的）会被刷成 `interrupted`（服务端写的），
-    同一个状态两个词，判重和通知都会错。
-    """
-    status = run.get("status")
-    if status != "interrupted":
-        return status
-    return "cancelled" if run.get("interrupted_by") == "cancel" else "interrupted"
 
 
 def _now() -> str:
@@ -464,7 +449,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 run = self._sync_client(spec).runs.get(task["thread_id"], task["run_id"])
             except Exception:  # noqa: BLE001
                 continue
-            status = _status_of_run(run)
+            status = task_status_of_run(run)
             if status and status != task.get("status"):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out
@@ -479,7 +464,7 @@ class AsyncTaskGuard(AgentMiddleware):
                 run = await self._async_client(spec).runs.get(task["thread_id"], task["run_id"])
             except Exception:  # noqa: BLE001
                 continue
-            status = _status_of_run(run)
+            status = task_status_of_run(run)
             if status and status != task.get("status"):
                 out[task["task_id"]] = {**task, "status": status, "last_checked_at": _now()}
         return out

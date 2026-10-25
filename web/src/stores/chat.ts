@@ -258,13 +258,22 @@ export const useChat = defineStore("chat", () => {
     running.value = false;
   }
 
-  /** 取消一个子任务；成功后不再订阅它的流（状态会随下一次 refreshState 更新）。 */
+  /** 取消一个子任务；成功后不再订阅它的流，并立刻拉一次真实状态。
+   *
+   * 为什么必须重拉：父 state 里的 `async_tasks[tid].status` 要等主管下一轮 run 才刷新，
+   * 中间任何一次 refreshState 都会用那个陈旧的 `running` 把卡片刷回去。
+   */
   async function cancelTask(id: string) {
     const t = tasks[id];
     if (!t || !threadId.value) return;
     taskAborts[id]?.abort();
     await api.cancelTask(id, threadId.value, t.run_id);
     t.status = "cancelled";
+    try {
+      if (tasks[id]) tasks[id] = { ...tasks[id], ...(await api.task(id, threadId.value)) };
+    } catch {
+      /* 状态刷新失败不影响已显示的取消 */
+    }
   }
 
   async function cancel() {

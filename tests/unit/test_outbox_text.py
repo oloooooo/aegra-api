@@ -5,7 +5,7 @@
 又派了同名 hybrid-bonding 任务）。
 """
 
-from custom.outbox import PREFIX, completion_text, notice_text
+from custom.outbox import PREFIX, completion_text, notice_text, task_status_of_run
 
 
 def test_cancelled_notice_tells_supervisor_not_to_redispatch() -> None:
@@ -25,3 +25,11 @@ def test_interrupted_notice_stays_resumable() -> None:
 def test_success_result_text_unchanged() -> None:
     text = completion_text("task-3", "run-3", "domain_agent", "success", "结论")
     assert text == f"{PREFIX} 'domain_agent' has completed] Result: 结论\n\ntask_id: task-3\nrun_id: run-3"
+
+
+def test_status_of_run_splits_interrupted_by_cause() -> None:
+    """服务端只有 interrupted 一个词；父 state / 前端必须靠 interrupted_by 拆成两个。"""
+    assert task_status_of_run({"status": "success"}) == "success"
+    assert task_status_of_run({"status": "interrupted", "interrupted_by": "cancel"}) == "cancelled"
+    assert task_status_of_run({"status": "interrupted", "interrupted_by": "hitl"}) == "interrupted"
+    assert task_status_of_run({}) is None  # 查不到状态：调用方保留原值

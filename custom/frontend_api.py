@@ -34,6 +34,7 @@ from aegra_api.core.auth_deps import require_auth
 from aegra_api.core.orm import get_session
 from aegra_api.core.sse import format_sse_message, get_sse_headers
 from aegra_api.models.auth import User
+from custom.outbox import task_status_of_run
 from custom.repositories import SpaceRepository, UserSpaceRepository
 from custom.services import service_token
 
@@ -136,7 +137,7 @@ async def _fresh_status(request: Request, task: dict[str, Any]) -> dict[str, Any
     """向子 run 核实真实状态（state 里的 status 可能停在 running，见 guard 注释）。"""
     try:
         run = await _service_client(request).runs.get(task["thread_id"], task["run_id"])
-        task = {**task, "status": run.get("status") or task.get("status")}
+        task = {**task, "status": task_status_of_run(run) or task.get("status")}
     except Exception as e:  # noqa: BLE001 — 查不到就回原状态，不阻断前端
         logger.warning("task_status_refresh_failed", task_id=task.get("task_id"), error=str(e))
     return task

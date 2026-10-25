@@ -31,6 +31,21 @@ def is_long_result(text: str) -> bool:
     return len(text) > LONG_RESULT_WARN
 
 
+def task_status_of_run(run: dict[str, Any]) -> str | None:
+    """服务端 run → 父 state 里的任务状态。
+
+    `interrupted` 在服务端是一个词，靠 `interrupted_by` 区分两件事：
+    - `cancel`（客户端取消 / 被顶掉）→ `cancelled`：这一轮作废，没有结果
+    - `hitl`（图停在人工确认点）→ `interrupted`：现场还在
+    不映射的话父 state 里 `cancelled` 会被刷成 `interrupted`，同一个状态两个词，
+    判重和通知都会错（ADR-0014 §1）。guard 与前端代理共用这一处。
+    """
+    status = run.get("status")
+    if status != "interrupted":
+        return status
+    return "cancelled" if run.get("interrupted_by") == "cancel" else "interrupted"
+
+
 def message_text(msg: Any) -> str:
     """消息正文：兼容 str / content 块列表 / dict 三种形态。"""
     content = getattr(msg, "content", None)
