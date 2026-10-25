@@ -69,6 +69,9 @@ def _check_scope(path: str | Path, config: object) -> None:
     """空间隔离（ADR-0005）：XLSX_TOOLS 不经 backend（自己 openpyxl 读盘），
     必须在 tool 层拦：虚拟路径第一段 ∈ allowed spaces，或根散文件共享只读。
     无鉴权上下文（本地 demo）不设限；相对路径在受限时直接拒绝（它绕开 OKF 根）。
+
+    判定落在**解析后**的路径上：`/空间A/../空间B/x.xlsx` 首段是 A（有权限），但真正
+    被打开的是 B 的文件。只比对原始字符串等于不设防（带 `..` 与符号链接一起兜住）。
     """
     spaces = allowed_spaces(config)  # type: ignore[arg-type]
     if spaces is None:
@@ -76,11 +79,21 @@ def _check_scope(path: str | Path, config: object) -> None:
     raw = str(path).strip()
     if not raw.startswith(("/", "\\")):
         raise ValueError(f"受限模式下必须用以 / 开头的虚拟路径（/空间名/文件.xlsx）：{path}")
-    rel = raw.lstrip("/\\")
-    first = rel.split("/", 1)[0]
+    root = _root()
+    try:
+        # resolve 不要求路径存在，所以不会把「文件不存在」提前偷成别的错
+        target = (root / raw.lstrip("/\\")).resolve()
+    except OSError as e:  # 非法字符 / 保留名 / 路径过长
+        raise ValueError(f"路径非法：{path}") from e
+    if target != root and root not in target.parents:
+        raise ValueError(f"路径越界：{path}")
+    parts = target.relative_to(root).parts
+    if not parts:
+        return  # "/" 本身；ls 类调用方自己按规则过滤
+    first = parts[0]
     if first in spaces:
         return  # 文件是否存在由 _resolve 报
-    if "/" not in rel and (_root() / first).is_file():
+    if len(parts) == 1 and target.is_file():
         return  # 根散文件共享只读（Q3b）
     visible = sorted(spaces) or ["（无）"]
     raise ValueError(f"无权访问 {path}：{first} 不在你的空间列表 {visible} 内")
@@ -156,7 +169,7 @@ def _search(path: str, keyword: str, sheet: str | None, header: int, limit: int)
     for name, df, str_df, mask in scanned:
         if len(hits) >= min(limit, _MAX_HITS):
             break
-        for r, c in zip(*mask.to_numpy().nonzero()):
+        for r, c in zip(*mask.to_numpy().nonzero(), strict=False):
             value = str(str_df.iat[r, c])[:_MAX_VALUE_LEN]
             hits.append(f"{name} | Excel第{r + header + 2}行 | {df.columns[c]} | {value}")
             if len(hits) >= min(limit, _MAX_HITS):
