@@ -61,6 +61,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "bcrypt>=5.0.0",
     "pandoc",
+    "boto3>=1.43.118",
 ]
 
 [project.urls]
