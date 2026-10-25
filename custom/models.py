@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -136,3 +137,46 @@ class AsyncTaskOutbox(Base):
 
     def __repr__(self) -> str:
         return f"<AsyncTaskOutbox {self.task_id!r}/{self.run_id!r} {self.status} attempts={self.attempts}>"
+
+
+class SessionObject(Base):
+    """会话文件里二进制的元数据（ADR-0015）。字节在对象存储，行在这里。
+
+    主键 `(上传者, 主管 thread, 文件名)`：同名覆盖是 PUT 语义，不是版本链。
+    唯一约束落在 DB 上（不靠"先查后插"），并发同名上传只会有一行活下来。
+    """
+
+    __tablename__ = "session_object"
+
+    owner_identity: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey("user_tables.identity", ondelete="CASCADE"),
+        primary_key=True,
+        comment="上传者身份；与 thread_id 一起构成私有隔离前缀",
+    )
+    thread_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, comment="主管线程 id（= 会话），删会话即删"
+    )
+    name: Mapped[str] = mapped_column(
+        String(200), primary_key=True, comment="上传文件名，形如 <空间名>_<表名>.xlsx"
+    )
+    space: Mapped[str] = mapped_column(
+        String(100), comment="从文件名前缀解析出的空间名，只用于路由到子 agent 与展示，**不是**隔离键"
+    )
+    object_key: Mapped[str] = mapped_column(String(512), comment="对象存储 key（含 {sha16}）")
+    sha256: Mapped[str] = mapped_column(String(64), comment="内容哈希；表索引的缓存键")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, comment="字节数；配额按它累加")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        # 配额查询：WHERE owner_identity=… 的 sum(size_bytes) / count(*)
+        Index("ix_session_object_owner", "owner_identity"),
+        # 删会话时按 (owner, thread) 找行
+        Index("ix_session_object_thread", "thread_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SessionObject {self.owner_identity!r}/{self.thread_id!r}/{self.name!r} {self.size_bytes}B>"

@@ -62,7 +62,7 @@ CREATE TABLE session_object (
     space          VARCHAR(100) NOT NULL,   -- 从文件名前缀解析，仅用于展示/审计
     object_key     VARCHAR(512) NOT NULL,
     sha256         CHAR(64)     NOT NULL,
-    bytes          BIGINT       NOT NULL,
+    size_bytes     BIGINT       NOT NULL,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     PRIMARY KEY (owner_identity, thread_id, name)
