@@ -2,7 +2,7 @@
 
 前端（独立仓库，Vue 3 + Vite）对接本服务时的接口契约。全部结论来自**实测**（真起服务、跑 supervisor 与三个领域子 agent）。
 
-实现位置：`custom/frontend_api.py`（路由前缀 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
+实现位置：`custom/frontend_api.py`、`custom/uploads.py`、`custom/task_control_api.py`（路由前缀都是 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
 
 另有 **3 个内部接口**：
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | `POST /custom/tasks/{task_id}/deliver-claim` | 主管侧拦截层 / 分发者 | 把发件箱行从 `pending` 原子翻成 `delivered`（[adr/0010](./adr/0010-task-delivery-idempotency.md)） |
 | `DELETE` 同名 | 同上 | 撤销认领 |
-| `POST /custom/tasks/{task_id}/cancel` | **前端**（侧栏任务卡「停止」） | 取消一个子任务。子线程属主是服务账号，用户 token 打不通原生 `cancel`，所以后端代理一次（[adr/0014](./adr/0014-no-hitl-for-eval.md)） |
+| `POST /custom/tasks/{task_id}/cancel` | **前端**（侧栏任务卡「取消」） | 取消一个子任务。子线程属主是服务账号，用户 token 打不通原生 `cancel`，所以后端代理一次（[adr/0014](./adr/0014-no-hitl-for-eval.md)） |
 
 前者鉴权只允许父线程属主或服务身份；`cancel` 同样。
 
@@ -115,6 +115,22 @@ event: end        data: {"status": "success"}
 - `stream_mode` 查询参数可覆盖，默认 `messages,custom`；`values` 每步都是整态快照，量大，要才加。
 
 前置条件：子 run 创建时必须声明 `stream_mode=["messages","custom"]`（`graphs/async_task_guard.py` 已声明）。若不声明，aegra 默认只产 `values`，代理订阅不到 token 流。
+
+### 3.7 `POST /custom/uploads`
+
+把一个 md 文件挂到当前会话（[adr/0013](./adr/0013-session-files-live-in-store.md)）。`multipart/form-data`，字段 `thread_id` + `file`。
+
+```json
+{"name": "报告.md", "path": "/uploads/报告.md", "bytes": 12034,
+ "uploaded_at": "2026-10-24T02:11:03+00:00", "ttl_minutes": 4320}
+```
+
+- 校验顺序固定：会话归属 → 文件名 → 扩展名 → 大小 → 编码。先挡归属与文件名，再边读边判大小（超限即 `413`），最后才解码。
+- 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `MAX_UPLOAD_MB`（默认 10）或本会话文件数已达 `MAX_FILES_PER_SESSION`（默认 50）`413`；store 未就绪 `503`。
+- 同名重传 = 覆盖（PUT 语义，`/uploads` 下永远只有一份），不占新名额。
+- 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。子 agent 看不到；主管**下一轮 run 起始**才拿到清单（`graphs/session_files.py`），所以本轮 run 看不到刚传的文件。
+- 孤儿 TTL 默认 72 小时（`UPLOAD_TTL_MINUTES`）：活跃会话每轮读清单会续期，没人读才过期；删会话即清空。
+- **没有列表/删除接口**：前端只能自己记住传过什么；要删文件目前只能删会话。
 
 ## 4. 直接用的原生接口
 
@@ -231,5 +247,5 @@ POST /threads/{thread_id}/runs/crons
 
 - 代理接口是**单次 Run 订阅**：子 agent 若被 `update_async_task` 再跑一轮，前端要按新的 `run_id` 重新连。
 - `service_token()` 是 10 年期长期 token（沿用 ADR-0004 的 shortcut），只在服务端使用，不下发浏览器。
-- 没有文件上传接口：用户目前无法把文件写进自己的 Space。
+- 没有把文件写进 Space 的接口：上传只到会话文件（`POST /custom/uploads`，§3.7）；也没有列出/删除已上传文件的接口（删会话即清空）。
 - 没有 refresh token。

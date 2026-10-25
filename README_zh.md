@@ -249,7 +249,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
 | 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：按 §6.2 启动（`docker start redis6`），或把该开关设回 `false` 并只用单进程启动 |
 | 取消后 run 还在继续跑 | 多进程启动但没开 Redis：取消信号跨不了进程（ADR-0009）。开 Redis 或改单进程 |
-| 建会话报 403「会话数已达上限」 | 每个账号默认最多 20 个会话（`MAX_THREADS_PER_USER`，ADR-0012）；删掉不用的会话即可，删会话会连带删它的子线程 |
+| 建会话报 403「会话数已达上限」 | 每个账号默认最多 200 个会话（`MAX_THREADS_PER_USER`，ADR-0012）；删掉不用的会话即可，删会话会连带删它的子线程 |
 
 ---
 
