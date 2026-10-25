@@ -23,17 +23,16 @@ class deepAgentContext(BaseModel):
 
 
 from langchain.tools import InjectedToolArg, tool, ToolRuntime
-from langgraph.config import get_config
 from langgraph.graph.state import RunnableConfig
 from langchain.agents.middleware import TodoListMiddleware
-from custom.session_store import session_namespace
+from graphs import session_scope
 from graphs.async_task_guard import AsyncTaskGuard
 from graphs.session_files import SessionFilesMiddleware
-from graphs.space_access import allowed_spaces, current_identity
+from graphs.space_access import allowed_spaces
 from graphs.space_agents import KNOWLEDGE_ROOT, list_spaces, load_agent_spec, space_dir
 from graphs.space_backend import SpaceBackend
 from graphs.prompts import MAIN_SYSTEM_PROMPT
-from graphs.tools import MAIN_TOOLS
+from graphs.tools import MAIN_TOOLS, XLSX_TOOLS
 
 logger = structlog.getLogger(__name__)
 
@@ -110,13 +109,13 @@ def domain_specs(config: RunnableConfig) -> dict[str, dict]:
 
 
 def _uploads_namespace(_runtime: object) -> tuple[str, ...]:
-    """`/uploads/` 路由的 store 命名空间：身份与线程都取服务端注入的 config。
+    """`/uploads/` 路由的 store 命名空间（ADR-0013 / ADR-0015 §4.1）。
 
-    不用 ``runtime.context``——那是客户端可控的；也不分给子 agent，会话文件只对主管可见。
+    主管 run：身份与线程都取服务端注入的 config（不用 ``runtime.context``，那是客户端可控的）。
+    子 agent run：取派活时 `AsyncTaskGuard` 签发的 `session_scope`（验签后）——所以同一条
+    会话里的 md 对子 agent 也可读，但它读不到别的主管的会话。
     """
-    config = get_config() or {}
-    conf = config.get("configurable") or {}
-    return session_namespace(current_identity(config), str(conf.get("thread_id") or ""))
+    return session_scope.uploads_namespace()
 
 
 def supervisor_backend() -> CompositeBackend:
@@ -137,7 +136,7 @@ def graph(config: RunnableConfig):  # noqa: ANN201 — 返回编译后的图
     return create_deep_agent(
         model=model,
         system_prompt=MAIN_SYSTEM_PROMPT,
-        tools=[*MAIN_TOOLS],
+        tools=[*MAIN_TOOLS, *XLSX_TOOLS],
         # 按空间隔离的 backend + 会话文件的 /uploads 路由（ADR-0013）
         backend=supervisor_backend(),
         context_schema=deepAgentContext,

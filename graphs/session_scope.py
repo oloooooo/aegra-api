@@ -80,3 +80,30 @@ def resolve(config: Any) -> tuple[str, str] | None:
 def field(scope: Any, key: str, default: Any = None) -> Any:
     """dict / pydantic 都能取，保持与 `space_access._field` 一致的行为。"""
     return _field(scope, key, default)
+
+
+_CONFIG_UNSET: Any = object()
+
+
+def current_config() -> Any:
+    """当前 run 的 config；图外（测试/脚本）返回空 dict。"""
+    try:
+        from langgraph.config import get_config
+
+        return get_config() or {}
+    except RuntimeError:
+        return {}
+
+
+def uploads_namespace(_runtime: Any = None) -> tuple[str, ...]:
+    """`/uploads/` 路由的 Store 命名空间。
+
+    主管 run 用自身的 `(identity, thread)`；子 agent 用派活时签发的 `session_scope`。
+    拿不到作用域时返回一个**死命名空间**——读不到任何会话文件，也不会撞上真会话。
+    """
+    from custom.session_store import NAMESPACE_PREFIX, session_namespace
+
+    scope = resolve(current_config())
+    if scope is None:
+        return (NAMESPACE_PREFIX, "_none", "_none")
+    return session_namespace(*scope)
