@@ -50,10 +50,14 @@ MAX_UPLOAD_MB = _int_env("MAX_UPLOAD_MB", 10)
 MAX_FILES_PER_SESSION = _int_env("MAX_FILES_PER_SESSION", 50)
 
 
+def identity_digest(identity: str) -> str:
+    """身份的短摘要（Store 命名空间与对象存储前缀共用，两处必须一致）。"""
+    return hashlib.sha256((identity or "").encode("utf-8")).hexdigest()[:16]
+
+
 def session_namespace(identity: str, thread_id: str) -> tuple[str, ...]:
     """会话文件的 store 命名空间：(uploads, h(身份), 主管 thread_id)。"""
-    digest = hashlib.sha256((identity or "").encode("utf-8")).hexdigest()[:16]
-    return (NAMESPACE_PREFIX, digest, thread_id)
+    return (NAMESPACE_PREFIX, identity_digest(identity), thread_id)
 
 
 def session_key(name: str) -> str:
