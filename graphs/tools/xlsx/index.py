@@ -26,6 +26,10 @@ _MAX_ROWS = 200
 _MAX_HITS = 100
 _MAX_VALUE_LEN = 80
 _QUERY_BUDGET_MS = int(os.environ.get("XLSX_QUERY_BUDGET_MS") or 5000)
+# 结构性硬闸：不依赖字节大小（同样 10 MB，可以是 30 万 cell，也可以是 500 万）
+_MAX_CELLS = int(os.environ.get("MAX_CELLS") or 2_000_000)
+# 本机缓存（索引与字节）的保留天数
+_CACHE_TTL_DAYS = int(os.environ.get("XLSX_CACHE_TTL_DAYS") or 7)
 
 _ALLOWED_ACTIONS = {
     sqlite3.SQLITE_SELECT,
@@ -79,16 +83,52 @@ def build(xlsx: Path, dest: Path, header: int) -> None:
         conn.close()
 
 
+def _cell_count(xlsx: Path) -> int:
+    """用 openpyxl read_only 探行列数（实测 27 ms / 0.9 MB，不会把表读进内存）。"""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(xlsx, read_only=True)
+    try:
+        return sum((ws.max_row or 0) * (ws.max_column or 0) for ws in wb.worksheets)
+    finally:
+        wb.close()
+
+
 def ensure(xlsx: Path, cache_dir: Path, cache_key: str, header: int) -> Path:
-    """返回可用的索引路径；没有就建（先写临时文件再原子替换，避免读到半个文件）。"""
+    """返回可用的索引路径；没有就建（先写临时文件再原子替换，避免读到半个文件）。
+
+    建之前先探 cell 数：一张“能上传但处理不了”的表，在这里拒掉比让 agent 等 40 秒再撞超时好。
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
+    _sweep_cache(cache_dir)
     dest = cache_dir / f"{cache_key}-h{header}-v{BUILD}.sqlite"
     if dest.is_file():
         return dest
+    cells = _cell_count(xlsx)
+    if cells > _MAX_CELLS:
+        raise ValueError(f"表太大：约 {cells} 个单元格，超过上限 {_MAX_CELLS}（请拆表或改存 csv）")
     tmp = dest.with_suffix(".sqlite.tmp")
     build(xlsx, tmp, header)
     os.replace(tmp, dest)  # 原子：并发构建时最后落地的赢，内容语义相同
     return dest
+
+
+_swept = False
+
+
+def _sweep_cache(cache_dir: Path) -> None:
+    """每个进程扫一次：删掉超过 `XLSX_CACHE_TTL_DAYS` 的缓存（删了按需重建）。"""
+    global _swept
+    if _swept:
+        return
+    _swept = True
+    cutoff = time.time() - _CACHE_TTL_DAYS * 86400
+    for path in cache_dir.glob("*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:  # noqa: PERF203 —— 单个文件删不掉不该影响其它
+            continue
 
 
 # ---------- 只读打开 ----------

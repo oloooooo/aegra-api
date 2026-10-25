@@ -128,9 +128,31 @@ event: end        data: {"status": "success"}
 - 校验顺序固定：会话归属 → 文件名 → 扩展名 → 大小 → 编码。先挡归属与文件名，再边读边判大小（超限即 `413`），最后才解码。
 - 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `MAX_UPLOAD_MB`（默认 10）或本会话文件数已达 `MAX_FILES_PER_SESSION`（默认 50）`413`；store 未就绪 `503`。
 - 同名重传 = 覆盖（PUT 语义，`/uploads` 下永远只有一份），不占新名额。
-- 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。子 agent 看不到；主管**下一轮 run 起始**才拿到清单（`graphs/session_files.py`），所以本轮 run 看不到刚传的文件。
+- 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/session_files.py`），所以本轮 run 看不到刚传的文件。
 - 孤儿 TTL 默认 72 小时（`UPLOAD_TTL_MINUTES`）：活跃会话每轮读清单会续期，没人读才过期；删会话即清空。
 - **没有列表/删除接口**：前端只能自己记住传过什么；要删文件目前只能删会话。
+
+### 3.8 `POST /custom/uploads/tables`
+
+把一个 xlsx 挂到当前会话（[adr/0015](./adr/0015-large-tables-in-object-storage.md)）。`multipart/form-data`，字段 `thread_id` + `file`。
+
+```json
+{"name": "cbam-reporting_报价表.xlsx", "path": "/uploads/cbam-reporting_报价表.xlsx",
+ "space": "cbam-reporting", "bytes": 4956, "sha256": "…", "indexed": false}
+```
+
+- **文件名必须是 `<空间名>_<表名>.xlsx`**。空间名只决定「主管派哪个子 agent」，**不决定存哪**；
+  它必须在该用户的 `user_spaces` 里，否则 `422`。
+- 校验顺序：会话归属 → 字节大小 → 文件名/空间 → 流式写入。前两步便宜，大文件在第三步之后才碰。
+- 错误码：会话不是你的 `404`；非 `.xlsx` `415`；超 `MAX_BLOB_MB`（默认 10）、超每会话文件数
+  （`MAX_XLSX_FILES_PER_SESSION`，默认 20）或超每用户总量（`MAX_BLOB_MB_PER_USER`，默认 2048）`413`；
+  文件名非法 / 空间没权限 `422`；对象存储未就绪 `503`。
+- **`indexed:false` 是正常状态**：索引在第一次调 `xlsx_*` 工具时才建，建完写回对象存储。
+- 同名重传 = 覆盖（PUT 语义）；同内容重传命中同一个 key，不重建索引。
+- 字节进对象存储（`sessions/{h(identity)}/{thread_id}/…`），**md 仍进 Store**；
+  子 agent 只能在同一条会话里读（靠派活时签发的 `session_scope`）。
+- 没有列表/删除接口：删除走删会话（`DELETE /threads/{id}`，连带清 PG 行与整个前缀）。
+  运维细节见 [S3.md](./S3.md)。
 
 ## 4. 直接用的原生接口
 
@@ -233,11 +255,11 @@ POST /threads/{thread_id}/runs/crons
 
 ### 建会话的配额
 
-`POST /threads` 每个账号最多 `MAX_THREADS_PER_USER`（默认 200）个会话（子线程计到所属主管上）。
+`POST /threads` 每个账号最多 `MAX_THREADS_PER_USER`（默认 50）个会话（子线程也计名额，一个会话派 3~5 个子任务就吃掉 3~5 个）。
 超额返回：
 
 ```http
-403 {"error": "forbidden", "message": "会话数已达上限（200），请先删除不用的会话再新建", "details": null}
+403 {"error": "forbidden", "message": "会话数已达上限（50），请先删除不用的会话再新建", "details": null}
 ```
 
 前端拿 `message` 直接提示即可（`client.ts::errorText` 已优先读它），不要当成登录失效。
@@ -247,5 +269,7 @@ POST /threads/{thread_id}/runs/crons
 
 - 代理接口是**单次 Run 订阅**：子 agent 若被 `update_async_task` 再跑一轮，前端要按新的 `run_id` 重新连。
 - `service_token()` 是 10 年期长期 token（沿用 ADR-0004 的 shortcut），只在服务端使用，不下发浏览器。
-- 没有把文件写进 Space 的接口：上传只到会话文件（`POST /custom/uploads`，§3.7）；也没有列出/删除已上传文件的接口（删会话即清空）。
+- 没有把文件写进 Space 的接口：空间知识只能手工放盘 / `scripts/okf_push_s3.py`（见 [S3.md](./S3.md)）；
+  上传的 xlsx 属于会话文件（§3.8），**不落 Space**。也没有列出/删除已上传文件的接口
+  （删会话即清空）。
 - 没有 refresh token。

@@ -1,9 +1,9 @@
 # 会话文件与大表（设计）
 
 配套 ADR：[0015 会话文件](./adr/0015-large-tables-in-object-storage.md)、
-[0016 空间进 S3](./adr/0016-spaces-in-object-storage.md)。
+[0016 空间进 S3](./adr/0016-spaces-in-object-storage.md)。操作手册见 [S3.md](./S3.md)。
 第 3 稿（2026-10-25）：归属从「挂 space」改为「上传者私有 + 随会话删」，命名与 Key 全部重写。
-**尚未实现。**
+**已实现**（真服务单进程/多进程实测通过）；本文描述设计与取舍，落地位置见 §9。
 
 ## 0. 开工前必须先修的两处**既有**缺陷
 
@@ -164,8 +164,10 @@ xlsx 工具用 `scope` 算 S3 前缀（工具仍绕 backend 直读字节）。�
 
 ## 5. ingest → SQLite
 
-`index.py::ensure(scope, sha16, name, header)`：本机缓存 → `HEAD` 索引 key → build 到
-`tempfile` → 单次 `put_object` → 原子落缓存。键见 §2，并发 build 幂等无锁。
+`index.py::ensure(xlsx, cache_dir, cache_key, header)`：本机缓存命中则直接用；否则先用
+`openpyxl read_only` 探 cell 数（**超 `MAX_CELLS` 直接拒，不建索引**），再 build 到临时文件、
+原子替换。键见 §2，并发 build 幂等无锁。每次调用开头顺带扫一遍过期缓存（每进程一次，
+`XLSX_CACHE_TTL_DAYS`）。
 
 build：`read_excel(sheet_name=None, header=header)` 一次全读（41.7 s），每 sheet 一张
 `s{i}` 表 + `meta` / `columns` 两张小表；`journal_mode=OFF, synchronous=OFF` 只用于构建。
@@ -264,57 +266,47 @@ SESSION_SCOPE_SECRET=<hmac key>
 virtual-host，`bucket.127.0.0.1:8333` 解析不了。bucket 启动时 `head_bucket` 失败则
 `create_bucket`（幂等）。
 
-## 8. 改动清单
+## 8. 改动清单（已落地）
 
-| 文件 | 内容 | 估行 |
-|---|---|---|
-| `graphs/tools/xlsx/__init__.py` | **先修 §0.1 越权**；四个 tool 改调 `index` | 改 ~120 |
-| `custom/blobs.py` | 懒加载 client、key 命名、`put_stream`、`get`、`copy`、`delete`、`head`、`abort_stale_multiparts` | ~110 |
-| `custom/session_objects.py` | 新增：PG 读写 + 配额事务 + 文件名→space 解析 | ~100 |
-| `custom/uploads.py` | 新增 `/uploads/tables` 路由（或独立 `table_uploads.py`） | ~90 |
-| `custom/models.py` + alembic | `SessionObject` | ~50 |
-| `custom/threads_delete.py` | 删会话时删 `sessions/{h}/{thread}/` 前缀 + PG 行 | ~15 |
-| `graphs/tools/xlsx/store.py` | 新增：scope 解析、缓存、S3 取字节 | ~70 |
-| `graphs/tools/xlsx/index.py` | 新增：`BUILD`、build、只读 SQL 查询 | ~170 |
-| `graphs/tools/xlsx/schema.py` | `where` 描述改成 SQL 口径 | ~6 |
-| `graphs/async_task_guard.py` | `_config_for()` 签发签名 `session_scope` | ~20 |
-| `graphs/domain_agents.py` | `SpaceBackend` → `CompositeBackend`（含 `/uploads` 路由） | ~15 |
-| `graphs/deepagents_nodes.py` | `_uploads_namespace()` 优先用 `session_scope` | ~15 |
-| `graphs/space_agents.py` | `has_tables` 认 `session_scope` / S3 前缀 | ~20 |
-| `graphs/space_backend.py` + 新 `space_object_backend.py` | 路径判定抽 mixin + 只读 S3 实现（ADR-0016） | ~220 |
-| `custom/frontend_api.py` | `_list_files` / `_count_files` 合并 `session_object` | ~20 |
-| `scripts/okf_push_s3.py` | 一键上传 OKF → S3（`--dry-run` / `--prune`） | ~60 |
-| `scripts/reap_multipart.py` | 清未完成分片 | ~30 |
-| `pyproject.toml` / `.env.example` | `boto3` + 新 env | ~12 |
+| 文件 | 内容 |
+|---|---|
+| `custom/blobs.py` | S3 客户端、key 命名、`put_stream`（自管分片可 abort）、`delete_prefix`、`abort_stale_multiparts` |
+| `custom/session_objects.py` | `parse_space`、`quota_violation`、`upsert`（锁用户行） |
+| `custom/models.py` + alembic `c1d2e3f4a5b6` | `session_object` 表 |
+| `custom/uploads.py` | `POST /custom/uploads/tables` |
+| `graphs/session_scope.py` | 签发/验签/解析（主管自身 config，子 agent 用签名凭证） |
+| `graphs/async_task_guard.py` | 派活时签发 `session_scope` |
+| `graphs/domain_agents.py` / `graphs/deepagents_nodes.py` | CompositeBackend + `/uploads` 路由；主管也装 xlsx 四件套 |
+| `graphs/tools/xlsx/{store,index}.py` + `__init__.py` | 字节解析、ingest → SQLite、四个工具改跑 SQL |
+| `custom/threads_delete.py` | 删会话连带清 PG 行 + S3 前缀 |
+| `graphs/okf_mirror.py` + `scripts/okf_{push,pull}_s3.py` | 空间知识进 S3（ADR-0016） |
+| `tests/unit/test_{blobs,session_objects,upload_tables,session_scope,xlsx_index,xlsx_scope,threads_delete_blobs,okf_mirror}.py` | 约 70 条单测 |
 
-## 9. 测试计划
+## 9. 测试策（已落地）
 
-`tests/unit/`（S3 层 monkeypatch `blobs`，不引 moto）：
+单测共约 70 条，位于 `tests/unit/`（S3 层 monkeypatch `blobs`，不引 moto）：
+`test_blobs.py`、`test_session_objects.py`、`test_upload_tables.py`、`test_session_scope.py`、
+`test_xlsx_scope.py`、`test_xlsx_index.py`、`test_threads_delete_blobs.py`、`test_okf_mirror.py`。
+重点覆盖：越权回归、文件名/空间规则、流式超限与 abort、配额两闸、行号公式
+`rowid + header + 1`、`xlsx_search` 的单元格语义、`where` 语义矩阵、authorizer 边界、
+`session_scope` 验签。
 
-1. **越权回归**：`/空间A/../空间B/x.xlsx` 必须被拒（§0.1）；
-2. 文件名规则：`cbam_报价.xlsx` ✅ / `无前缀.xlsx` ❌ / `别的空间_x.xlsx`（无权限）❌；
-3. 流式计数超限 → 413 且 tmp 被删；配额失败 → **不删旧 key**；
-4. 配额：字节与文件数两闸；同名覆盖不占新名额；
-5. 幂等：同内容重传 → 索引键不变、`ensure()` 不 build；
-6. `BUILD` 变化 → 新 key；缓存写入是原子替换；
-7. **行号公式** `rowid + header + 1`（header=0/1 各一条）；
-8. **`xlsx_search` 单元格语义**：一行两列命中 → 两条结果、列名正确；
-9. `where` 语义矩阵（§5.2 六条，含括号列名、`!=` 空值、`LIKE` 转义）；
-10. authorizer：`zeroblob` / `ATTACH` / `PRAGMA` 被拒；`progress_handler` 拦住笛卡尔积炸弹；
-11. `session_scope` 验签：篡改 owner → 拒；无 `sig` → 拒。
-
-`tests/e2e/`（真 SeaweedFS）：上传 10 MB 表 → 首次查询建索引 → 第二次 <100 ms →
-删会话后查不到且前缀已清空。
+端到端没写成自动化用例，是**手跑**的（`docs/S3.md` §6 的步骤）：
+真 SeaweedFS + 真 PG + 真服务（单进程 / 两 worker 各一遍），上传 → 主管 run 里
+`xlsx_info('/uploads/…')` 拿到正确 JSON → 删会话后前缀与行都清空。
 
 ## 10. 未做 / 已知限制
 
 - 首次访问建索引几十秒（预建索引需动 worker）。
 - 前端直传、断点续传、秒传预检：见 ADR-0015 §3.4。
-- 存量 `graphs/okf/<space>/*.xlsx` 迁移脚本未写，先双读单写。
-- 存储层配额不严格：PG 的 `sum(bytes)` 不含索引与被覆盖的旧 blob，物理用量可能到 2 倍。
-- `abort_stale_multiparts` 依赖 SeaweedFS 实现 `ListMultipartUploads`：社区资料说支持，**未实测**。
+- 存量 `graphs/okf/<space>/*.xlsx` **仍是空间文件**（本地盘或 `OKF_BACKEND=s3` 的镜像），
+  没有“把空间表迁成会话表”的脚本；两套来源共存是有意的。
+- 存储层配额不严格：PG 的 `sum(size_bytes)` 不含索引与被覆盖的旧 blob，物理用量可能到 2 倍。
+- `abort_stale_multiparts` 依赖 SeaweedFS 实现 `ListMultipartUploads`：已实测可用；
+  但清未完成分片的定时任务 `scripts/reap_multipart.py` 未写（`put_stream` 自己管分片时能 abort，
+  这条只给崩溃场景兜底）。
 - 只支持 `.xlsx`；`csv` / `xls` / 多文件联查（duckdb）未做。
-- `grep`/`glob` 在 S3 backend 上没有索引，只能 list + 逐个 GET（ADR-0016）。
+- 空间知识走**本地镜像**而非直接读 S3（ADR-0016 的决定变更），所以改了空间内容要 pull。
 
 ## 11. 参考
 

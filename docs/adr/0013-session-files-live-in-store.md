@@ -2,12 +2,15 @@
 
 用户上传的文件分两类，归属完全不同：
 
-| | 会话文件（本期做） | 空间表（第二期） |
+| | 会话文件（本期做） | 空间表（第二期，**已由 ADR-0015 重定**） |
 |---|---|---|
-| 谁能看 | 上传者本人、这个会话 | 拥有该 Space 的所有人 |
-| 隔离键 | `(上传者 identity, 主管 thread_id)` | `space` |
-| 存储 | LangGraph Store | Store 的 space 命名空间 |
-| 谁读 | 主管（`/uploads/`） | 空间子 agent（xlsx 四件套） |
+| 谁能看 | 上传者本人、这个会话 | ~~拥有该 Space 的所有人~~ → **仍只对上传者本人 + 这个会话可见** |
+| 隔离键 | `(上传者 identity, 主管 thread_id)` | ~~`space`~~ → **同一组键**（文件名里的 `<space>_` 前缀只做路由，不隔离） |
+| 存储 | LangGraph Store | ~~Store 的 space 命名空间~~ → **对象存储**（ADR-0015） |
+| 谁读 | 主管（`/uploads/`） | 空间子 agent（靠派活时签发的 `session_scope` 凭证） |
+
+> 实现时推翻了"空间表对空间成员共享"这一列：用户要求上传的 xlsx **仅上传者可见、随会话删**。
+> 所以第二期没有变成“另一种归属”，而是“同一种归属、另一种载体”。见 [ADR-0015](./0015-large-tables-in-object-storage.md)。
 
 本 ADR 只定会话文件。它进 Store，不进 `graphs/okf/<space>/`——那里是知识空间，
 进去就等于对空间成员发布，而会话文件是私人草稿。
@@ -20,9 +23,33 @@
 上（属主是服务账号 `subagent_service`）。若命名空间取"当前 run 的 thread_id"，
 子 agent 各看各的空目录，方案直接失效。
 
-所以隔离键固定为主管 thread：主管侧直接取 `configurable.thread_id`；子 agent 侧靠
-`AsyncTaskGuard` 已经在转发的 `configurable.parent_thread_id`（ADR-0005 同一条转发路径）。
+所以隔离键固定为主管 thread，取值只从**服务端注入**的两处来：`configurable.thread_id`
+（aegra 强制覆写，客户端改不了，见 `src/aegra_api/services/langgraph_service.py:721`）与
+`configurable.langgraph_auth_user.identity`（`require_auth` 注入）。
 词表里因此把 **Session** 钉死为"主管 thread"。
+
+> **2026-10-25 更正（原文写错了）**：这里原来写的是"子 agent 侧靠 `AsyncTaskGuard` 已经在
+> 转发的 `configurable.parent_thread_id`"。**这个转发不存在。** 已逐行核实：
+>
+> - `AsyncTaskGuard._config_for()`（`graphs/async_task_guard.py:211-229`）只返回
+>   `{"configurable": {"user_spaces": [...]}}`，没有第二个键；
+> - `parent_thread_id` 走的是另一条路：`_thread_meta()`（`:232-239`）把它写进**子线程的
+>   metadata**（PG 的 `thread.metadata_json`），服务端 `finalize_run` 与 thread 配额从那里读
+>   （`src/aegra_api/services/run_status.py:261`），子 run 的 `configurable` 里看不到；
+> - 今天**不构成 bug**：子 agent 的图根本没有 `/uploads` 路由（`graphs/domain_agents.py`
+>   当时直接用 `SpaceBackend`，路由只加在 `graphs/deepagents_nodes.py::supervisor_backend()` 上），
+>   所以下面第 120 行的决定与实现是一致的；（2026-10-25 后续：ADR-0015 已给子 agent 加上该路由）
+> - 顺带纠正一个推断：「照这个做会算成 `h(subagent_service)` 的跨用户共享命名空间」也不准。
+>   `_uploads_namespace` 用的是 `configurable.thread_id`，而子 run 里它已被 aegra 换成
+>   **子线程** id，算出来是 `(uploads, h(subagent_service), 子线程 id)` —— 是"每个子任务
+>   一个恒空命名空间"，不是共享命名空间。
+>
+> 真要给子 agent 文件访问，得同时改两处，且是一次 ADR 级改动：① `_config_for()` 转发
+> **主管 identity + 主管 thread_id**（必须从 `langgraph_auth_user` 与覆写后的 `thread_id`
+> 取——客户端 body 里的 `configurable` 是加法合并进 run config 的，`create_run_config`
+> 只强制覆盖 `thread_id/run_id/langgraph_auth_user`，其余键照收，所以那些键不可信）；
+> ② 给子 agent 的 backend 加 `/uploads` route。只转发 `parent_thread_id` 不够，
+> `session_namespace()` 还需要 identity。
 
 ### 2. 命名空间里对 identity 做 hash
 
@@ -115,10 +142,13 @@ bug。命名空间定为：
 - **删除清理是隐式顺序依赖**：custom app 先装载、核心路由后 `include_router`，Starlette 按
   注册顺序匹配才盖得住。启动时扫描 `app.router.routes` 断言首个匹配是本路由，遮挡失效即
   启动失败（不能静默漏删）——这是债，aegra 升级改了装载顺序就得跟着改。
-- **`refresh_on_read` 对全 store 生效**：第二期空间表若带 ttl，会被"读着读着过期"。
-  空间表必须不带 ttl，或读时显式 `refresh_ttl=False`。
-- 会话文件只对主管可见：子 agent 想用文件内容，由主管转述（贴正文或给路径都不行，
-  子 agent 的 backend 没有 `/uploads/` route）。
+- **`refresh_on_read` 对全 store 生效**：~~第二期空间表若带 ttl，会被"读着读着过期"。
+  空间表必须不带 ttl，或读时显式 `refresh_ttl=False`。~~（空间表已改走对象存储，见 ADR-0015；
+  这条只对将来又把带 TTL 的数据放进 Store 时有效）
+- ~~会话文件只对主管可见：子 agent 想用文件内容，由主管转述（贴正文或给路径都不行，
+  子 agent 的 backend 没有 `/uploads/` route）。~~ **2026-10-25 已改变**：ADR-0015 给子 agent
+  的 backend 也加了 `/uploads/` 路由，准入靠派活时签发的 `session_scope`（HMAC 验签）。
+  语义仍是“只对上传者本人的这条会话可见”，只是那条会话里的子 agent 也算“本人”。
 - `hash(identity)` 让 SQL 层无法按 identity 直接筛 store 行；排查靠服务端计算的命名空间。
 - **清理由 `clear()` 分页做，最多 20 轮**（500×20）：store 没有 namespace 级删除，只有
   `PutOp(value=None)`；上限是为了 store 行为异常时不无限循环，删不完的残余交给孤儿保留期。

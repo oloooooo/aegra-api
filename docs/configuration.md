@@ -279,7 +279,40 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MAX_THREADS_PER_USER` | `200` | 一个账号最多同时拥有几个会话（主管线程；子线程计到所属主管上）。超额时 `POST /threads` 返回 403。超管不受限。见 [adr/0012](./adr/0012-thread-quota-replaces-task-limit.md) |
+| `MAX_THREADS_PER_USER` | `50` | 一个账号最多同时拥有几个会话（主管线程 + 子线程；子线程计到所属主管上）。超额时 `POST /threads` 返回 403。超管不受限。见 [adr/0012](./adr/0012-thread-quota-replaces-task-limit.md) |
+
+### 会话文件与大表（`custom/session_store.py`、`custom/session_objects.py`、`custom/blobs.py`）
+
+md 会话文件进 LangGraph Store，xlsx 的字节进对象存储；完整操作手册见 [S3.md](./S3.md)。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MAX_UPLOAD_MB` | `10` | **md** 单文件上限（`POST /custom/uploads`） |
+| `MAX_FILES_PER_SESSION` | `50` | **md** 每会话文件数 |
+| `UPLOAD_TTL_MINUTES` | `4320`（72h） | md 的孤儿保留期，语义是「最后读取后多久」 |
+| `MAX_BLOB_MB` | `10` | **xlsx** 单文件上限（`POST /custom/uploads/tables`） |
+| `MAX_CELLS` | `2000000` | 表结构硬闸；超了第一次调工具就报错，不静默截断 |
+| `MAX_XLSX_FILES_PER_SESSION` | `20` | 每会话 xlsx 个数（同名覆盖不占名额） |
+| `MAX_MD_FILES_PER_SESSION` | `10` | 每会话 md 个数（与上面那个分开计） |
+| `MAX_BLOB_MB_PER_USER` | `2048` | 每用户二进制总量 |
+| `SESSION_SCOPE_SECRET` | `dev-session-scope` | 子 agent 读会话文件的 HMAC 密钥，**生产必须改** |
+| `XLSX_CACHE_DIR` / `XLSX_CACHE_TTL_DAYS` | `.cache/xlsx` / `7` | 表索引与字节的本机缓存（必须在 OKF 根之外） |
+| `XLSX_QUERY_BUDGET_MS` | `5000` | 单次 `where` 查询的 CPU 预算，超了 `interrupt()` |
+
+### 对象存储与空间模式（ADR-0015 / ADR-0016）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `S3_ENDPOINT` | 空 | 空 = 对象存储未启用；xlsx 上传会返回 503 |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `dev` / `dev` | 凭证（SeaweedFS 未配 IAM 时任意值） |
+| `S3_BUCKET` | `aegra-blobs` | 桶名，启动时自动创建（幂等） |
+| `S3_REGION` | `us-east-1` | 任意值 |
+| `OKF_BACKEND` | `local` | `local` 读 `graphs/okf`；`s3` 读本地镜像 |
+| `OKF_MIRROR_DIR` | `.cache/okf` | `s3` 模式的镜像目录 |
+| `OKF_MIRROR_TTL_SECONDS` | `0` | 镜像过期重拉的间隔；`0` = 只拉一次 |
+| `OKF_DIR` | `okf` | 空间根目录名（相对 `graphs/`） |
+
+> 这些变量**不在 `settings.py` 里**（由各自模块直接读 `os.environ`），所以不会出现在自动生成的配置表里。
 
 ### LLM
 

@@ -169,3 +169,31 @@ def test_header_offset_shifts_row_numbers(tmp_path):
     idx = index.ensure(p, tmp_path, "h", 1)
     with index.open_ro(idx) as c:
         assert "Excel第3行" in index.search(c, "A1", None, 1, 10)
+
+
+def test_rejects_table_over_max_cells(tmp_path, monkeypatch):
+    """能上传但处理不了的宽表：建索引前就拒，别让 agent 等 40 秒再撞超时。"""
+    p = tmp_path / "big.xlsx"
+    pd.DataFrame({"a": list(range(50)), "b": list(range(50))}).to_excel(p, index=False)
+    monkeypatch.setattr(index, "_MAX_CELLS", 10)
+
+    with pytest.raises(ValueError, match="表太大"):
+        index.ensure(p, tmp_path / "cache", "k", 0)
+
+
+def test_cache_sweep_removes_expired_files(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    stale = cache / "stale.sqlite"
+    stale.write_bytes(b"x")
+    import os as _os
+    import time as _time
+
+    old = _time.time() - 10 * 86400
+    _os.utime(stale, (old, old))
+    monkeypatch.setattr(index, "_swept", False)
+    monkeypatch.setattr(index, "_CACHE_TTL_DAYS", 7)
+
+    index._sweep_cache(cache)
+
+    assert not stale.exists()

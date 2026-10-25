@@ -62,8 +62,8 @@ JWT_SECRET=换成长随机串
 PASSWORD_PEPPER=换成长随机串
 
 # --- 业务上限 ---
-# 一个账号最多同时拥有几个会话（主管线程，默认 200）；子线程跟着父线程计数
-MAX_THREADS_PER_USER=200
+# 一个账号最多同时拥有几个会话（含子线程，默认 50）；一个会话派 3~5 个子任务就吃掉 3~5 个名额
+MAX_THREADS_PER_USER=50
 
 # --- 服务 ---
 HOST=127.0.0.1
@@ -424,6 +424,10 @@ graphs/okf/bio-lab/
 **有 `.xlsx` 才会装 xlsx 四件套**（`xlsx_info/query/search/profile` + CodeInterpreterMiddleware），
 纯文档空间自动不装。
 
+> 空间知识也可以放对象存储（`OKF_BACKEND=s3`，多副本读到同一份）：改完跑
+> `scripts/okf_push_s3.py`，各副本跑 `scripts/okf_pull_s3.py`。全部 env 与上传方式见
+> [docs/S3.md](./docs/S3.md)。
+
 ### 11.4 验证（不用重启）
 
 ```bash
@@ -446,7 +450,7 @@ d, p = load_agent_spec('bio-lab'); print(has_tables('bio-lab'), d[:40], len(p))"
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
 | 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `custom/outbox_dispatcher.py`（主管空闲时开一轮唤醒 run） |
 | 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
-| 一个账号最多几个会话（`MAX_THREADS_PER_USER`，默认 200）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
+| 一个账号最多几个会话（`MAX_THREADS_PER_USER`，默认 50，含子线程）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |
 | prompt 与描述 | `<space>/AGENT.md`（`graphs/space_agents.py`） |
 
