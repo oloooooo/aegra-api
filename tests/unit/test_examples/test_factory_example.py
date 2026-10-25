@@ -11,7 +11,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[5] / "examples"
+EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples"
 
 
 class ScriptedModel:

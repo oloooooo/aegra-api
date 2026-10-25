@@ -345,7 +345,9 @@ class TestCancelRun:
             mock_streaming.cancel_run = AsyncMock()
             mock_streaming.signal_run_cancelled = AsyncMock()
 
-            resp = client.post("/threads/test-thread-123/runs/test-run-123/cancel")
+            # 端点默认 action 是 interrupt（Agent Protocol 对齐），本用例验的是 cancel 分支，
+            # 所以必须显式传；不传会走到 interrupt_run（本用例没 mock，拿 MagicMock 去 await）。
+            resp = client.post("/threads/test-thread-123/runs/test-run-123/cancel?action=cancel")
 
             assert resp.status_code == 200
             mock_streaming.cancel_run.assert_awaited_once_with("test-run-123", emit_end_event=False)

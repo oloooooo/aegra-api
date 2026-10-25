@@ -36,6 +36,6 @@ class TestReplayRetentionIsShared:
         assert redis_broker._REPLAY_TTL_SECONDS == REPLAY_RETENTION_SECONDS
 
     def test_documented_window_matches_the_constant(self) -> None:
-        doc = Path(__file__).parents[5] / "docs" / "guides" / "streaming.mdx"
+        doc = Path(__file__).parents[3] / "docs" / "guides" / "streaming.mdx"
         minutes = REPLAY_RETENTION_SECONDS // 60
         assert f"retained for {minutes} minutes" in doc.read_text(encoding="utf-8")

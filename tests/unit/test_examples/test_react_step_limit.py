@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[5] / "examples"
+EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples"
 
 
 class AlwaysCallsTool:

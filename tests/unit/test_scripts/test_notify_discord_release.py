@@ -10,7 +10,12 @@ from types import ModuleType
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[5] / "scripts" / "notify_discord_release.py"
+_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "notify_discord_release.py"
+
+# 本仓库没有这个脚本（上游 aegra 的 release 通知脚本没搬过来），用例无从执行。
+# 不静默跳过整份文件：脚本哪天被搬进来，这里的断言自动生效。
+if not _SCRIPT.exists():
+    pytest.skip(f"script not present in this repo: {_SCRIPT}", allow_module_level=True)
 
 
 def _load_script() -> ModuleType:
