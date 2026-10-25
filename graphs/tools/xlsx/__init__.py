@@ -96,10 +96,10 @@ async def _remote_of(path: str, config: object) -> store.Remote | None:
     owner, thread_id = scope
 
     # 懒导入：这个模块在启动期就被 graphs/tools 拉起来，别把 ORM 拖进 import 路径
-    from aegra_api.core.database import db_manager
+    from aegra_api.core.orm import get_session_maker
     from custom import session_objects
 
-    async with db_manager.get_session_maker()() as session:
+    async with get_session_maker()() as session:
         row = await session_objects.get_one(session, owner, thread_id, name)
     if row is None:
         raise FileNotFoundError(f"文件不存在：{path}（先用 /custom/uploads/tables 上传）")

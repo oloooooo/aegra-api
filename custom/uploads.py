@@ -13,6 +13,7 @@ thread_id 为键。无主的文件既没法被任何 run 看到，也没有任�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from pathlib import PureWindowsPath
 from typing import Annotated
@@ -204,7 +205,9 @@ async def upload_session_table(
         await _drop_new(final, old_key)
         raise
     finally:
-        await asyncio.to_thread(blobs.delete, tmp)  # 幂等；删失败也不影响正确性
+        # 清理不能抛：它一旦抛出去，就把「上传成不成功」的结论盖掉了（曾经把 503 变成 500）
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(blobs.delete, tmp)
 
     # 提交成功后才删被替换掉的旧对象
     if old_key and old_key != final:
@@ -229,6 +232,11 @@ async def upload_session_table(
 
 
 async def _drop_new(final: str | None, old_key: str | None) -> None:
-    """失败清理：只删本次新写的对象，且它不能是旧行正在用的那一个。"""
+    """失败清理：只删本次新写的对象，且它不能是旧行正在用的那一个。
+
+    自身必须吞异常：存储已经坏了（这往往就是进到这里的原因），再抛一次只会把
+    「存储不可用 → 503」变成「未知错误 → 500」。
+    """
     if final and final != old_key:
-        await asyncio.to_thread(blobs.delete, final)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(blobs.delete, final)

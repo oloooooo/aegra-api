@@ -84,3 +84,15 @@ def test_uploads_namespace_matches_store_namespace():
         assert ss.uploads_namespace() == expected
     finally:
         mod.current_config = original
+
+
+def test_service_identity_without_scope_is_denied():
+    """子 agent 没带转发凭证 → fail-closed，而不是落到 h(subagent_service) 的空命名空间。"""
+    cfg = {
+        "configurable": {
+            "langgraph_auth_user": {"identity": "subagent_service"},
+            "user_spaces": ["sp"],
+            "thread_id": "child-1",
+        }
+    }
+    assert ss.resolve(cfg) is None

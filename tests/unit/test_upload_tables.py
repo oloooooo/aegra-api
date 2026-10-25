@@ -142,3 +142,25 @@ async def test_quota_failure_keeps_object_when_it_is_the_old_one(env):
 
     assert calls["copy"][0][1] == state["old_key"]  # 前提：新旧 key 确实相同
     assert calls["copy"][0][1] not in calls["delete"]
+
+
+async def test_cleanup_failure_does_not_mask_the_real_error(env, monkeypatch):
+    """存储挂了时清理也会挂：必须仍然返回 503，而不是把异常顶出去变成 500。"""
+    calls, _ = env
+    monkeypatch.setattr(session_objects, "MAX_BLOB_BYTES", 10 * 1024 * 1024)
+
+    def put_boom(*_a, **_kw):
+        raise blobs.BlobUnavailable("S3_ENDPOINT 未配置")
+
+    monkeypatch.setattr(blobs, "put_stream", put_boom)
+
+    def delete_boom(_key):
+        raise blobs.BlobUnavailable("S3_ENDPOINT 未配置")
+
+    monkeypatch.setattr(blobs, "delete", delete_boom)
+
+    with pytest.raises(HTTPException) as e:
+        await uploads_mod.upload_session_table(
+            session=FakeSession(), user=_user("sp"), thread_id="t-1", file=FakeFile("sp_表.xlsx")
+        )
+    assert e.value.status_code == 503

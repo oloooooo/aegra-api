@@ -20,7 +20,7 @@ import hmac
 import os
 from typing import Any
 
-from graphs.space_access import _field, current_identity
+from graphs.space_access import SERVICE_IDENTITY, _field, current_identity
 
 _SCOPE_KEY = "session_scope"
 _MISSING: Any = object()
@@ -73,6 +73,10 @@ def resolve(config: Any) -> tuple[str, str] | None:
         return None
     identity = current_identity(config)
     if not identity or identity == "local":
+        return None
+    if identity == SERVICE_IDENTITY:
+        # 子 agent 必须靠派活时签发的凭证；没带上就 fail-closed。
+        # （否则它会在 h(subagent_service) 下的恒空命名空间里找文件，报"不存在"而非"无权"）
         return None
     return identity, thread_id
 

@@ -29,12 +29,7 @@ def wired(monkeypatch):
     calls: dict[str, list] = {"rows": [], "prefix": []}
     session = FakeSession()
 
-    class FakeDB:
-        @staticmethod
-        def get_session_maker():
-            return lambda: FakeCM(session)
-
-    monkeypatch.setattr(threads_delete, "db_manager", FakeDB)
+    monkeypatch.setattr(threads_delete, "get_session_maker", lambda: (lambda: FakeCM(session)))
 
     async def fake_delete_rows(_s, owner, thread_id):
         calls["rows"].append((owner, thread_id))

@@ -19,18 +19,19 @@ thread 行，不认识 store。`src/` 默认不动，所以把清理放在这一
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Annotated
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.api.threads import delete_thread as core_delete_thread
+
 # 必须用 require_auth：get_current_user 读 scope["user"]，只有 AuthenticationMiddleware
 # 或先跑过 require_auth 才有值，而 aegra 用的是自己的 auth 中间件（copy 自 custom/routers.py）
 from aegra_api.core.auth_deps import require_auth
 from aegra_api.core.database import db_manager
-from aegra_api.core.orm import get_session
+from aegra_api.core.orm import get_session, get_session_maker
 from aegra_api.models.auth import User
 from custom.session_store import clear
 
@@ -79,7 +80,7 @@ async def _clear_blobs(identity: str, thread_id: str) -> None:
     from custom import blobs, session_objects
 
     try:
-        async with db_manager.get_session_maker()() as fresh:
+        async with get_session_maker()() as fresh:
             removed = await session_objects.delete_for_thread(fresh, identity, thread_id)
             await fresh.commit()
         if removed:
