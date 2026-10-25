@@ -27,6 +27,6 @@ def _positive_int(name: str, default: int) -> int:
 # 一个账号最多同时拥有几个会话（主管线程 + 它们的子线程）。
 # 超管不受限（见 custom_auth.py）：管理员要能排查别人的问题。
 #
-# 200 是“够用且不爆库”的量级：单个用户正常只会同时开个位数会话，到 200 基本是脚本
-# 刷出来的；同时 200 个 thread 的 checkpoint 对单库仍是小数目。
-MAX_THREADS_PER_USER = _positive_int("MAX_THREADS_PER_USER", 200)
+# 50 是按“一个会话派 3~5 个子任务”反推的量级：用户实际能同时开的主会话约 10 个。
+# 口径仍是“含子线程”（子线程计数到所属主管上），只在建会话时判定。
+MAX_THREADS_PER_USER = _positive_int("MAX_THREADS_PER_USER", 50)
