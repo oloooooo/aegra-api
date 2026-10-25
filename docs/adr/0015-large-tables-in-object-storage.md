@@ -1,13 +1,12 @@
-# 大表（xlsx）放对象存储，派生索引用 SQLite
+# 会话文件：md 进 Store、xlsx 进对象存储，都私有且随会话删
 
-> 状态：**决定已定，实现未开始**（2026-10-25）。
-> 本文取代 ADR-0013 那张对比表里「空间表（第二期）→ Store 的 space 命名空间」一行；
-> ADR-0013 关于会话文件（md、Store、TTL）的全部内容**不变**。
-> 实现细节见 [`../large-files.md`](../large-files.md)。
+> 状态：**决定已定，实现未开始**（2026-10-25，第 3 稿）。
+> 本文取代第 1 稿「大表挂 space」的全部内容（那版已作废，理由见文末「作废记录」）。
+> 实现细节见 [`../large-files.md`](../large-files.md)；空间内容进 S3 见 [ADR-0016](./0016-spaces-in-object-storage.md)。
 
 ## 背景：三个实测数字
 
-目标规模是 80k 行 × 10 列 × 3 sheet（240 万 cell），xlsx 文件 27.9 MB。
+目标规模 80k 行 × 10 列 × 3 sheet（240 万 cell），xlsx 27.9 MB。
 
 | 事实 | 数字 |
 |---|---|
@@ -15,118 +14,102 @@
 | `xlsx_info` 现在（3 sheet 全读） | **41.7 s**，峰值 129 MB |
 | 单 sheet `read_excel` | **14.7 s**（无缓存，每次一样慢） |
 | 一次 ingest 进 SQLite（df 已在内存） | 0.5 s，产物 26.9 MB |
-| 之后 `WHERE … LIMIT 200` / `COUNT` / `GROUP BY` | 2 ms / 1 ms / 3 ms，峰值 <1 MB |
-| `read_excel(nrows=5)` | 25 ms |
-| `openpyxl load_workbook(read_only=True)` 取行列数 | 27 ms |
+| 之后 `WHERE … LIMIT 200` / `COUNT` / `GROUP BY` | 2 ms / 1 ms / 3 ms |
+| `read_excel(nrows=5)` / `openpyxl read_only` 取行列数 | 25 ms / 27 ms |
 
-结论：**慢的不是查询，是"每次调用都重新解析整个 xlsx"**。所以问题不是"怎么查得快"，
-而是"解析一次、之后别再解析"。
+结论：慢的不是查询，是"每次调用都重新解析整个 xlsx"。
 
 ## 关键决定
 
-### 1. 字节进对象存储，不进 Store、不进 PG
+### 1. 归属：**上传者私有 + 随会话删**，不挂 space
 
-- Store：值必须是 JSON 文本，xlsx 得 base64，约 37 MB/文件，且每次 `get` 拉整块，
-  还会被 store sweeper / TTL 语义牵连。
-- PG：同理，`bytea` 37 MB 走 WAL 与备份，代价不可接受。
-- 对象存储（SeaweedFS，S3 协议）：客户端用 `boto3` 直连。
+文件只对上传者本人、只在这一条主管 thread 里可见；会话删除即删。
+这与 md 会话文件（ADR-0013）是同一套会话语义，只是载体不同。
 
-**不需要把 xlsx 接进 deepagents 的 backend**。四个 xlsx 工具本来就不走 backend
-（自读盘），它们需要的只是"字节从哪来"——把 `Path` 换成 `(bucket, key)` 即可。
-S3Backend / BlobStorageMiddleware / 社区 `deepagents-backends` 一律不需要：
-deepagents 本地 0.7.23 无 S3 backend，上游 PR #1913 与 #6325 均 closed 未合入。
+### 2. 两种载体：md → Store，xlsx → 对象存储
 
-### 2. 大表挂 **space**，不挂会话
+- md 继续留 LangGraph Store：`/uploads/*.md` 要靠 `StoreBackend` 才能被 `read_file` 读到，
+  而 deepagents 没有 S3 backend（上游 PR #1913 / #6325 均 closed）；Store 的
+  「最后读取后 N 小时过期」也正是 ADR-0013 选的孤儿语义。
+- xlsx 必须进对象存储：base64 进 Store 约 37 MB/文件，每次 `get` 拉整块。
+- 两边的删除链统一到「删会话即删」，所以只有一条 mental model。
 
-这是本 ADR 最重要的一个取舍。会话文件（ADR-0013）的命名空间是
-`(uploads, sha256(上传者 identity), 主管 thread_id)`，而真正干活的子 agent 用静态身份
-`subagent_service`（ADR-0004），拿不到主管 identity，算不出那个命名空间；要靠
-`AsyncTaskGuard._config_for()` 做受信转发才行——而那是一次 ADR 级改动，且转发当前
-**并不存在**（`AsyncTaskGuard._config_for()` 只回传 `user_spaces`；ADR-0013 §1 的描述
-与实现不符，是文档 bug）。
+### 3. 文件名前缀只是**路由**，不是隔离
 
-而 **space 已经在 `configurable.user_spaces` 里转发给子 agent**（ADR-0005，
-`graphs/space_access.py:43`）。ADR-0013 在 2026-10-25 的更正块（`docs/adr/0013:29-45`）里
-已经自己写明了“`parent_thread_id` 转发不存在”，所以给 `/uploads` 开子 agent 需要同时改
-转发与 backend 路由两处。挂 space 之后：
+上传文件名形如 `cbam-reporting_报价表.xlsx`，`_` 前那一段是 **space 名**：
 
-- 鉴权、隔离、`_check_scope`（`graphs/tools/xlsx/__init__.py:68`）、四个工具、
-  子 agent 可见性**全部现成**（依赖的正是同一个 `_config_for()` 的 `user_spaces`，
-  区别只是这条转发已经存在）；
-- ADR-0013 关于「会话文件只对主管可见、子 agent 的 backend 没有 `/uploads/` route」
-  的决定**一个字都不用改**。
+- 必须 ∈ 该用户的 `user_spaces`，否则 422 拒收（这是「表规则」的一部分）；
+- 主管据此决定派哪个 space 子 agent 分析（表不属于任何 space，但主题属于）；
+- **存储前缀仍是 `sessions/{h(identity)}/{thread_id}/`**，与 space 无关。
 
-**但“现成”不等于“正确”**：`_check_scope` 今天有跨空间越权（第一段判权后任 `..` 都能穿，
-实测 `/空间A/../空间B/x.xlsx` 能读到 `空间B` 的文件）。**搬 store 之前必须先修它**，
-不然新代码会把同一个漏洞一并搬过去。见 `../large-files.md` §0.1。
+这样"按空间分配"和"仅上传者可见 + 随会话删"同时成立。
 
-代价：大表对空间成员可见（而非仅上传者）。这与 space 本身的语义一致，可接受。
+### 4. 子 agent 靠签名凭证读同一份文件
 
-### 3. 派生索引 = SQLite，键由内容哈希决定
+子 agent 是静态服务身份（ADR-0004），算不出 `h(主管 identity)`。所以：
 
-- 每 sheet 一张表 `s0/s1/s2`，另加 `meta` / `columns` 两张小表。
-- 索引键 = `sha256(字节) + header + BUILD`（`BUILD` 是代码里的 schema 版本号，改列就 +1）。
-  **相同内容 → 相同键 → 相同产物**，于是“谁建都一样”：不需要分布式锁、不需要 leader
-election、不需要跨实例广播。
-- 索引是**可丢弃的派生数据**：建失败不影响上传成功，删了下次重建。索引放独立
-  `index/` 前缀（不能跟 blob 同前缀：它不在 PG 行的 `object_key` 里，同前缀就没人删它）。
-- 打开方式 `mode=ro&immutable=1` + `set_authorizer` 只放 SELECT/READ + 函数名白名单。
-  `where` 直拼 SQL 在引擎层被限死，比现在 `df.query(engine="python")` 能跑任意 Python 严格。
-- `where` 的语法与现在**不完全兼容**（已实测）：`数量 > 0` 裸中文名可用，但 `数量(个)`、
-  `价 格` 必须加引号；`!=` 在 SQL 里会漏掉空值行；`~col.isna()` / `@var` 不支持。
-  这些必须写进工具描述，否则模型会大面积报错或静默少行。
+- `AsyncTaskGuard._config_for()` 额外签发 `configurable.session_scope = {owner, thread_id, sig}`，
+  `sig = HMAC(服务端密钥, owner+thread_id)`；
+- **不替换 `langgraph_auth_user`**：一换，`allowed_spaces()` 会走普通用户分支去读
+  `auth_user.user_spaces`，子 agent 的权限从「本任务 space」放大成「用户全部 space」；
+- 必须签名：`create_run_config` 只强制覆写 `thread_id/run_id/langgraph_auth_user`，
+  其余 `configurable` 键客户端能自己塞（ADR-0013 更正块踩过这条）；
+- 子 agent 的 backend 从 `SpaceBackend` 换成
+  `CompositeBackend(default=SpaceBackend, routes={"/uploads/": StoreBackend(ns=f(session_scope))})`，
+  xlsx 工具用同一个 `session_scope` 算 S3 前缀（工具仍绕 backend 直读字节）。
 
-顺带一个"免费"的兼容性：SQLite 的 unquoted identifier 允许任意 ≥0x80 字符，反引号也
-支持，`==` 等价于 `=`。现有 `where` 写法（`数量 > 0`、`料号 == 'ABC'`、
-`` `col a` > 1 ``）几乎能原样跑，不需要写表达式翻译器。
+### 5. 上限与规则（env 可改，改数不发版）
 
-### 4. 字节入口先经服务端流式中转，直传留到 >100 MB
+| 项 | 值 | 说明 |
+|---|---|---|
+| `MAX_BLOB_MB` | 10 | xlsx 单文件字节上限（`MAX_UPLOAD_MB` 留给 md） |
+| `MAX_CELLS` | 2 000 000 | 结构性硬闸，超了直接拒，不静默截断 |
+| `MAX_MD_FILES_PER_SESSION` | 10 | |
+| `MAX_XLSX_FILES_PER_SESSION` | 20 | |
+| `MAX_THREADS_PER_USER` | 50 | **含子线程**（现行口径） |
+| `MAX_BLOB_BYTES_PER_USER` | 2 GB | 每用户 blob 总量 |
 
-`presigned PUT` 让浏览器直传才是大文件的正解，但需要额外的「确认上传」接口、临时前缀、
-过期清理。当前 27.9 MB 一次中转完全够用，且 sha256 本来就要过一次字节。
-把入口抽成 `custom/blobs.py::put_stream()` 一个函数，换直传时只改它。
+**不做**：秒传预检、前端直传、断点续传、按内容去重（同名覆盖就是正确语义）。
+**总是**建表索引（一次几十秒，换此后毫秒级；两条路径比一条贵）。
 
 ## Considered Options
 
 | 方案 | 否决理由 |
 |---|---|
-| xlsx 进 LangGraph Store | base64 约 37 MB/文件，每次调用拉整块 |
-| xlsx 进 PG `bytea` | WAL / 备份 / 连接内存都不划算 |
-| `pyarrow` + `duckdb` + parquet | 两个新依赖，百万行 / 多文件联查才值得 |
-| 进程内 LRU 缓存 DataFrame | 现在收益≈0；大表时又不如磁盘产物（`memory_usage()` 还低估 object 列） |
-| 给子 agent 挂 `/uploads` | 推翻 ADR-0013，需先改身份转发 |
-| S3Backend / BlobStorageMiddleware | 工具本来不走 backend，属多余 |
-| 内容寻址主键（`blobs/{sha256}`）+ 引用计数 | 删除要跨会话引用计数与 GC；改用 `(space, name)` 主键后整类问题消失 |
-| 浏览器直传（presigned） | 第一期成本不划算，留到 >100 MB |
+| 大表挂 space（第 1 稿） | 一张随手传的表变成永久共享知识，不可撤回；与「私有 + 随会话删」冲突 |
+| xlsx 进 Store / PG | base64 约 37 MB/文件，每次调用拉整块 |
+| 子 agent 直接替换 auth_user | 权限从「一个 space」放大成「用户全部 space」（ADR-0005 的收窄失效） |
+| 不签名、直接信 `configurable.session_scope` | 客户端可伪造 owner，读别人的会话文件 |
+| md 也搬 S3 | 要自己实现 `BackendProtocol`（~200 行）+ 重建「读后续期」TTL；md 用不上 S3 的容量 |
+| 内容寻址主键 + 引用计数 | 删除要跨会话引用计数与 GC；主键用 `(owner, thread, name)` 后整类问题消失 |
+| 进程内 LRU 缓存 DataFrame | 现在收益≈0；大表时又不如磁盘产物 |
 
 ## 后果
 
 **要接受的**：
 
-- **必须顺带修两处既有缺陷，否则本方案会静默失效**：
-  ① `_check_scope` 的跨空间越权；② `graphs/space_agents.py::has_tables` 与
-  `custom/frontend_api.py` 的 `_list_files` 都只扫本地盘 → 新上传的表永远装不上 xlsx 工具、
-  前端也看不到。详见 `../large-files.md` §0。
-- 首次访问一个未建索引的大表会 **41.7 s**（一次，全集群一次）。缓解（上传后丢后台 job
-  预建）需要动 worker，本期不做，代码里记 `shortcut:`。
-- 新增一个运行时依赖 `boto3`，以及一个部署组件 SeaweedFS。
-- 多一条运维逻辑：未完成的 multipart 上传 S3 不会自动清（必须显式 abort），
-  需要 `scripts/reap_multipart.py` 定期跑一次。aegra 的 crons API 只触发**图 run**，
-  不是运维脚本调度器，所以这个脚本得交给系统计划任务/侧车（`docs/large-files.md` §3.1）。
-- 存量 `graphs/okf/<space>/*.xlsx` 需要迁移；迁移脚本本期未写，先做**双读单写**兼容。
-- `graphs/okf` 从"真相"退化为"部署自带的只读样例"。这顺手修掉一个已有的多机缺陷：
-  本地盘挂载在多副本下本来就不一致。
+- 必须顺带修两处**既有**缺陷，否则本方案静默失效：
+  ① `_check_scope` 的跨空间越权（`/空间A/../空间B/x.xlsx` 现在能读）；
+  ② `graphs/space_agents.py::has_tables` 与 `custom/frontend_api.py::_list_files` 只扫本地盘。
+- 首次访问未建索引的大表 **41.7 s**（一次，全集群一次）；预建索引需要动 worker，未做。
+- 新增运行时依赖 `boto3` + 部署组件 SeaweedFS。
+- 多一条运维逻辑：未完成的 multipart 上传 S3 不会自动清，需 `scripts/reap_multipart.py`。
+  注意 aegra 的 crons API 只触发**图 run**，不是运维脚本调度器。
+- 两套载体 = 两套删除链，统一在 `custom/threads_delete.py` 一处。
 
-**不需要再做的**：不再讨论「xlsx 放 PG / Store」，不再试图给 deepagents 写 S3 backend。
+## 作废记录（2026-10-25）
+
+第 1 稿决定「大表挂 space，元数据进 `space_object` 表，空间成员共享」。作废原因：
+用户明确要求 **xlsx 仅上传者可见、随会话删除**。挂 space 与这两条都不兼容（space 内的东西
+对所有空间成员可见、且没有任何会话语义）。文件名里的 space 前缀因此降级为「路由提示」。
 
 ## 怎么验证（本地）
 
 ```bash
-weed server -s3 -dir=./.seaweedfs            # S3 网关在 :8333
+weed server -s3 -dir=./.seaweedfs            # S3 网关 :8333
 # .env: S3_ENDPOINT=http://127.0.0.1:8333 / S3_BUCKET=aegra-blobs
-.venv/Scripts/python.exe -m aegra_api.main
 .venv/Scripts/python.exe -m pytest tests/unit/test_xlsx_index.py -q
 ```
 
-`boto3` 必须配 `s3={"addressing_style": "path"}`：给了 `endpoint_url` 之后 boto3 仍默认
-virtual-host，`bucket.127.0.0.1:8333` 解析不了。
+boto3 必须配 `s3={"addressing_style": "path"}`：给了 `endpoint_url` 后仍默认 virtual-host，
+`bucket.127.0.0.1:8333` 解析不了。
