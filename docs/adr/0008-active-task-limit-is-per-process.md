@@ -99,9 +99,12 @@ MAX_ACTIVE_TASKS=3      # 正整数；非法值退回默认 3，启动不会因�
    `SELECT … FOR UPDATE` / 按 `parent_thread_id` 的 advisory lock 保证跨进程原子；派活成功写一行。
    顺带把 `/custom/tasks` 列表与三处「核实子 run 状态」的实现（`graphs/async_task_guard.py::_refreshed_sync/_refreshed_async`、
    `custom/frontend_api.py::_fresh_status`）收敛到同一张表。
-2. **查 `runs` 表现有数据**：子 run 的 `config.configurable.parent_thread_id` 已经带上了父线程
-   （ADR-0005），但 aegra 没为它建索引、也没暴露「按 config 查 run」的接口，只能全表扫 JSONB，
-   等于把成本压到每次派活上。不推荐，除非顺带在 `src/` 加索引与查询接口。
+2. **查 `runs` / `thread` 表现有数据**：注意子 run 的 config 里**没有**父线程标识——
+   `AsyncTaskGuard._config_for()` 只发 `user_spaces`，`parent_thread_id` 在子线程的
+   `metadata`（`_thread_meta()` 写的，即 `thread.metadata_json`），不在 `run.config`。
+   但 `thread` 表只在 `user_id` 上有索引（`idx_thread_user`），JSONB 没有 GIN 索引，也没暴露
+   「按 metadata 查 thread」的接口，只能全表扫，等于把成本压到每次派活上。不推荐，除非顺带在
+   `src/` 加索引与查询接口。
 
 ## Considered Options
 
