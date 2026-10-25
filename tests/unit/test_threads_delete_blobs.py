@@ -29,13 +29,14 @@ def wired(monkeypatch):
     calls: dict[str, list] = {"rows": [], "prefix": []}
     session = FakeSession()
 
-    monkeypatch.setattr(threads_delete, "get_session_maker", lambda: (lambda: FakeCM(session)))
+    monkeypatch.setattr(threads_delete, "get_session_maker", lambda: lambda: FakeCM(session))
 
     async def fake_delete_rows(_s, owner, thread_id):
         calls["rows"].append((owner, thread_id))
         return 2
 
     monkeypatch.setattr(session_objects, "delete_for_thread", fake_delete_rows)
+    monkeypatch.setattr(blobs, "configured", lambda: True)  # 默认当“生产”、单测自带一个
     monkeypatch.setattr(blobs, "delete_prefix", lambda prefix: calls["prefix"].append(prefix) or 3)
     return calls, session
 
@@ -74,3 +75,14 @@ async def test_prefix_failure_is_swallowed(wired, monkeypatch):
     await threads_delete._clear_blobs("u1", "t-1")  # 不抛
 
     assert calls["rows"] == [("u1", "t-1")]
+
+
+async def test_skips_prefix_when_object_storage_not_configured(wired, monkeypatch):
+    """开发环境不配 S3：不应每次删会话都打一条异常日志。行还是要删的。"""
+    calls, _ = wired
+    monkeypatch.setattr(blobs, "configured", lambda: False)
+    monkeypatch.setattr(blobs, "configured", lambda: False)
+
+    await threads_delete._clear_blobs("u1", "t-1")
+
+    assert calls["prefix"] == []

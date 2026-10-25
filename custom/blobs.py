@@ -43,6 +43,11 @@ def bucket() -> str:
     return _env("S3_BUCKET", "aegra-blobs")
 
 
+def configured() -> bool:
+    """有没有配对象存储。开发环境只跑磁盘时这是 False：调用方据此**跳过**而不是报错。"""
+    return bool(_env("S3_ENDPOINT"))
+
+
 _client_cache: Any = None
 
 
@@ -253,6 +258,7 @@ __all__ = [
     "blob_key",
     "bucket",
     "client",
+    "configured",
     "copy",
     "delete",
     "delete_prefix",

@@ -79,6 +79,9 @@ async def _clear_blobs(identity: str, thread_id: str) -> None:
     """
     from custom import blobs, session_objects
 
+    if not blobs.configured():  # 开发环境只跑磁盘：没有对象要删，不必假装失败
+        return
+
     try:
         async with get_session_maker()() as fresh:
             removed = await session_objects.delete_for_thread(fresh, identity, thread_id)

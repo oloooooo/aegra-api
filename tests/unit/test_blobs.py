@@ -171,3 +171,10 @@ def test_delete_prefix_pages_and_batches(monkeypatch):
     monkeypatch.setattr(blobs, "client", lambda: PagingS3())
     assert blobs.delete_prefix("p/") == 1001
     assert batches == [1000, 1]
+
+
+def test_configured_follows_endpoint(monkeypatch):
+    monkeypatch.setenv("S3_ENDPOINT", "http://x:9000")
+    assert blobs.configured() is True
+    monkeypatch.setenv("S3_ENDPOINT", "")
+    assert blobs.configured() is False
