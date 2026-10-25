@@ -37,6 +37,9 @@ MAX_MD_FILES_PER_SESSION = _int_env("MAX_MD_FILES_PER_SESSION", 10)
 MAX_XLSX_FILES_PER_SESSION = _int_env("MAX_XLSX_FILES_PER_SESSION", 20)
 # 每用户二进制总量：会话数 × 每会话文件数相乘会失控，必须有这道闸
 MAX_BYTES_PER_USER = _int_env("MAX_BLOB_MB_PER_USER", 2048) * 1024 * 1024
+# 单个 xlsx 的 HTTP 层上限（与 md 的 MAX_UPLOAD_MB 分开）
+MAX_BLOB_MB = _int_env("MAX_BLOB_MB", 10)
+MAX_BLOB_BYTES = MAX_BLOB_MB * 1024 * 1024
 
 _XLSX_SUFFIX = ".xlsx"
 

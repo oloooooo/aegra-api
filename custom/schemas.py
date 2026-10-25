@@ -58,3 +58,13 @@ class UploadFileResponse(BaseModel):
     bytes: int
     uploaded_at: str
     ttl_minutes: int
+
+class UploadTableResponse(BaseModel):
+    """上传成功的大表（ADR-0015）：字节在对象存储，行在 `session_object`。"""
+
+    name: str
+    path: str
+    space: str
+    bytes: int
+    sha256: str
+    indexed: bool = False
