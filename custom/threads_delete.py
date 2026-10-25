@@ -1,4 +1,8 @@
-"""删会话时连带清掉它的会话文件（ADR-0013）。
+"""删会话时连带清掉它的会话文件（ADR-0013 / ADR-0015）。
+
+两种载体的删除链在这里合流：md 在 LangGraph Store（`session_store.clear`），
+二进制（xlsx）在对象存储（前缀 `sessions/{h(identity)}/{thread_id}/`）+ PG 的
+`session_object` 行。顺序：先删行、再删前缀——行留着会让配额虚高，对象删不掉只是垃圾。
 
 为什么用「注册一条同名路由遮挡核心路由」：aegra 的 `delete_thread` 只删 checkpoint 与
 thread 行，不认识 store。`src/` 默认不动，所以把清理放在这一层。可行是因为
@@ -14,6 +18,7 @@ thread 行，不认识 store。`src/` 默认不动，所以把清理放在这一
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Annotated
 
 import structlog
@@ -44,6 +49,7 @@ async def delete_thread(
 ) -> dict[str, str]:
     """核心删除 + 会话文件清理。"""
     result = await core_delete_thread(thread_id, user, session)
+    await _clear_blobs(user.identity, thread_id)  # 与 store 无依赖：先跑，别被它拦住
     try:
         store = db_manager.get_store()
     except RuntimeError:  # 初始化未完成：文件留着，靠孤儿保留期兜底（ADR-0013）
@@ -62,6 +68,31 @@ async def delete_thread(
         # 残留文件由孤儿保留期清理；比"删成功却报错"更可取
         logger.exception("session_files_clear_failed", identity=user.identity, thread_id=thread_id)
     return result
+
+
+async def _clear_blobs(identity: str, thread_id: str) -> None:
+    """删掉这条会话的二进制：先删 `session_object` 行，再删对象存储前缀。
+
+    thread 行已经删了，这里再抛错只会让客户端把成功的删除当成失败去重试（然后 404），
+    所以两段各自兜底：行删不掉→下次按同前缀再清；对象删不掉→生命周期兜底。
+    """
+    from custom import blobs, session_objects
+
+    try:
+        async with db_manager.get_session_maker()() as fresh:
+            removed = await session_objects.delete_for_thread(fresh, identity, thread_id)
+            await fresh.commit()
+        if removed:
+            logger.info("session_objects_cleared", identity=identity, thread_id=thread_id, removed=removed)
+    except Exception:  # noqa: BLE001 —— 不能把已成功的删除变成 500
+        logger.exception("session_objects_clear_failed", identity=identity, thread_id=thread_id)
+        return
+    try:
+        count = await asyncio.to_thread(blobs.delete_prefix, blobs.session_prefix(identity, thread_id))
+        if count:
+            logger.info("session_blobs_cleared", identity=identity, thread_id=thread_id, removed=count)
+    except Exception:  # noqa: BLE001 —— 同上；生命周期规则会收尾
+        logger.exception("session_blobs_clear_failed", identity=identity, thread_id=thread_id)
 
 
 # ---------- 启动断言 ----------
