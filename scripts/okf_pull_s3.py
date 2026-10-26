@@ -1,4 +1,4 @@
-"""把对象存储的 `okf/` 前缀拉到本地镜像（`OKF_BACKEND=s3` 用，ADR-0016）。
+"""把对象存储的 `okf/` 前缀拉到本地镜像（`okf.backend: s3` 用，ADR-0016）。
 
 `knowledge_root()` 在镜像缺失时会自动调用它；手动跑用于「空间内容改了，想让各副本立刻生效」。
 
@@ -26,7 +26,7 @@ from graphs import okf_mirror  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="从对象存储拉取 OKF 镜像")
-    ap.add_argument("--dest", default=None, help="镜像目录，缺省 OKF_MIRROR_DIR 或 .cache/okf")
+    ap.add_argument("--dest", default=None, help="镜像目录，缺省 config.yaml 的 okf.mirror_dir（或 .cache/okf）")
     args = ap.parse_args()
 
     dest = Path(args.dest).resolve() if args.dest else okf_mirror.mirror_root()

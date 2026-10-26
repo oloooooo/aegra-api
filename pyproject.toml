@@ -50,6 +50,8 @@ dependencies = [
     # Utils
     "structlog>=25.4.0",
     "asgi-correlation-id>=4.3.4",
+    # 读仓库根的 config.yaml（custom/project_config.py）
+    "pyyaml>=6.0",
     # Redis (optional broker backend for multi-instance streaming)
     "redis[hiredis]>=5.0.0",
     # Cron expression parsing

@@ -125,7 +125,7 @@ _Avoid_: 把子 agent 的数量或名字写成固定值、把 prompt 写在代�
 _Avoid_: 把 `async_tasks.status` 当成子 run 的真实状态（真实状态查 `GET /custom/tasks/{id}`）
 
 **Thread quota（会话配额）**:
-一个账号最多拥有多少个 thread（`MAX_THREADS_PER_USER`）。子线程也计数，但计入它所属的
+一个账号最多拥有多少个 thread（`config.yaml` 的 `quota.max_threads_per_user`）。子线程也计数，但计入它所属的
 主管：子线程建时带 metadata `owner_identity`（终端用户）与 `parent_thread_id`，
 计数只统计 `parent_thread_id` 为空的那批。超额时 `POST /threads` 返回 403。
 删主管线程会连带删它的子线程，否则子线程（属主是服务账号）会成为永久孤儿。

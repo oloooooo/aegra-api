@@ -7,10 +7,11 @@ import os
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from custom import project_config
 from custom.models import UserSpace
 
-# access token 有效期（秒），改 .env 可覆盖
-TOKEN_TTL = int(os.environ.get("ACCESS_TOKEN_TTL", "3600"))
+# access token 有效期（秒）；非密钥，配在 config.yaml 的 auth.access_token_ttl
+TOKEN_TTL = int(project_config.get("auth.access_token_ttl"))
 
 
 def _hash_password(password: str) -> str:
@@ -30,8 +31,8 @@ def _create_access_token(identity: str) -> str:
     return jwt.encode(payload, os.environ["JWT_SECRET"], algorithm="HS256")
 
 
-# 内部服务账号（async subagent / 前端代理读取子线程用）
-SERVICE_IDENTITY = os.environ.get("SERVICE_IDENTITY", "subagent_service")
+# 内部服务账号（async subagent / 前端代理读取子线程用）；非密钥，配在 config.yaml
+SERVICE_IDENTITY = project_config.get("auth.service_identity")
 _service_token_cache: str | None = None
 
 

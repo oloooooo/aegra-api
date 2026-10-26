@@ -12,6 +12,8 @@ import structlog
 from graphs.llms import model
 from pydantic import BaseModel
 
+from custom import project_config
+
 # 服务身份的 token 只在 custom/services.py 铸造（单一来源）。
 # 导入不读 env，真正的读取发生在下方 service_token() 调用时（已在 load_dotenv 之后）。
 from custom.services import service_token
@@ -81,7 +83,8 @@ _service_token = service_token()
 # langgraph_auth_user.user_spaces）。加一个 space 就多一个子 agent，删一个就少一个，
 # 代码不用动。
 _GRAPH_ID = "domain_agent"  # aegra.json 里那个唯一域子 agent 图的 key
-_SERVER_URL = "http://127.0.0.1:2026"
+# 服务自己调自己的地址；容器/换端口在 config.yaml 的 agents.server_url 改
+_SERVER_URL = project_config.get("agents.server_url")
 
 
 def domain_specs(config: RunnableConfig) -> dict[str, dict]:

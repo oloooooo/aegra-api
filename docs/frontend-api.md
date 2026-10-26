@@ -34,7 +34,7 @@ POST /custom/login
 200 {"access_token": "...", "token_type": "bearer", "expires_in": 3600}
 ```
 
-- token **1 小时**过期（`ACCESS_TOKEN_TTL`），没有 refresh token；前端收到 401 就回登录页。
+- token **1 小时**过期（`config.yaml` 的 `auth.access_token_ttl`），没有 refresh token；前端收到 401 就回登录页。
 - `permissions` 含 `write` 表示超级用户（`user_tables.is_super`），能建 Space、分配用户、看全部 Space。
 - 当前身份：`GET /custom/whoami`；自己的空间：`GET /custom/user/spaces`。
 
@@ -126,10 +126,10 @@ event: end        data: {"status": "success"}
 ```
 
 - 校验顺序固定：会话归属 → 文件名 → 扩展名 → 大小 → 编码。先挡归属与文件名，再边读边判大小（超限即 `413`），最后才解码。
-- 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `MAX_UPLOAD_MB`（默认 10）或本会话文件数已达 `MAX_FILES_PER_SESSION`（默认 50）`413`；store 未就绪 `503`。
+- 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `session_files.max_upload_mb`（默认 10）或本会话文件数已达 `session_files.max_files_per_session`（默认 50）`413`；store 未就绪 `503`。
 - 同名重传 = 覆盖（PUT 语义，`/uploads` 下永远只有一份），不占新名额。
 - 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/session_files.py`），所以本轮 run 看不到刚传的文件。
-- 孤儿 TTL 默认 72 小时（`UPLOAD_TTL_MINUTES`）：活跃会话每轮读清单会续期，没人读才过期；删会话即清空。
+- 孤儿 TTL 默认 72 小时（`session_files.upload_ttl_minutes`）：活跃会话每轮读清单会续期，没人读才过期；删会话即清空。
 - **没有列表/删除接口**：前端只能自己记住传过什么；要删文件目前只能删会话。
 
 ### 3.8 `POST /custom/uploads/tables`
@@ -144,8 +144,8 @@ event: end        data: {"status": "success"}
 - **文件名必须是 `<空间名>_<表名>.xlsx`**。空间名只决定「主管派哪个子 agent」，**不决定存哪**；
   它必须在该用户的 `user_spaces` 里，否则 `422`。
 - 校验顺序：会话归属 → 字节大小 → 文件名/空间 → 流式写入。前两步便宜，大文件在第三步之后才碰。
-- 错误码：会话不是你的 `404`；非 `.xlsx` `415`；超 `MAX_BLOB_MB`（默认 10）、超每会话文件数
-  （`MAX_XLSX_FILES_PER_SESSION`，默认 20）或超每用户总量（`MAX_BLOB_MB_PER_USER`，默认 2048）`413`；
+- 错误码：会话不是你的 `404`；非 `.xlsx` `415`；超 `xlsx.max_blob_mb`（默认 10）、超每会话文件数
+  （`xlsx.max_xlsx_files_per_session`，默认 20）或超每用户总量（`xlsx.max_blob_mb_per_user`，默认 2048）`413`；
   文件名非法 / 空间没权限 `422`；对象存储未就绪 `503`。
 - **`indexed:false` 是正常状态**：索引在第一次调 `xlsx_*` 工具时才建，建完写回对象存储。
 - 同名重传 = 覆盖（PUT 语义）；同内容重传命中同一个 key，不重建索引。
@@ -255,7 +255,7 @@ POST /threads/{thread_id}/runs/crons
 
 ### 建会话的配额
 
-`POST /threads` 每个账号最多 `MAX_THREADS_PER_USER`（默认 50）个会话（子线程也计名额，一个会话派 3~5 个子任务就吃掉 3~5 个）。
+`POST /threads` 每个账号最多 `quota.max_threads_per_user`（`config.yaml`，默认 50）个会话（子线程也计名额，一个会话派 3~5 个子任务就吃掉 3~5 个）。
 超额返回：
 
 ```http

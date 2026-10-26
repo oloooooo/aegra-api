@@ -8,7 +8,7 @@
     PYTHONPATH=. .venv/Scripts/python.exe scripts/okf_push_s3.py
     PYTHONPATH=. .venv/Scripts/python.exe scripts/okf_push_s3.py --prune
 
-需要 `.env` 里的 `S3_ENDPOINT` / `S3_BUCKET`（见 `.env_example`）。
+需要 `config.yaml` 里的 `s3.endpoint` / `s3.bucket`（见 docs/S3.md §2），凭证在 `.env`。
 """
 
 from __future__ import annotations

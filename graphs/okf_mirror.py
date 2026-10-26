@@ -1,4 +1,4 @@
-"""知识空间根：`OKF_BACKEND=local` 直接读盘，`=s3` 读 S3 的本地镜像（ADR-0016）。
+"""知识空间根：`okf.backend: local` 直接读盘，`: s3` 读 S3 的本地镜像（ADR-0016）。
 
 为什么是「镜像」而不是手写一个 S3 backend：deepagents 的 `BackendProtocol` 有 14 个方法
 （ls / read / grep / glob / write / edit / delete / upload / download + 各自的 async 版），
@@ -8,7 +8,7 @@
 镜像换来的性质一样：空间内容存在 S3（多副本看到同一份），进程只读本地副本，
 8 个 fs 工具走的还是同一份经过测试的实现。
 
-刷新时机：镜像缺失时拉一次；`OKF_MIRROR_TTL_SECONDS`（默认 0 = 不自动刷新）到期后再拉。
+刷新时机：镜像缺失时拉一次；`okf.mirror_ttl_seconds`（默认 0 = 不自动刷新）到期后再拉。
 改了空间内容就重跑 `scripts/okf_pull_s3.py`，或把 TTL 设成几百秒让它自己过期。
 """
 
@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-from custom import blobs
+from custom import blobs, project_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _PREFIX = "okf/"
@@ -29,24 +29,20 @@ _last_pull: float = 0.0
 
 def local_root() -> Path:
     """部署包/仓库里自带的 `graphs/okf`（`local` 模式的真相，`s3` 模式下的上传源）。"""
-    return (PROJECT_ROOT / "graphs" / os.getenv("OKF_DIR", "okf")).resolve()
+    return (PROJECT_ROOT / "graphs" / project_config.get("okf.dir")).resolve()
 
 
 def backend_mode() -> str:
-    return (os.getenv("OKF_BACKEND") or "local").strip().lower()
+    return str(project_config.get("okf.backend")).strip().lower()
 
 
 def mirror_root() -> Path:
     """`s3` 模式下的本地镜像目录；默认 `.cache/okf`（必须在 OKF 根之外）。"""
-    return Path(os.getenv("OKF_MIRROR_DIR") or ".cache/okf").resolve()
+    return Path(project_config.get("okf.mirror_dir")).resolve()
 
 
 def _ttl() -> float:
-    raw = os.getenv("OKF_MIRROR_TTL_SECONDS")
-    try:
-        return float(raw) if raw else 0.0
-    except ValueError:
-        return 0.0
+    return float(project_config.get("okf.mirror_ttl_seconds"))
 
 
 def knowledge_root(*, force_pull: bool = False) -> Path:

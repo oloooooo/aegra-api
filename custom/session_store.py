@@ -16,12 +16,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from datetime import UTC, datetime
 from typing import Any
 
 # 只是 store 的 batch op 类型（轻量模块），不是整张图
 from langgraph.store.base import PutOp
+
+from custom import project_config
 
 # 命名空间前缀。第二期的空间表用别的前缀（如 "space_tables"），别混。
 NAMESPACE_PREFIX = "uploads"
@@ -30,24 +31,13 @@ NAMESPACE_PREFIX = "uploads"
 VIRTUAL_ROOT = "/uploads"
 
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 1 else default
-
-
 # 孤儿保留期：语义是「最后读取后多久」，不是绝对寿命（ADR-0013）
-UPLOAD_TTL_MINUTES = _int_env("UPLOAD_TTL_MINUTES", 72 * 60)
+UPLOAD_TTL_MINUTES = int(project_config.get("session_files.upload_ttl_minutes"))
 # 接口拒收线，与「是否放进上下文」的 32KB 阈值无关
-MAX_UPLOAD_MB = _int_env("MAX_UPLOAD_MB", 10)
+MAX_UPLOAD_MB = int(project_config.get("session_files.max_upload_mb"))
 # 每个会话最多挂多少个文件：TTL 只管孤儿、thread 配额只管会话数，
 # 没有这道闸的话单会话可以无限堆（每份 ≤10MB）。
-MAX_FILES_PER_SESSION = _int_env("MAX_FILES_PER_SESSION", 50)
+MAX_FILES_PER_SESSION = int(project_config.get("session_files.max_files_per_session"))
 
 
 def identity_digest(identity: str) -> str:

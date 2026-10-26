@@ -318,7 +318,7 @@ Supersede（`multitask_strategy="interrupt"`，**在创建新 run 之前**）：
   "dependencies": ["."],
   "graphs": {
     "researcher": "./graphs/researcher.py:graph",
-    "supervisor": "./graphs/supervisor.py:graph"
+    "supervisor": "./graphs/deepagents_nodes.py:graph"
   }
 }
 ```

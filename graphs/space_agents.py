@@ -23,13 +23,14 @@ import re
 from pathlib import Path
 
 from graphs.okf_mirror import knowledge_root
+from custom import project_config
 
 # 项目根（= 仓库根）。space.path 存的相对路径以它为基准（frontend_api 也这么解）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# 知识空间根：`OKF_BACKEND=local` 是 `graphs/okf`，`=s3` 是 S3 的本地镜像（ADR-0016）。
+# 知识空间根：`okf.backend: local` 是 `graphs/okf`，`s3` 是 S3 的本地镜像（ADR-0016）。
 # 保留 `KNOWLEDGE_ROOT` 这个常量名给老调用点，真正的解析统一走 `okf_mirror.knowledge_root()`。
-KNOWLEDGE_ROOT = Path(__file__).resolve().parent / os.getenv("OKF_DIR", "okf")
+KNOWLEDGE_ROOT = Path(__file__).resolve().parent / project_config.get("okf.dir")
 
 AGENT_FILE = "AGENT.md"
 

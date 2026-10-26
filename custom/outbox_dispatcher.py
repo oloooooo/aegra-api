@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -41,6 +40,7 @@ from aegra_api.models.auth import User
 from aegra_api.models.runs import RunCreate
 from aegra_api.services.run_status import ACTIVE_RUN_STATES
 from aegra_api.settings import settings
+from custom import project_config
 from custom.models import AsyncTaskOutbox, UserSpace, UserTables
 from custom.outbox import completion_text, is_long_result, message_text, result_body
 from custom.services import service_token
@@ -49,25 +49,26 @@ logger = structlog.getLogger(__name__)
 
 # 轮询间隔：1s 是"用户几乎察觉不到"与"空表时的 DB 压力"之间的折中。
 # 多进程下每个进程各跑一个循环，空表时每条 tick 只有一次索引扫描。
-_POLL_INTERVAL = float(os.getenv("OUTBOX_POLL_INTERVAL_SECONDS", "1.0"))
+_POLL_INTERVAL = float(project_config.get("outbox.poll_interval_seconds"))
 # 一批最多领多少行（避免一个 tick 把队列抽干，把机会让给别的进程）
-_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
+_BATCH_SIZE = int(project_config.get("outbox.batch_size"))
 # 分发租约：领到批后多久算"我在处理"，超时说明进程死了，别人可以接手
-_LEASE_SECONDS = float(os.getenv("OUTBOX_LEASE_SECONDS", "30"))
+_LEASE_SECONDS = float(project_config.get("outbox.lease_seconds"))
 # 父线程忙时的重试间隔（不是失败，不计尝试次数）
-_BUSY_BACKOFF_SECONDS = float(os.getenv("OUTBOX_BUSY_BACKOFF_SECONDS", "2"))
+_BUSY_BACKOFF_SECONDS = float(project_config.get("outbox.busy_backoff_seconds"))
 # 失败重试上限：超过就标 failed，交给父 run 的 hook 兜底（不永久占着轮询）
-_MAX_ATTEMPTS = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "10"))
+_MAX_ATTEMPTS = int(project_config.get("outbox.max_attempts"))
 # 启动延迟：等 core 的 DB / LangGraph 初始化完（lifespan 顺序不确定）
-_STARTUP_DELAY_SECONDS = float(os.getenv("OUTBOX_STARTUP_DELAY_SECONDS", "5"))
+_STARTUP_DELAY_SECONDS = float(project_config.get("outbox.startup_delay_seconds"))
 
 # 服务身份客户端（进程级缓存）：子线程属主是服务账号，只有它能读子线程
 _SERVICE_CLIENT: Any = None
 # 自己调自己用 IPv4 回环：`settings.app.SERVER_URL` 推导成 localhost，
 # 而 Windows 下 localhost 优先解成 ::1，uvicorn 只绑了 127.0.0.1 → 请求会挂住。
-_SERVICE_URL = os.getenv("AEGRA_INTERNAL_URL") or f"http://127.0.0.1:{settings.app.PORT}"
+# 留空则按服务端口拼（容器里想指内网 DNS 名就在 config.yaml 改 outbox.internal_url）。
+_SERVICE_URL = project_config.get("outbox.internal_url") or f"http://127.0.0.1:{settings.app.PORT}"
 # 读子线程摘要的超时：拿不到就退到存盘摘要，不能把整个 tick 挂死
-_SUMMARY_TIMEOUT = float(os.getenv("OUTBOX_SUMMARY_TIMEOUT_SECONDS", "5"))
+_SUMMARY_TIMEOUT = float(project_config.get("outbox.summary_timeout_seconds"))
 
 
 def _wake_run_id(parent_thread_id: str, rows: list[dict[str, Any]]) -> str:

@@ -21,6 +21,7 @@ import os
 import uuid
 from typing import Any
 
+from custom import project_config
 from custom.session_store import identity_digest
 
 _PART_BYTES = 8 * 1024 * 1024  # S3 要求除最后一片外 ≥5MiB
@@ -36,16 +37,17 @@ class BlobUnavailable(Exception):
 
 
 def _env(name: str, default: str = "") -> str:
+    """凭证仍只走环境变量（不进 config.yaml）。"""
     return (os.environ.get(name) or default).strip()
 
 
 def bucket() -> str:
-    return _env("S3_BUCKET", "aegra-blobs")
+    return project_config.get("s3.bucket")
 
 
 def configured() -> bool:
     """有没有配对象存储。开发环境只跑磁盘时这是 False：调用方据此**跳过**而不是报错。"""
-    return bool(_env("S3_ENDPOINT"))
+    return bool(project_config.get("s3.endpoint"))
 
 
 _client_cache: Any = None
@@ -58,9 +60,9 @@ def client() -> Any:
     global _client_cache
     if _client_cache is not None:
         return _client_cache
-    endpoint = _env("S3_ENDPOINT")
+    endpoint = project_config.get("s3.endpoint")
     if not endpoint:
-        raise BlobUnavailable("S3_ENDPOINT 未配置")
+        raise BlobUnavailable("对象存储未配置（config.yaml 的 s3.endpoint 为空）")
     try:
         import boto3
         from botocore.config import Config
@@ -71,7 +73,7 @@ def client() -> Any:
         endpoint_url=endpoint,
         aws_access_key_id=_env("S3_ACCESS_KEY", "dev"),
         aws_secret_access_key=_env("S3_SECRET_KEY", "dev"),
-        region_name=_env("S3_REGION", "us-east-1"),
+        region_name=project_config.get("s3.region"),
         # 给了 endpoint_url 之后 boto3 仍默认 virtual-host，bucket.127.0.0.1:8333 解析不了
         config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}),
     )

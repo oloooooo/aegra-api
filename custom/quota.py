@@ -10,18 +10,7 @@
 
 from __future__ import annotations
 
-import os
-
-
-def _positive_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 1 else default
+from custom import project_config
 
 
 # 一个账号最多同时拥有几个会话（主管线程 + 它们的子线程）。
@@ -29,4 +18,4 @@ def _positive_int(name: str, default: int) -> int:
 #
 # 50 是按“一个会话派 3~5 个子任务”反推的量级：用户实际能同时开的主会话约 10 个。
 # 口径仍是“含子线程”（子线程计数到所属主管上），只在建会话时判定。
-MAX_THREADS_PER_USER = _positive_int("MAX_THREADS_PER_USER", 50)
+MAX_THREADS_PER_USER = int(project_config.get("quota.max_threads_per_user"))

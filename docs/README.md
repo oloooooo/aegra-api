@@ -2,10 +2,12 @@
 
 本目录是 aegra-api 作为 Deep Agents async subagent 通信面（Agent Protocol，简称 ACP）的文档。旧版需求文档属于已废弃的独立包 `aegra-protocol`（该仓库已不存在）。
 
+> ADR 是决策当时的快照，里面写的 env 名（如 `MAX_BLOB_MB`、`OKF_BACKEND`）现在多数已经搬到仓库根 `config.yaml`（§3.2）；旧环境变量名仍可作为覆盖值使用。以 [configuration.md](./configuration.md) 为准。
+
 | 文件 | 内容 |
 | - | - |
 | [design.md](./design.md) | **需求与设计（§7 五项改动已全部实现，§10 测试全部通过）**：deepagents 实发的五类请求、状态/动作词表三方对照、端点契约、`interrupted_by` 数据模型、状态机、取消与 Supersede 时序、本期改动清单、`aegra.json` 示例、已知限制、测试清单 |
-| [configuration.md](./configuration.md) | **配置参考**：`aegra.json` 逐键说明与启动期报错、graph key / `assistant_id` 契约、全部环境变量、日志（stdout + `logs/aegra.log` 轮转与保留）、OpenTelemetry / Prometheus、排错对照表 |
+| [configuration.md](./configuration.md) | **配置参考**：`aegra.json` 逐键说明与启动期报错、graph key / `assistant_id` 契约、**配置来源三分（§3.1 aegra 原生环境变量 / §3.2 本项目新增的 `config.yaml` / §3.3 密钥）**、日志（stdout + `logs/aegra.log` 轮转与保留）、OpenTelemetry / Prometheus、排错对照表 |
 | [streaming.md](./streaming.md) | **流式参考**：`client.stream` 结构与全部 9 种模式实测矩阵、aegra 模式处理与 `version="v2"` 硬编码、deepagents/`astream_events` 适配、v3 进程内✅/HTTP❌、前端 vs 调试选型、子图流不回传等坑、子 agent 流代理与 `async_tasks` 僵尸状态 |
 | [frontend-api.md](./frontend-api.md) | **前端接口参考**：`custom/` 下 10 个前端接口（`frontend_api.py` 7 个 + `task_control_api.py` 的 `cancel` + `uploads.py` 的 md 上传与会话大表上传）+ 2 个投递 ack 内部接口、鉴权与 token 时长、原生接口清单、SSE 帧契约（增量 / interrupt-resume / 回写消息识别）、定时任务实测行为、会话删除与已知限制 |
 | [large-files.md](./large-files.md) | **会话文件与大表（实现说明）**：md→Store / xlsx→S3 双载体、`sessions/{h}/{thread}/` 前缀、文件名 `<space>_*.xlsx` 只做路由、签名 `session_scope`、ingest → SQLite、多副本一致性、已知限制与测试清单 |
@@ -26,7 +28,7 @@
 | [adr/0013-session-files-live-in-store.md](./adr/0013-session-files-live-in-store.md) | 会话文件放 LangGraph Store，按（上传者, 主管 thread）隔离；不进 Space、随会话删除、孤儿靠 TTL 兜底 |
 | [adr/0014-no-hitl-for-eval.md](./adr/0014-no-hitl-for-eval.md) | 子任务只做取消与状态通知，不做 `eval` 的 HITL 审批（2026-10-25 复审：暂停/继续仍不做） |
 | [adr/0015-large-tables-in-object-storage.md](./adr/0015-large-tables-in-object-storage.md) | 会话文件：md 进 Store、xlsx 进对象存储，**上传者私有 + 随会话删**；文件名 `<space>_*` 只做主题路由；子 agent 靠**签名 `session_scope`** + `CompositeBackend` 路由读文件 |
-| [adr/0016-spaces-in-object-storage.md](./adr/0016-spaces-in-object-storage.md) | 空间内容（OKF）进 S3，`OKF_BACKEND=local\|s3` 两套实现（`s3` 读本地镜像）；`scripts/okf_push_s3.py` / `okf_pull_s3.py` |
+| [adr/0016-spaces-in-object-storage.md](./adr/0016-spaces-in-object-storage.md) | 空间内容（OKF）进 S3，`okf.backend: local\|s3` 两套实现（`s3` 读本地镜像）；`scripts/okf_push_s3.py` / `okf_pull_s3.py` |
 
 其他相关文档：
 

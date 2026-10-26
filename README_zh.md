@@ -35,43 +35,57 @@ psql --version   # 或确认 PG 已在 localhost:5432 监听
 
 ---
 
-## 3. 配置 `.env`
+## 3. 配置：`.env` + `config.yaml`
 
 ```bash
 cp .env_example .env
 ```
 
-至少改这几项（其余可保持默认）：
+两份文件分工（逐键说明见 [`docs/configuration.md` §3](./docs/configuration.md#3-配置来源)）：
+
+| 文件 | 放什么 |
+|---|---|
+| `.env` | aegra 原生运行参数（数据库、端口、日志…）+ **密钥** + 第三方模型 key |
+| `config.yaml` | 本项目新增的非密钥参数（会话配额、文件上限、对象存储地址、知识空间）—— 已有默认值，不改也能跑 |
+
+`.env` 至少改这几项：
 
 ```ini
-# --- 数据库 ---
+# --- A. aegra 原生：数据库 ---
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=你的密码
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 POSTGRES_DB=aegra          # 库要先建好：createdb aegra
 
-# --- 模型（OpenAI 兼容接口） ---
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.deepseek.com      # 用官方则可留空
-OPENAI_MODEL=deepseek-flash
-
-# --- 鉴权：两个密钥必须设置，否则启动就报错 ---
-# 生成：python -c "import secrets;print(secrets.token_urlsafe(48))"
-JWT_SECRET=换成长随机串
-PASSWORD_PEPPER=换成长随机串
-
-# --- 业务上限 ---
-# 一个账号最多同时拥有几个会话（含子线程，默认 50）；一个会话派 3~5 个子任务就吃掉 3~5 个名额
-MAX_THREADS_PER_USER=50
-
-# --- 服务 ---
+# --- A. aegra 原生：服务 ---
 HOST=127.0.0.1
 PORT=2026
 AEGRA_CONFIG=aegra.json
+
+# --- B. 密钥：两个必须设置，否则启动就报错 ---
+# 生成：python -c "import secrets;print(secrets.token_urlsafe(48))"
+JWT_SECRET=换成长随机串
+PASSWORD_PEPPER=换成长随机串
+SESSION_SCOPE_SECRET=换成长随机串     # 子 agent 读会话文件用
+
+# --- C. 第三方：模型（OpenAI 兼容接口，graphs/llms.py 读取） ---
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.deepseek.com      # 用官方则可留空
+OPENAI_MODEL=deepseek-flash
+```
+
+`config.yaml` 只改真要调的（示例：一个账号最多几个会话；生产接对象存储）：
+
+```yaml
+quota:
+  max_threads_per_user: 50   # 含子线程；一个会话派 3~5 个子任务就吃掉 3~5 个名额
+s3:
+  endpoint: http://127.0.0.1:8333   # 留空 = 不启用对象存储（上传会话大表会 503）
 ```
 
 > `PASSWORD_PEPPER` 一旦改动，**已注册的账号全部无法登录**（bcrypt 哈希不再匹配），需要重新注册或重置密码。
+> 改了 `config.yaml` 或 `.env` 都要**重启进程**；同名环境变量优先于 `config.yaml`。
 
 建库（若还没有）：
 
@@ -249,7 +263,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
 | 启动报 Redis 连接失败 / `RuntimeError: Redis not initialized` | `.env` 开了 `REDIS_BROKER_ENABLED=true` 但 Redis 没起：按 §6.2 启动（`docker start redis6`），或把该开关设回 `false` 并只用单进程启动 |
 | 取消后 run 还在继续跑 | 多进程启动但没开 Redis：取消信号跨不了进程（ADR-0009）。开 Redis 或改单进程 |
-| 建会话报 403「会话数已达上限」 | 每个账号默认最多 50 个会话（`MAX_THREADS_PER_USER`，ADR-0012；**含子线程**，一个会话派 3~5 个子任务就要吃掉 3~5 个名额）；删掉不用的会话即可，删会话会连带删它的子线程 |
+| 建会话报 403「会话数已达上限」 | 每个账号默认最多 50 个会话（`config.yaml` 的 `quota.max_threads_per_user`，ADR-0012；**含子线程**，一个会话派 3~5 个子任务就要吃掉 3~5 个名额）；删掉不用的会话即可，删会话会连带删它的子线程 |
 
 ---
 
@@ -424,8 +438,8 @@ graphs/okf/bio-lab/
 **有 `.xlsx` 才会装 xlsx 四件套**（`xlsx_info/query/search/profile` + CodeInterpreterMiddleware），
 纯文档空间自动不装。
 
-> 空间知识也可以放对象存储（`OKF_BACKEND=s3`，多副本读到同一份）：改完跑
-> `scripts/okf_push_s3.py`，各副本跑 `scripts/okf_pull_s3.py`。全部 env 与上传方式见
+> 空间知识也可以放对象存储（`config.yaml` 的 `okf.backend: s3`，多副本读到同一份）：改完跑
+> `scripts/okf_push_s3.py`，各副本跑 `scripts/okf_pull_s3.py`。全部配置与上传方式见
 > [docs/S3.md](./docs/S3.md)。
 
 ### 11.4 验证（不用重启）
@@ -450,7 +464,7 @@ d, p = load_agent_spec('bio-lab'); print(has_tables('bio-lab'), d[:40], len(p))"
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
 | 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `custom/outbox_dispatcher.py`（主管空闲时开一轮唤醒 run） |
 | 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
-| 一个账号最多几个会话（`MAX_THREADS_PER_USER`，默认 50，含子线程）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
+| 一个账号最多几个会话（`quota.max_threads_per_user`，默认 50，含子线程）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |
 | prompt 与描述 | `<space>/AGENT.md`（`graphs/space_agents.py`） |
 

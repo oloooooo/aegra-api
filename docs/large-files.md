@@ -18,7 +18,7 @@
 
 - `graphs/space_agents.py:96::has_tables` 用 `glob("*.xlsx")` 决定装不装 xlsx 四件套；
   `graphs/domain_agents.py:51` 依赖它。字节进 S3 / 会话私有后，它必须换成
-  ①空间前缀探测（`OKF_BACKEND=s3`）或 ②「本次 run 有 `session_scope` 就装」。
+  ①空间前缀探测（`okf.backend: s3`）或 ②「本次 run 有 `session_scope` 就装」。
 - `custom/frontend_api.py:158/164` 的 `_count_files` / `_list_files` 用 `rglob` 扫本地盘。
 
 ## 1. 分层
@@ -42,7 +42,7 @@ delete，一次覆盖字节与索引——比上一稿的独立 `index/` 前缀�
 tmp      tmp/{uuid4}/{name}
 blob     sessions/{h(identity)}/{thread_id}/{sha16}/{name}
 index    sessions/{h(identity)}/{thread_id}/idx/{name}.h{header}.v{BUILD}.sqlite
-cache    {XLSX_CACHE_DIR}/{h}-{thread}-{sha16}-{header}-v{BUILD}.sqlite
+cache    {xlsx.cache_dir}/{h}-{thread}-{sha16}-{header}-v{BUILD}.sqlite
 ```
 
 - `{sha16}` = sha256 前 16 hex，进路径 → 并发同名不同内容各写各的 key，**不会出现
@@ -82,12 +82,12 @@ CREATE TABLE session_object (
 | 序 | 动作 | 失败 |
 |---|---|---|
 | 1 | `require_auth` + thread 归属（FastAPI 依赖，handler 前已跑完） | 404 |
-| 2 | `Content-Length > MAX_BLOB_MB` | 413，一个字节都不读 |
+| 2 | `Content-Length > xlsx.max_blob_mb` | 413，一个字节都不读 |
 | 3 | 流式读 64 KB：计数 + `hashlib.update` | 超线 → 停止喂流 → 删 tmp → 413 |
 | 4 | 解析文件名前缀 → `space ∈ user_spaces`？ | 422 |
 
 **不用** `b"".join(chunks)`（现在 `custom/uploads.py:69` 就是，27.9 MB 常驻两份）。
-`MAX_UPLOAD_MB=10` 留给 md 不动；`MAX_BLOB_MB` 独立，缺省 10。
+`session_files.max_upload_mb=10` 留给 md 不动；`xlsx.max_blob_mb` 独立，缺省 10。
 
 **用 `upload_fileobj` 直写 S3 `tmp/` key**（不落本地文件）：请求流长度在读完前不可信，
 而 `put_object` 要求先给 `ContentLength`；`upload_fileobj` 按 8 MiB 自动分片、长度未知也能跑、
@@ -129,7 +129,7 @@ CREATE TABLE session_object (
 ### 3.4 明确不做
 
 秒传预检（只省一次上传、多一次 RTT、解决不了竞态）、前端直传/分片/断点续传（28 MB 用不上，
-入口已抽成 `put_stream()`，`MAX_BLOB_MB > 100` 再换）、内容去重（同名覆盖才是正确语义）。
+入口已抽成 `put_stream()`，`xlsx.max_blob_mb > 100` 再换）、内容去重（同名覆盖才是正确语义）。
 
 ## 4. 读取：字节从哪来
 
@@ -139,7 +139,7 @@ CREATE TABLE session_object (
 /uploads/<name>.xlsx
   ├─ 本机缓存命中（h+thread+sha16）→ 用它
   ├─ 查 PG session_object 拿 object_key → get_object → 原子落到缓存
-  └─ 若 path 以 /<space>/ 开头且 OKF_BACKEND=local → 存量本地盘（双读兼容）
+  └─ 若 path 以 /<space>/ 开头且 okf.backend: local → 存量本地盘（双读兼容）
 ```
 
 - 缓存写必须 **`.tmp` + `os.replace`**，命中后 `PRAGMA quick_check`。`immutable=1` 关掉了
@@ -165,9 +165,9 @@ xlsx 工具用 `scope` 算 S3 前缀（工具仍绕 backend 直读字节）。�
 ## 5. ingest → SQLite
 
 `index.py::ensure(xlsx, cache_dir, cache_key, header)`：本机缓存命中则直接用；否则先用
-`openpyxl read_only` 探 cell 数（**超 `MAX_CELLS` 直接拒，不建索引**），再 build 到临时文件、
+`openpyxl read_only` 探 cell 数（**超 `xlsx.max_cells` 直接拒，不建索引**），再 build 到临时文件、
 原子替换。键见 §2，并发 build 幂等无锁。每次调用开头顺带扫一遍过期缓存（每进程一次，
-`XLSX_CACHE_TTL_DAYS`）。
+`xlsx.cache_ttl_days`）。
 
 build：`read_excel(sheet_name=None, header=header)` 一次全读（41.7 s），每 sheet 一张
 `s{i}` 表 + `meta` / `columns` 两张小表；`journal_mode=OFF, synchronous=OFF` 只用于构建。
@@ -248,17 +248,33 @@ UNION ALL SELECT rowid, 1, CAST(c1 AS TEXT) FROM s0 WHERE c1 LIKE ? ESCAPE '\'
 不新增：`sqlite3`（stdlib）、`pandas`/`openpyxl`（已有）、`aioboto3`、`moto`。
 
 **boto3 client 必须懒加载**：`graphs/tools/xlsx/__init__.py` 在 import 期就被
-`graphs/tools/__init__.py:13`、`graphs/xlsx_tools.py` 拉起，模块级建 client 会让没配 `S3_*`
-的环境（本地 demo、单测）直接 import 失败。
+`graphs/tools/__init__.py:13`、`graphs/xlsx_tools.py` 拉起，模块级建 client 会让没配
+`s3.endpoint` 的环境（本地 demo、单测）直接 import 失败。
 
-```bash
-S3_ENDPOINT=http://127.0.0.1:8333
-S3_ACCESS_KEY=... S3_SECRET_KEY=... S3_BUCKET=aegra-blobs S3_REGION=us-east-1
-OKF_BACKEND=local|s3            # ADR-0016
-MAX_BLOB_MB=10  MAX_CELLS=2000000
-MAX_MD_FILES_PER_SESSION=10  MAX_XLSX_FILES_PER_SESSION=20
-MAX_THREADS_PER_USER=50  MAX_BLOB_BYTES_PER_USER=2147483648
-XLSX_CACHE_DIR=.cache/xlsx  XLSX_CACHE_TTL_DAYS=7
+```yaml
+# config.yaml
+s3:
+  endpoint: http://127.0.0.1:8333
+  bucket: aegra-blobs
+  region: us-east-1
+okf:
+  backend: local            # local | s3（ADR-0016）
+xlsx:
+  max_blob_mb: 10
+  max_cells: 2000000
+  max_md_files_per_session: 10
+  max_xlsx_files_per_session: 20
+  max_blob_mb_per_user: 2048
+  cache_dir: .cache/xlsx
+  cache_ttl_days: 7
+quota:
+  max_threads_per_user: 50
+```
+
+```ini
+# .env —— 只有凭证
+S3_ACCESS_KEY=...
+S3_SECRET_KEY=...
 SESSION_SCOPE_SECRET=<hmac key>
 ```
 
@@ -299,7 +315,7 @@ virtual-host，`bucket.127.0.0.1:8333` 解析不了。bucket 启动时 `head_buc
 
 - 首次访问建索引几十秒（预建索引需动 worker）。
 - 前端直传、断点续传、秒传预检：见 ADR-0015 §3.4。
-- 存量 `graphs/okf/<space>/*.xlsx` **仍是空间文件**（本地盘或 `OKF_BACKEND=s3` 的镜像），
+- 存量 `graphs/okf/<space>/*.xlsx` **仍是空间文件**（本地盘或 `okf.backend: s3` 的镜像），
   没有“把空间表迁成会话表”的脚本；两套来源共存是有意的。
 - 存储层配额不严格：PG 的 `sum(size_bytes)` 不含索引与被覆盖的旧 blob，物理用量可能到 2 倍。
 - `abort_stale_multiparts` 依赖 SeaweedFS 实现 `ListMultipartUploads`：已实测可用；

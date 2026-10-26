@@ -1,0 +1,75 @@
+# 本项目新增的配置（不属于 aegra 原生）。
+# 逐键说明：docs/configuration.md §3.2
+#
+# 什么放这里：非密钥的项目参数（配额、会话文件上限、对象存储地址、知识空间、发件箱）。
+# 什么不放这里：
+#   - 密钥 -> .env（JWT_SECRET / PASSWORD_PEPPER / SESSION_SCOPE_SECRET / S3_ACCESS_KEY /
+#     S3_SECRET_KEY / OPENAI_API_KEY）
+#   - aegra 原生配置 -> aegra.json、src/aegra_api/settings.py（.env 里的 HOST/PORT/POSTGRES_* 等）
+#
+# 优先级：同名环境变量 > 本文件 > 代码内默认值（custom/project_config.py）。
+# 改完要重启进程；值类型写错会直接启动失败。
+
+# --- 配额（custom/quota.py，ADR-0012）---
+quota:
+  # 一个账号最多同时拥有几个会话（主管线程 + 子线程，子线程计到所属主管上）。
+  # 超额时 POST /threads 返回 403；超管不受限。
+  max_threads_per_user: 200
+
+# --- 身份与 token（custom/services.py、custom/custom_auth.py）---
+auth:
+  # 内部服务身份名：子 agent 线程的属主，custom_auth 对它就免查库放行。
+  # custom/ 与 graphs/space_access.py 共用这一个值，改了旧子线程属主就对不上。
+  service_identity: subagent_service
+  # access token 有效期（秒）
+  access_token_ttl: 3600
+
+# --- 会话文件 md（custom/session_store.py，ADR-0013）---
+session_files:
+  max_upload_mb: 10             # 单文件上限（POST /custom/uploads）
+  max_files_per_session: 50     # 每会话文件数
+  upload_ttl_minutes: 4320      # 孤儿保留期（72h），语义是「最后读取后多久」
+
+# --- 会话大表 xlsx（custom/session_objects.py、graphs/tools/xlsx/，ADR-0015）---
+xlsx:
+  max_blob_mb: 10               # 单个 xlsx 的 HTTP 上限（与 md 的 max_upload_mb 分开）
+  max_cells: 2000000            # 结构性硬闸，超了第一次调工具就报错
+  max_xlsx_files_per_session: 20  # 同名覆盖不占名额
+  max_md_files_per_session: 10
+  max_blob_mb_per_user: 2048    # 每用户二进制总量（2GB）
+  cache_dir: .cache/xlsx        # 索引与字节的本机缓存，必须在 okf.dir 之外
+  cache_ttl_days: 7
+  query_budget_ms: 5000         # 单次 where 查询的 CPU 预算，超了 interrupt()
+
+# --- 对象存储（custom/blobs.py，ADR-0015/0016）---
+# 凭证走 .env（S3_ACCESS_KEY / S3_SECRET_KEY）。
+s3:
+  # 空 = 不启用对象存储：上传会话大表返回 503，其余功能不受影响。
+  # 本地 SeaweedFS：http://127.0.0.1:8333（起法见 docs/S3.md §2）
+  endpoint: ""
+  bucket: aegra-blobs
+  region: us-east-1
+
+# --- 空间知识（graphs/okf_mirror.py，ADR-0016）---
+okf:
+  backend: local                # local = 直接读 graphs/<dir>；s3 = 读本地镜像
+  dir: okf                      # 空间根目录名（相对 graphs/）
+  mirror_dir: .cache/okf        # s3 模式的镜像目录
+  mirror_ttl_seconds: 0         # 0 = 只拉一次；改内容后跑 scripts/okf_pull_s3.py
+
+# --- 图（graphs/deepagents_nodes.py）---
+agents:
+  # supervisor 给 AsyncSubAgent 用的服务地址；容器/换端口时改这里。
+  server_url: http://127.0.0.1:2026
+
+# --- 任务结果发件箱（custom/outbox_dispatcher.py，ADR-0010）---
+outbox:
+  poll_interval_seconds: 1.0
+  batch_size: 50
+  lease_seconds: 30
+  busy_backoff_seconds: 2
+  max_attempts: 10
+  startup_delay_seconds: 5
+  summary_timeout_seconds: 5
+  # 分发者读子线程用的自调地址；留空 = http://127.0.0.1:<PORT>（PORT 取 aegra 原生配置）
+  internal_url: ""

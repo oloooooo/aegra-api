@@ -250,7 +250,7 @@ Every key in detail, the startup-time error messages, the graph-key / `assistant
 
 ### Environment Variables (`.env`)
 
-Loaded once at import; real environment variables take precedence over the file, so the same `.env` works in Docker/K8s with a few keys overridden. Defaults for everything are in `src/aegra_api/settings.py`; a commented starting point is [`.env_example`](.env_example), and the full reference (server, PostgreSQL, pools, Redis/workers, cron, retention, logging, OpenTelemetry, metrics) is in [docs/configuration.md](docs/configuration.md).
+Loaded once at import; real environment variables take precedence over the file, so the same `.env` works in Docker/K8s with a few keys overridden. Configuration comes from three places: aegra's own settings in `src/aegra_api/settings.py` (env only), this project's **non-secret** knobs in [`config.yaml`](config.yaml) (read by `custom/project_config.py`, env override allowed), and **secrets** in `.env` (JWT_SECRET, PASSWORD_PEPPER, SESSION_SCOPE_SECRET, S3 credentials, OPENAI_API_KEY). A commented starting point is [`.env_example`](.env_example) (A native / B secrets / C third-party); the full reference (server, PostgreSQL, pools, Redis/workers, cron, retention, logging, OpenTelemetry, metrics) is in [docs/configuration.md](docs/configuration.md).
 
 ```bash
 # --- Server ---
@@ -419,7 +419,7 @@ libs/aegra-api/
 ## Documentation
 
 - **启动指南 / Getting started (中文)**: [README_zh.md](README_zh.md) — 环境依赖、`.env`、建表、初始化账号与知识空间、前后端启动、排错
-- Configuration reference (aegra.json, environment variables, logging): [docs/configuration.md](docs/configuration.md) (Chinese)
+- Configuration reference (aegra.json, config.yaml, environment variables, logging): [docs/configuration.md](docs/configuration.md) (Chinese)
 - Async subagent (ACP) design: [docs/design.md](docs/design.md)
 - Streaming reference (stream modes, sub-agent stream proxy): [docs/streaming.md](docs/streaming.md) (Chinese)
 - Frontend API contract (custom endpoints, SSE frames, interrupt/resume): [docs/frontend-api.md](docs/frontend-api.md) (Chinese)

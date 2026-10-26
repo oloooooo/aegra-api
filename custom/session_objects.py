@@ -12,33 +12,21 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from custom import project_config
 from custom.models import SessionObject, UserTables
 
-
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 1 else default
-
-
 # 每会话文件数：md 与 xlsx 分开计（文件名规则、载体、读法都不同）
-MAX_MD_FILES_PER_SESSION = _int_env("MAX_MD_FILES_PER_SESSION", 10)
-MAX_XLSX_FILES_PER_SESSION = _int_env("MAX_XLSX_FILES_PER_SESSION", 20)
+MAX_MD_FILES_PER_SESSION = int(project_config.get("xlsx.max_md_files_per_session"))
+MAX_XLSX_FILES_PER_SESSION = int(project_config.get("xlsx.max_xlsx_files_per_session"))
 # 每用户二进制总量：会话数 × 每会话文件数相乘会失控，必须有这道闸
-MAX_BYTES_PER_USER = _int_env("MAX_BLOB_MB_PER_USER", 2048) * 1024 * 1024
-# 单个 xlsx 的 HTTP 层上限（与 md 的 MAX_UPLOAD_MB 分开）
-MAX_BLOB_MB = _int_env("MAX_BLOB_MB", 10)
+MAX_BYTES_PER_USER = int(project_config.get("xlsx.max_blob_mb_per_user")) * 1024 * 1024
+# 单个 xlsx 的 HTTP 层上限（与 md 的 max_upload_mb 分开）
+MAX_BLOB_MB = int(project_config.get("xlsx.max_blob_mb"))
 MAX_BLOB_BYTES = MAX_BLOB_MB * 1024 * 1024
 
 _XLSX_SUFFIX = ".xlsx"

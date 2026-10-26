@@ -13,13 +13,14 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from langgraph.config import get_config
 
-# 必须与 custom/custom_auth.py 的 SERVICE_IDENTITY 保持同一 env 与缺省值
-SERVICE_IDENTITY = os.environ.get("SERVICE_IDENTITY", "subagent_service")
+from custom import project_config
+
+# 与 custom/custom_auth.py 同一个 config.yaml 键：两边总能对上
+SERVICE_IDENTITY = project_config.get("auth.service_identity")
 
 _MISSING: Any = object()
 

@@ -9,6 +9,7 @@ from sqlalchemy import select
 from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session_maker
+from custom import project_config
 from custom.quota import MAX_THREADS_PER_USER
 from custom.repositories import ThreadQuotaRepository, UserRepository, UserSpaceRepository
 
@@ -16,7 +17,8 @@ logger = structlog.getLogger(__name__)
 
 # 内部服务账号（async subagent 的静态 token）：跳过 DB 查询直接放行。
 # subagent 拿不到终端用户的 JWT，只能用构建期铸的静态 token，见 graphs/deepagents_nodes.py。
-SERVICE_IDENTITY = os.environ.get("SERVICE_IDENTITY", "subagent_service")
+# 与 custom/services.py 读同一个 config.yaml 键，不会各自跑偏。
+SERVICE_IDENTITY = project_config.get("auth.service_identity")
 
 auth = Auth()
 

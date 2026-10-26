@@ -2,11 +2,11 @@
 
 两种来源，读法不同但下游一致（都先落到本地文件，再建/复用 SQLite 索引）：
 
-- `/空间名/x.xlsx`：知识空间里的存量文件，走本地盘（`graphs/okf/<OKF_DIR>`），只读。
+- `/空间名/x.xlsx`：知识空间里的存量文件，走本地盘（`graphs/<okf.dir>`），只读。
 - `/uploads/x.xlsx`：会话文件，字节在对象存储；按 `(上传者, 主管 thread, sha16)` 命名
   落到本机缓存。缓存是**可丢弃**的：删了下次重下。
 
-`XLSX_CACHE_DIR` 不能落在 OKF 根下——根散文件对所有登录用户只读共享。
+`xlsx.cache_dir` 不能落在 OKF 根下——根散文件对所有登录用户只读共享。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from custom import blobs
+from custom import blobs, project_config
 from custom.session_store import identity_digest
 
 UPLOADS_PREFIX = "/uploads/"
@@ -33,7 +33,7 @@ class Remote:
 
 
 def cache_dir() -> Path:
-    return Path(os.getenv("XLSX_CACHE_DIR") or ".cache/xlsx").resolve()
+    return Path(project_config.get("xlsx.cache_dir")).resolve()
 
 def root() -> Path:
     """与 backend 同一根：虚拟路径 /a.xlsx 落到 <okf>/a.xlsx（s3 模式下是本地镜像）。"""

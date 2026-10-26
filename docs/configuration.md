@@ -1,15 +1,22 @@
 # aegra-api 配置
 
-aegra-api 的配置分两份文件，职责不重叠：
+aegra-api 的配置分三份文件，职责不重叠：
 
-| | `aegra.json` | `.env` / 环境变量 |
-|---|---|---|
-| **放什么** | 这个部署**对外提供什么**：图、自定义 HTTP app、store / checkpointer / auth 策略 | 它**怎么跑、连什么**：host / port、PostgreSQL、Redis、worker、cron、日志、OpenTelemetry、LLM key |
-| **谁读** | `src/aegra_api/config.py` | `src/aegra_api/settings.py`（`load_dotenv()` 在导入时执行，真实环境变量优先于文件） |
-| **格式** | JSON | 项目根 `.env`，`KEY=VALUE` |
-| **放密钥** | 不放 | 放 |
+| | `aegra.json` | `config.yaml` | `.env` / 环境变量 |
+|---|---|---|---|
+| **放什么** | 这个部署**对外提供什么**：图、自定义 HTTP app、store / checkpointer / auth 策略 | 本项目新增的**非密钥**参数：会话配额、文件上限、对象存储地址、OKF、发件箱 | aegra 原生运行参数（host / port、PostgreSQL、Redis、worker、cron、日志、OTEL）+ **密钥** + 第三方 SDK |
+| **谁读** | `src/aegra_api/config.py` | `custom/project_config.py` | `src/aegra_api/settings.py`（`load_dotenv()` 在导入时执行）+ 各模块 `os.environ` |
+| **格式** | JSON | YAML | 项目根 `.env`，`KEY=VALUE` |
+| **放密钥** | 不放 | **不放** | 放 |
+| **优先级** | — | 默认值 < 文件 < 同名环境变量 | 真实环境变量 > `.env` |
 
-判断标准：跟机器或部署绑定的值（凭据、主机名、端口、容量、开关）走环境变量；描述"这个服务托管什么"（托管哪些图、用哪个 auth 处理器、保留策略）走 `aegra.json`。
+判断标准：
+
+- 描述“这个服务托管什么”（托管哪些图、用哪个 auth 处理器、保留策略）→ `aegra.json`
+- 本项目自己加的调参（配额、上限、S3 地址、OKF、发件箱）→ `config.yaml`
+- 跟机器/部署绑定的 aegra 原生参数、以及任何凭据 → `.env`
+
+三者的逐键说明见 [§3](#3-配置来源)。
 
 ---
 
@@ -67,7 +74,7 @@ AEGRA_CONFIG=aegra_example.json uv run python src/aegra_api/main.py
 {
   "graphs": {
     "researcher": "./graphs/researcher.py:graph",
-    "supervisor": "./graphs/supervisor.py:graph"
+    "supervisor": "./graphs/deepagents_nodes.py:graph"
   }
 }
 ```
@@ -201,11 +208,27 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 
 ---
 
-## 3. 环境变量
+## 3. 配置来源
 
-全部由 `src/aegra_api/settings.py`（pydantic-settings）定义，未声明的变量被静默忽略。`.env` 在导入时加载一次，**真实环境变量优先**，所以同一份 `.env` 在 Docker/K8s 里可以只覆盖几个键。
+三份文件、三套职责，互不覆盖：
 
-### 服务与运行
+| 来源 | 放什么 | 谁读 | 优先级 |
+|---|---|---|---|
+| `aegra.json` | aegra 原生：托管哪些图、自定义 HTTP app、store / checkpointer / auth（见 §2） | `src/aegra_api/config.py` | — |
+| `config.yaml`（仓库根） | 本项目新增的**非密钥**参数：配额、会话文件上限、对象存储地址、知识空间、发件箱 | `custom/project_config.py` | 代码默认值 < 文件 < 同名环境变量 |
+| `.env` / 环境变量 | aegra 原生 env（§3.1）、**密钥**（§3.3）、第三方 SDK（§3.4） | `settings.py` 与各模块 `os.environ` | 环境变量总优先 |
+
+一个键该放哪：
+
+- 影响 aegra 本身怎么跑（host / port / PG / Redis / 日志 / OTEL）→ `.env`（§3.1，上游定义）
+- 本项目加的调参（配额、上限、S3 地址、OKF、发件箱）→ `config.yaml`（§3.2）
+- 凭据（JWT 密钥、密码 pepper、S3 凭证、API key）→ `.env`（§3.3）
+
+### 3.1 aegra 原生环境变量（`src/aegra_api/settings.py`）
+
+升级 aegra 时这段原样跟着上游走，不要往里塞业务配置。未声明的键被静默忽略；`.env` 在导入时加载一次，**真实环境变量优先**，所以同一份 `.env` 在 Docker/K8s 里可以只覆盖几个键。
+
+#### 服务与运行
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -219,7 +242,7 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `KEEPALIVE_INTERVAL_SECS` | `5` | join/wait 端点的心跳间隔 |
 | `FF_V2_EVENT_STREAMING` | `true` | 新版事件流开关 |
 
-### PostgreSQL 与连接池
+#### PostgreSQL 与连接池
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -229,7 +252,7 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `SQLALCHEMY_POOL_SIZE` / `SQLALCHEMY_MAX_OVERFLOW` | `10` / `20` | API 侧连接池 |
 | `LANGGRAPH_MIN_POOL_SIZE` / `LANGGRAPH_MAX_POOL_SIZE` | `5` / `20` | 图执行侧连接池 |
 
-### Redis 与 worker
+#### Redis 与 worker
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -242,7 +265,7 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `STUCK_PENDING_THRESHOLD_SECONDS` / `POSTGRES_POLL_INTERVAL_SECONDS` | `120` / `5` | 卡住判定与回退轮询 |
 | `WORKER_QUEUE_KEY` / `WORKER_DRAIN_TIMEOUT` | `aegra:jobs` / `30` | 队列键名与优雅停机时长 |
 
-### Cron
+#### Cron
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -251,72 +274,121 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `CRON_MAX_PER_USER` / `CRON_TICK_BATCH_SIZE` / `CRON_MAX_PAYLOAD_BYTES` | `100` / `100` / `65536` | 配额与批量 |
 | `CRON_ALLOW_SECONDS_SCHEDULE` | `false` | 是否允许秒级调度 |
 
-### 任务结果发件箱（`custom/outbox_dispatcher.py`）
-
-进程内后台循环，每个进程一个，靠 `FOR UPDATE SKIP LOCKED` + 租约分工。
-**不依赖 Redis**（Redis 只用于 `executor.submit`）；不配置也能跑。语义见
-[adr/0010](./adr/0010-task-delivery-idempotency.md)。
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `OUTBOX_POLL_INTERVAL_SECONDS` | `1.0` | 轮询间隔；空表时每 tick 一次索引扫描 |
-| `OUTBOX_BATCH_SIZE` | `50` | 一次 tick 最多领多少行 |
-| `OUTBOX_LEASE_SECONDS` | `30` | 领取租约；进程死了过期后别人接手 |
-| `OUTBOX_BUSY_BACKOFF_SECONDS` | `2` | 父线程有活跃 run 时的重看间隔（不计失败次数） |
-| `OUTBOX_MAX_ATTEMPTS` | `10` | 建唤醒 run 连续失败多少次后标 `failed`，交由父 run 的 hook 兜底 |
-| `OUTBOX_STARTUP_DELAY_SECONDS` | `5` | 启动后首次 tick 的延迟（等 DB/LangGraph 初始化完） |
-| `OUTBOX_SUMMARY_TIMEOUT_SECONDS` | `5` | 现查子线程摘要的超时；超时退到发件箱里的快照 |
-| `AEGRA_INTERNAL_URL` | `http://127.0.0.1:{PORT}` | 分发者读子线程用的自调地址；用 IPv4 回环（`localhost` 在 Windows 下会先解成 `::1`） |
-
-### 保留策略
+#### 保留策略
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AEGRA_THREAD_TTL` | 无 | 覆盖 `checkpointer.ttl`；可写分钟数，也可写 `{"strategy":"keep_latest","default_ttl":...}`。别名 `LANGGRAPH_THREAD_TTL` |
 | `AEGRA_CHECKPOINT_DURABILITY` | 无 | 覆盖 `checkpointer.durability` |
 
-### 业务配额（本项目自定义，在 `custom/quota.py`）
+### 3.2 本项目新增：`config.yaml`（`custom/project_config.py`）
+
+非密钥的项目参数全在这一个文件里。密钥不要往里写（§3.3）。
+
+- **位置**：仓库根 `config.yaml`（`custom/project_config.py` 按自身位置找，与 CWD 无关）。
+- **生效时机**：import 时读一次 → **改完要重启进程**（与 `aegra.json` 一致）。
+- **优先级**：同名环境变量 > 文件 > 代码内默认值。留口子给容器 `-e` 和单测 `monkeypatch.setenv`。
+- **写错不将就**：YAML 语法错、键拼错、值类型错（该写数字写成了文字）都会在启动时抛 `ValueError`，不会静默退回默认值。
+- **没写 = 用默认值**：文件里可以只写要改的键；整份删掉也能跑（全用默认）。
+
+下表「覆盖变量」列的用途只有两个：容器里临时改一个键、单测里打桩。日常改配置改 YAML。
+
+#### 配额（`custom/quota.py`）
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `quota.max_threads_per_user` | `50` | `MAX_THREADS_PER_USER` | 一个账号最多同时拥有几个会话（主管线程 + 子线程；子线程计到所属主管上）。超额时 `POST /threads` 返回 403。超管不受限。见 [adr/0012](./adr/0012-thread-quota-replaces-task-limit.md) |
+
+#### 身份与 token（`custom/services.py`、`custom/custom_auth.py`、`graphs/space_access.py`）
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `auth.service_identity` | `subagent_service` | `SERVICE_IDENTITY` | 服务身份名：子 agent 线程的属主、`custom_auth` 免查库放行、`delivery_api` 跨用户放行都按它判断。三个模块读同一个键，不会各自跑偏 |
+| `auth.access_token_ttl` | `3600` | `ACCESS_TOKEN_TTL` | access token 有效期（秒） |
+
+#### 会话文件 md（`custom/session_store.py`）
+
+md 进 LangGraph Store，按（上传者, 主管 thread）隔离。
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `session_files.max_upload_mb` | `10` | `MAX_UPLOAD_MB` | md 单文件上限（`POST /custom/uploads`） |
+| `session_files.max_files_per_session` | `50` | `MAX_FILES_PER_SESSION` | md 每会话文件数 |
+| `session_files.upload_ttl_minutes` | `4320`（72h） | `UPLOAD_TTL_MINUTES` | md 的孤儿保留期，语义是「最后读取后多久」 |
+
+#### 会话大表 xlsx（`custom/session_objects.py`、`graphs/tools/xlsx/`）
+
+xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 [large-files.md](./large-files.md)。
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `xlsx.max_blob_mb` | `10` | `MAX_BLOB_MB` | xlsx 单文件上限（`POST /custom/uploads/tables`） |
+| `xlsx.max_cells` | `2000000` | `MAX_CELLS` | 表结构硬闸；超了第一次调工具就报错，不静默截断 |
+| `xlsx.max_xlsx_files_per_session` | `20` | `MAX_XLSX_FILES_PER_SESSION` | 每会话 xlsx 个数（同名覆盖不占名额） |
+| `xlsx.max_md_files_per_session` | `10` | `MAX_MD_FILES_PER_SESSION` | 每会话 md 个数（与上面那个分开计） |
+| `xlsx.max_blob_mb_per_user` | `2048` | `MAX_BLOB_MB_PER_USER` | 每用户二进制总量 |
+| `xlsx.cache_dir` | `.cache/xlsx` | `XLSX_CACHE_DIR` | 索引与字节的本机缓存（必须在 OKF 根之外） |
+| `xlsx.cache_ttl_days` | `7` | `XLSX_CACHE_TTL_DAYS` | 本机缓存保留天数 |
+| `xlsx.query_budget_ms` | `5000` | `XLSX_QUERY_BUDGET_MS` | 单次 `where` 查询的 CPU 预算，超了 `interrupt()` |
+
+#### 对象存储（`custom/blobs.py`）
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `s3.endpoint` | 空 | `S3_ENDPOINT` | 空 = 对象存储未启用；xlsx 上传会返回 503，其余功能不受影响 |
+| `s3.bucket` | `aegra-blobs` | `S3_BUCKET` | 桶名，启动时自动创建（幂等） |
+| `s3.region` | `us-east-1` | `S3_REGION` | 任意值（SeaweedFS 不校验） |
+
+#### 空间知识 OKF（`graphs/okf_mirror.py`、`graphs/space_agents.py`）
+
+见 [adr/0016](./adr/0016-spaces-in-object-storage.md)、[S3.md](./S3.md)。
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `okf.backend` | `local` | `OKF_BACKEND` | `local` 直接读 `graphs/<okf.dir>`；`s3` 读本地镜像 |
+| `okf.dir` | `okf` | `OKF_DIR` | 空间根目录名（相对 `graphs/`） |
+| `okf.mirror_dir` | `.cache/okf` | `OKF_MIRROR_DIR` | `s3` 模式的镜像目录 |
+| `okf.mirror_ttl_seconds` | `0` | `OKF_MIRROR_TTL_SECONDS` | 镜像过期重拉的间隔；`0` = 只拉一次（改内容后手动跑 `scripts/okf_pull_s3.py`） |
+
+#### 图（`graphs/deepagents_nodes.py`）
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `agents.server_url` | `http://127.0.0.1:2026` | `AEGRA_SERVER_URL` | supervisor 给 `AsyncSubAgent` 用的服务地址；容器里要填服务自身可达地址（如 `http://aegra-api:2026`） |
+
+#### 任务结果发件箱（`custom/outbox_dispatcher.py`）
+
+进程内后台循环，每个进程一个，靠 `FOR UPDATE SKIP LOCKED` + 租约分工。
+**不依赖 Redis**（Redis 只用于 `executor.submit`）；不配置也能跑。语义见
+[adr/0010](./adr/0010-task-delivery-idempotency.md)。
+
+| YAML 键 | 默认 | 覆盖变量 | 说明 |
+|---|---|---|---|
+| `outbox.poll_interval_seconds` | `1.0` | `OUTBOX_POLL_INTERVAL_SECONDS` | 轮询间隔；空表时每 tick 一次索引扫描 |
+| `outbox.batch_size` | `50` | `OUTBOX_BATCH_SIZE` | 一次 tick 最多领多少行 |
+| `outbox.lease_seconds` | `30` | `OUTBOX_LEASE_SECONDS` | 领取租约；进程死了过期后别人接手 |
+| `outbox.busy_backoff_seconds` | `2` | `OUTBOX_BUSY_BACKOFF_SECONDS` | 父线程有活跃 run 时的重看间隔（不计失败次数） |
+| `outbox.max_attempts` | `10` | `OUTBOX_MAX_ATTEMPTS` | 建唤醒 run 连续失败多少次后标 `failed`，交由父 run 的 hook 兜底 |
+| `outbox.startup_delay_seconds` | `5` | `OUTBOX_STARTUP_DELAY_SECONDS` | 启动后首次 tick 的延迟（等 DB/LangGraph 初始化完） |
+| `outbox.summary_timeout_seconds` | `5` | `OUTBOX_SUMMARY_TIMEOUT_SECONDS` | 现查子线程摘要的超时；超时退到发件箱里的快照 |
+| `outbox.internal_url` | 空 | `AEGRA_INTERNAL_URL` | 分发者读子线程用的自调地址；空 = `http://127.0.0.1:{PORT}`（IPv4 回环，`localhost` 在 Windows 下会先解成 `::1`） |
+
+### 3.3 密钥：只走 `.env`
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MAX_THREADS_PER_USER` | `50` | 一个账号最多同时拥有几个会话（主管线程 + 子线程；子线程计到所属主管上）。超额时 `POST /threads` 返回 403。超管不受限。见 [adr/0012](./adr/0012-thread-quota-replaces-task-limit.md) |
+| `JWT_SECRET` | **无（必填）** | HS256 签/验 access token。缺失 = 启动即 `KeyError: 'JWT_SECRET'` |
+| `PASSWORD_PEPPER` | **无（必填）** | 密码哈希前拼接的全局密文。改了这个值，已注册账号全部登不上（旧哈希不再匹配） |
+| `SESSION_SCOPE_SECRET` | `dev-session-scope` | 签发/校验子 agent 读会话文件的 `session_scope` 的 HMAC 密钥，**生产必须改** |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `dev` / `dev` | 对象存储凭证（SeaweedFS 未配 IAM 时任意值） |
 
-### 会话文件与大表（`custom/session_store.py`、`custom/session_objects.py`、`custom/blobs.py`）
+### 3.4 第三方 SDK 与模型
 
-md 会话文件进 LangGraph Store，xlsx 的字节进对象存储；完整操作手册见 [S3.md](./S3.md)。
-
-| 变量 | 默认 | 说明 |
+| 变量 | 默认 | 谁读 |
 |---|---|---|
-| `MAX_UPLOAD_MB` | `10` | **md** 单文件上限（`POST /custom/uploads`） |
-| `MAX_FILES_PER_SESSION` | `50` | **md** 每会话文件数 |
-| `UPLOAD_TTL_MINUTES` | `4320`（72h） | md 的孤儿保留期，语义是「最后读取后多久」 |
-| `MAX_BLOB_MB` | `10` | **xlsx** 单文件上限（`POST /custom/uploads/tables`） |
-| `MAX_CELLS` | `2000000` | 表结构硬闸；超了第一次调工具就报错，不静默截断 |
-| `MAX_XLSX_FILES_PER_SESSION` | `20` | 每会话 xlsx 个数（同名覆盖不占名额） |
-| `MAX_MD_FILES_PER_SESSION` | `10` | 每会话 md 个数（与上面那个分开计） |
-| `MAX_BLOB_MB_PER_USER` | `2048` | 每用户二进制总量 |
-| `SESSION_SCOPE_SECRET` | `dev-session-scope` | 子 agent 读会话文件的 HMAC 密钥，**生产必须改** |
-| `XLSX_CACHE_DIR` / `XLSX_CACHE_TTL_DAYS` | `.cache/xlsx` / `7` | 表索引与字节的本机缓存（必须在 OKF 根之外） |
-| `XLSX_QUERY_BUDGET_MS` | `5000` | 单次 `where` 查询的 CPU 预算，超了 `interrupt()` |
-
-### 对象存储与空间模式（ADR-0015 / ADR-0016）
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `S3_ENDPOINT` | 空 | 空 = 对象存储未启用；xlsx 上传会返回 503 |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `dev` / `dev` | 凭证（SeaweedFS 未配 IAM 时任意值） |
-| `S3_BUCKET` | `aegra-blobs` | 桶名，启动时自动创建（幂等） |
-| `S3_REGION` | `us-east-1` | 任意值 |
-| `OKF_BACKEND` | `local` | `local` 读 `graphs/okf`；`s3` 读本地镜像 |
-| `OKF_MIRROR_DIR` | `.cache/okf` | `s3` 模式的镜像目录 |
-| `OKF_MIRROR_TTL_SECONDS` | `0` | 镜像过期重拉的间隔；`0` = 只拉一次 |
-| `OKF_DIR` | `okf` | 空间根目录名（相对 `graphs/`） |
-
-> 这些变量**不在 `settings.py` 里**（由各自模块直接读 `os.environ`），所以不会出现在自动生成的配置表里。
-
-### LLM
-
-`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` 由 langchain-openai 从环境读取（`settings.py` 把 `.env` 灌进 `os.environ`）。注意**模型名不会自动生效**，图代码必须自己取（见 `.env_example` 里的注释）。
+| `OPENAI_API_KEY` | 空 | `graphs/llms.py` 显式传给 `ChatOpenAI`（langchain-openai 也能自己从 env 取） |
+| `OPENAI_BASE_URL` | 空 | 同上；OpenAI 兼容端点（DeepSeek / Moonshot / vLLM …）才需要 |
+| `OPENAI_MODEL` | 空 | 同上，**没有 SDK 约定**：图代码自己取。留空时 `ChatOpenAI(model="")` 会在首次调用时报错 |
 
 ---
 
@@ -443,6 +515,11 @@ docker run --log-driver json-file --log-opt max-size=10m --log-opt max-file=5 ..
 | `Graph 'x' not found for assistant` | 库里 assistant 引用的 graph key 已从 `aegra.json` 删掉 | 把 key 加回配置（重启生效），或改客户端指向现存的图 |
 | `Graph 'x' not found in aegra.json. Available: [...]` | 在建 assistant 时传了配置里没有的 `graph_id` | 从提示的可用列表里选 |
 | 改了 `aegra.json` 没反应 | 配置只在启动时读一次 | 重启进程 |
+| 改了 `config.yaml` 没反应 | ① 只在 import 时读一次；② 同名环境变量优先（旧 `.env` 里还留着 `MAX_*` 那一行） | 重启；`env | grep -E 'MAX_|OKF_|S3_|OUTBOX_'` 看有没有变量盖掉它 |
+| 启动即 `ValueError: ... 不是合法 YAML` | `config.yaml` 缩进/冒号写错 | 用 YAML 校验器过一遍（缩进必须空格，不能 Tab） |
+| 启动即 `ValueError: 配置 xlsx.max_cells 需要数字` | `config.yaml` 里值写成了非数字（比如 `2m`） | 写成纯数字 |
+| `config.yaml` 里加的键不生效 | 键名拼错，或放错了段（`_SPEC` 里没这个键） | 对照 §3.2 的表；单测 `tests/unit/test_project_config.py` 会把拼错的键抳出来 |
+| 启动即 `KeyError: 'JWT_SECRET'` / `'PASSWORD_PEPPER'` | `.env` 缺密钥（这两个**不**在 `config.yaml`） | 在 `.env` 补上，见 §3.3 |
 | `Custom apps must be FastAPI applications. ...` | `http.app` 导出的不是 FastAPI 实例 | 用 `FastAPI()` 建 app |
 | `User has no 'org_id' required for 'orgs'-scoped store access` | 用了 `store.scopes` 但身份里没有该属性 | 在 auth 处理器里补该属性，或去掉这条 scope |
 | `must be 'sync', 'async' or 'exit', got ...` | `checkpointer.durability` 取值非法 | 改成三者之一 |
@@ -481,7 +558,18 @@ docker run --log-driver json-file --log-opt max-size=10m --log-opt max-file=5 ..
 }
 ```
 
-`.env`：见仓库根目录的 [`.env_example`](../.env_example)（数据库、日志、Redis/worker、cron、可观测性都有注释版）。
+`config.yaml`：见仓库根的 [`config.yaml`](../config.yaml)（本项目新增的非密钥参数，带注释，默认值就是代码内默认）。只写要改的键即可。
+
+```yaml
+quota:
+  max_threads_per_user: 50
+s3:
+  endpoint: ""                # 空 = 对象存储不启用
+okf:
+  backend: local
+```
+
+`.env`：见仓库根目录的 [`.env_example`](../.env_example)（aegra 原生参数、密钥、第三方 SDK）。**密钥只放这里**。
 
 相关文档：
 
