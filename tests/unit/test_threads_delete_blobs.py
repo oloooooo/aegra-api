@@ -2,7 +2,9 @@
 
 import pytest
 
-from custom import blobs, session_objects, threads_delete
+from shared.session import blobs
+from custom.service import session_files as session_objects
+from custom.middleware import threads_delete
 
 
 class FakeSession:

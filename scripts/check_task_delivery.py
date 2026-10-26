@@ -4,7 +4,7 @@
 
 架构（ADR-0010）：
     子 run 终态 → ``finalize_run`` 写发件箱行（pending）
-                ├─ 父线程空闲 → ``custom/outbox_dispatcher.py`` 开一轮唤醒 run
+                ├─ 父线程空闲 → ``custom/service/outbox_dispatcher.py`` 开一轮唤醒 run
                 └─ 父线程在跑 → 该 run 的 before_agent 把结果写进 state 并 ack
 
 覆盖：
@@ -12,7 +12,7 @@
    **刻意不实现 after_agent**——run 结束时写的模型已没机会转述，交给分发者开唤醒 run；
 2. 判重键是 `(task_id, run_id)`，且 check 过的任务（delivered_run_id + 发件箱行 ack）
    不再重复投、分发者也不再开唤醒 run；
-3. 投递文本统一由 `custom/outbox.py` 生成（分发者与 guard 必须逐字一致）；
+3. 投递文本统一由 `shared/outbox.py` 生成（分发者与 guard 必须逐字一致）；
 4. 同批多个任务各自独立 ack —— 旧版 8s 让路窗口挡住的地方。
 """
 
@@ -25,9 +25,9 @@ import sys
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from custom.outbox import completion_text, is_long_result, result_body
-from custom.outbox import task_status_of_run as _status_of_run
-from graphs.async_task_guard import AsyncTaskGuard, _completion_text
+from shared.outbox import completion_text, is_long_result, result_body
+from shared.outbox import task_status_of_run as _status_of_run
+from graphs.middleware.async_task_guard import AsyncTaskGuard, _completion_text
 
 FAILS: list[str] = []
 

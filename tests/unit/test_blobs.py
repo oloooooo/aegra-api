@@ -1,15 +1,16 @@
-"""`custom/blobs.py` 的纯逻辑测试：不碰真 S3，用假 client 记调用。
+"""`shared/session/blobs.py` 的纯逻辑测试：不碰真 S3，用假 client 记调用。
 
 重点锁三件事：key 命名（删会话靠前缀）、sha256/字节数、**超限时必须 abort 分片**
 （`upload_fileobj` 那条路做不到，只能自己管）。
 """
 
 import hashlib
+from typing import Any
 
 import pytest
 
-from custom import blobs
-from custom.session_store import session_namespace
+from shared.session import blobs
+from shared.session.store import session_namespace
 
 
 class FakeS3:
@@ -19,6 +20,10 @@ class FakeS3:
         self.aborted: list[str] = []
         self._mp = 0
         self.missing = False
+        # reap_tmp / abort_stale_multiparts 用到的两个视图
+        self.mtimes: dict[str, Any] = {}
+        self.deleted: list[str] = []
+        self.uploads: list[dict] = []
 
     def put_object(self, **kw):
         self.calls.append(("put_object", kw))
@@ -50,6 +55,28 @@ class FakeS3:
                 "HeadObject",
             )
         return {"ContentLength": len(self.objects[kw["Key"]])}
+
+    def list_objects_v2(self, **kw):
+        self.calls.append(("list_objects_v2", kw))
+        prefix = kw.get("Prefix", "")
+        return {
+            "Contents": [
+                {"Key": k, "Size": len(v), "LastModified": self.mtimes.get(k)}
+                for k, v in self.objects.items()
+                if k.startswith(prefix)
+            ],
+            "IsTruncated": False,
+        }
+
+    def delete_objects(self, **kw):
+        self.calls.append(("delete_objects", kw))
+        for o in kw["Delete"]["Objects"]:
+            self.deleted.append(o["Key"])
+            self.objects.pop(o["Key"], None)
+
+    def list_multipart_uploads(self, **kw):
+        self.calls.append(("list_multipart_uploads", kw))
+        return {"Uploads": list(self.uploads), "IsTruncated": False}
 
     def names(self):
         return [c[0] for c in self.calls]
@@ -178,3 +205,50 @@ def test_configured_follows_endpoint(monkeypatch):
     assert blobs.configured() is True
     monkeypatch.setenv("S3_ENDPOINT", "")
     assert blobs.configured() is False
+
+
+# ---------- 上传垃圾清理（scripts/reap_multipart.py） ----------
+
+
+def _ago(hours: float):
+    from datetime import UTC, datetime, timedelta
+
+    return datetime.now(UTC) - timedelta(hours=hours)
+
+
+def test_reap_tmp_deletes_only_stale_objects(s3):
+    """只清超时的 tmp/：正在上传的（新）不能动，正式 key 更不能碰。"""
+    s3.objects["tmp/old-a/x.xlsx"] = b"stale"
+    s3.objects["tmp/new-b/y.xlsx"] = b"fresh"
+    s3.objects["sessions/h/t1/abc/x.xlsx"] = b"real"
+    s3.mtimes = {
+        "tmp/old-a/x.xlsx": _ago(48),
+        "tmp/new-b/y.xlsx": _ago(1),
+        "sessions/h/t1/abc/x.xlsx": _ago(1000),
+    }
+
+    assert blobs.reap_tmp(24 * 3600) == 1
+    assert s3.deleted == ["tmp/old-a/x.xlsx"]
+    assert "tmp/new-b/y.xlsx" in s3.objects and "sessions/h/t1/abc/x.xlsx" in s3.objects
+
+
+def test_reap_tmp_skips_objects_without_timestamp(s3):
+    """拿不到 LastModified 就不删：宁可留垃圾也不误删。"""
+    s3.objects["tmp/no-ts/x.xlsx"] = b"?"
+    assert blobs.reap_tmp(0) == 0
+    assert s3.deleted == []
+
+
+def test_reap_tmp_dry_run_deletes_nothing(s3):
+    s3.objects["tmp/old/x.xlsx"] = b"stale"
+    s3.mtimes = {"tmp/old/x.xlsx": _ago(48)}
+    assert blobs.reap_tmp(24 * 3600, dry_run=True) == 1
+    assert s3.deleted == [] and "tmp/old/x.xlsx" in s3.objects
+
+
+def test_abort_stale_multiparts_dry_run_counts_without_aborting(s3):
+    s3.uploads = [{"Key": "a.xlsx", "UploadId": "mp-old", "Initiated": _ago(30)}]
+    assert blobs.abort_stale_multiparts(24 * 3600, dry_run=True) == 1
+    assert s3.aborted == []
+    assert blobs.abort_stale_multiparts(24 * 3600) == 1
+    assert s3.aborted == ["mp-old"]

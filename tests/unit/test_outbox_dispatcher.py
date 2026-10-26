@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from custom import outbox_dispatcher as disp
+from custom.service import outbox_dispatcher as disp
 
 PARENT = "parent-thread"
 

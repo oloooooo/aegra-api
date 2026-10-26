@@ -28,9 +28,9 @@ from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.models.enums import RunStatus  # noqa: F401 — 先加载 models，避免 run_status 的循环导入
 from aegra_api.services.run_status import finalize_run
-from custom.models import AsyncTaskOutbox
-from custom.services import service_token
-from graphs.async_task_guard import AsyncTaskGuard
+from custom.db.models import AsyncTaskOutbox
+from shared.token import service_token
+from graphs.middleware.async_task_guard import AsyncTaskGuard
 
 BASE = "http://127.0.0.1:2026"
 SUPERVISOR = "supervisor"

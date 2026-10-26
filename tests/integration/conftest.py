@@ -42,7 +42,7 @@ async def _stub_session_cm() -> AsyncIterator[_StubSession]:
 
 @pytest.fixture(autouse=True)
 def stub_session_maker(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """给 `custom/custom_auth.py` 的 `@auth.on` 处理器塞一个假 session maker。
+    """给 `custom/middleware/auth.py` 的 `@auth.on` 处理器塞一个假 session maker。
 
     那几条处理器（会话配额、级联删子线程）**直接用 `get_session_maker()`**，不走
     FastAPI 的 `get_session` 依赖，所以用例里 `override_get_session_dep` 覆盖不到
@@ -50,8 +50,8 @@ def stub_session_maker(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     `RuntimeError: Database not initialized`（此前 integration 的 41 个用例全栽在这）。
 
     补丁打在 `aegra_api.core.orm.async_session_maker` 这个**模块级缓存**上，而不是
-    `custom.custom_auth.get_session_maker`：自定义 app/auth 是 `importlib` 按
-    `custom_app_module` 之类的合成名加载的，`custom.custom_auth` 与它可能是两个模块
+    `custom.middleware.auth.get_session_maker`：自定义 app/auth 是 `importlib` 按
+    `custom_app_module` 之类的合成名加载的，`custom.middleware.auth` 与它可能是两个模块
     实例，patch 前者对后者无效。缓存只有一个，`get_session_maker()` 谁调都先看它。
 
     只回答处理器真正要的两类查询：配额计数（恒 0）和线程属主（恒 None）。业务断言仍

@@ -4,7 +4,7 @@
 跑会卡住整个进程）。这里锁住两件事：计数口径不变、文件列表的字段/顺序不变。
 """
 
-from custom.frontend_api import _count_files, _list_files
+from custom.api.spaces import _count_files, _list_files
 
 
 def test_count_files_counts_nested_files_only(tmp_path):

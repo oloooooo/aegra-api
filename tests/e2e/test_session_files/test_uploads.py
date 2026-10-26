@@ -51,7 +51,7 @@ async def _create_thread(http: httpx.AsyncClient, token: str) -> str:
 
 
 def _namespace(identity: str, thread_id: str) -> str:
-    """与 custom/session_store.py 同一套推导：点点拼成 store 的 prefix 列。"""
+    """与 shared/session/store.py 同一套推导：点点拼成 store 的 prefix 列。"""
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return f"uploads.{digest}.{thread_id}"
 
@@ -213,8 +213,8 @@ async def test_upload_is_readable_through_supervisor_backend(http: httpx.AsyncCl
     from deepagents.backends import CompositeBackend, StoreBackend
     from langgraph.store.postgres import PostgresStore
 
-    from custom.session_store import session_namespace
-    from graphs.deepagents_nodes import supervisor_backend
+    from shared.session.store import session_namespace
+    from graphs.supervisor import supervisor_backend
 
     who = await _register_and_login(http)
     thread_id = await _create_thread(http, who["token"])

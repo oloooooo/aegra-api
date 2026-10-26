@@ -19,7 +19,7 @@ from typing import Any
 
 import pandas as pd
 
-from custom import project_config
+from shared import config
 
 # 改 build 产物结构就 +1：旧索引会因 key 变化而自然失效（否则永远读到旧结构）
 BUILD = 1
@@ -27,11 +27,11 @@ BUILD = 1
 _MAX_ROWS = 200
 _MAX_HITS = 100
 _MAX_VALUE_LEN = 80
-_QUERY_BUDGET_MS = int(project_config.get("xlsx.query_budget_ms"))
+_QUERY_BUDGET_MS = int(config.get("xlsx.query_budget_ms"))
 # 结构性硬闸：不依赖字节大小（同样 10 MB，可以是 30 万 cell，也可以是 500 万）
-_MAX_CELLS = int(project_config.get("xlsx.max_cells"))
+_MAX_CELLS = int(config.get("xlsx.max_cells"))
 # 本机缓存（索引与字节）的保留天数
-_CACHE_TTL_DAYS = int(project_config.get("xlsx.cache_ttl_days"))
+_CACHE_TTL_DAYS = int(config.get("xlsx.cache_ttl_days"))
 
 _ALLOWED_ACTIONS = {
     sqlite3.SQLITE_SELECT,

@@ -4,8 +4,8 @@
 以及**子 agent 不能借它拿到用户全部 space**（那是 `allowed_spaces` 的独立判定）。
 """
 
-from custom.session_store import session_namespace
-from graphs import session_scope as ss
+from shared.session.store import session_namespace
+from graphs.access import session_scope as ss
 
 
 def test_mint_verify_roundtrip():
@@ -76,7 +76,7 @@ def test_uploads_namespace_matches_store_namespace():
     assert ns != expected  # 跑外没有 config → 死命名空间
     assert ns[1] == "_none"
 
-    import graphs.session_scope as mod
+    import graphs.access.session_scope as mod
 
     original = mod.current_config
     mod.current_config = lambda: {"configurable": {"session_scope": scope}}

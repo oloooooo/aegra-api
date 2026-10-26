@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from aegra_api.models.auth import User
-from custom.delivery_api import claim_delivery, release_delivery
+from custom.api.delivery import claim_delivery, release_delivery
 
 PARENT = "parent-thread"
 

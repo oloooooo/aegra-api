@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1] / "graphs" / "okf"
+ROOT = Path(__file__).resolve().parents[1] / "knowledge"
 
 
 def gen_hybrid_bonding() -> None:
@@ -98,6 +98,6 @@ def gen_cbam() -> None:
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("OKF_DIR", "okf")
+    os.environ.setdefault("OKF_DIR", "knowledge")
     gen_hybrid_bonding()
     gen_cbam()

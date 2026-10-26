@@ -13,8 +13,8 @@ dependency where service code imported from the API module.
     “run 已 success 但结果没入账”；主键 `(task_id, run_id)` 使得 worker 租约过期重跑
     （同一个 run 再次 finalize）不会插第二行。
 
-    投递本身不在这里：消费端是 `graphs/async_task_guard.py`（父 run 首尾写 state +
-    ack）与 `custom/outbox_dispatcher.py`（父线程空闲时开唤醒 run）。
+    投递本身不在这里：消费端是 `graphs/middleware/async_task_guard.py`（父 run 首尾写 state +
+    ack）与 `custom/service/outbox_dispatcher.py`（父线程空闲时开唤醒 run）。
 """
 
 from collections.abc import Collection
@@ -31,7 +31,7 @@ from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.utils.status_compat import validate_run_status, validate_thread_status
-from custom.models import AsyncTaskOutbox
+from custom.db.models import AsyncTaskOutbox
 
 logger = structlog.getLogger(__name__)
 _serializer = GeneralSerializer()

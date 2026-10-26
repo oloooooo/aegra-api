@@ -268,6 +268,6 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 # 注册 custom 表到 Base.metadata，供 alembic autogenerate 发现。
-# 用模块导入而非 from-import：custom.models 顶部要 from 本模块取 Base，
+# 用模块导入而非 from-import：custom.db.models 顶部要 from 本模块取 Base，
 # from-import 会在两种导入顺序之一下循环导入失败，模块导入不会。
-import custom.models  # noqa: E402,F401
+import custom.db.models  # noqa: E402,F401

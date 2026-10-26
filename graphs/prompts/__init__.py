@@ -3,11 +3,10 @@
 文件布局（与包同目录）::
 
     graphs/prompts/
-    ├── main.md        主 agent（supervisor）system prompt
-    └── researcher.md  researcher 子 agent system prompt
+    └── main.md        主 agent（supervisor）system prompt
 
-领域子 agent 的 prompt 不在这里——它们跟着知识空间走（``graphs/okf/<space>/AGENT.md``），
-见 ``graphs/space_agents.py``。一个空间一个文件，增删空间不用改代码。
+领域子 agent 的 prompt 不在这里——它们跟着知识空间走（``knowledge/<space>/AGENT.md``），
+见 ``shared/knowledge/spec.py``。一个空间一个文件，增删空间不用改代码。
 
 用法::
 
@@ -67,11 +66,9 @@ def render_prompt(name: str, **kwargs: object) -> str:
 
 # 模块级常量：图 import 时直接取，调用方不必关心加载方式。
 MAIN_SYSTEM_PROMPT = load_prompt("main")
-RESEARCHER_SYSTEM_PROMPT = load_prompt("researcher")
 
 __all__ = [
     "MAIN_SYSTEM_PROMPT",
-    "RESEARCHER_SYSTEM_PROMPT",
     "get_prompt",
     "list_prompts",
     "load_prompt",

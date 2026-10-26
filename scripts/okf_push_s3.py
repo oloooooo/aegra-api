@@ -1,4 +1,4 @@
-"""把 `graphs/okf/` 一键传到对象存储的 `okf/` 前缀（ADR-0016）。
+"""把 `knowledge/` 一键传到对象存储的 `okf/` 前缀（ADR-0016）。
 
 幂等：对象已存在且字节数相同就跳过；`--prune` 顺带删掉 S3 上本地已没有的对象。
 
@@ -24,13 +24,13 @@ import dotenv  # noqa: E402
 
 dotenv.load_dotenv()
 
-from custom import blobs  # noqa: E402
-from graphs import okf_mirror  # noqa: E402
+from shared.session import blobs  # noqa: E402
+from shared.knowledge import root as okf_mirror  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="上传 OKF 到对象存储")
-    ap.add_argument("--source", default=None, help="源目录，缺省 graphs/okf")
+    ap.add_argument("--source", default=None, help="源目录，缺省 knowledge")
     ap.add_argument("--dry-run", action="store_true", help="只打印要做什么")
     ap.add_argument("--prune", action="store_true", help="删掉 S3 上本地已不存在的对象")
     args = ap.parse_args()

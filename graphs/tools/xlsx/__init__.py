@@ -26,8 +26,8 @@ from typing import Any
 
 from langchain.tools import ToolRuntime, tool
 
-from graphs import session_scope
-from graphs.space_access import allowed_spaces
+from graphs.access import session_scope
+from graphs.access.spaces import allowed_spaces
 from graphs.tools.xlsx import index, store
 from graphs.tools.xlsx.schema import (
     XlsxHeader,
@@ -95,12 +95,14 @@ async def _remote_of(path: str, config: object) -> store.Remote | None:
         raise ValueError(f"会话文件只能在它所属的会话里读：{path}")
     owner, thread_id = scope
 
-    # 懒导入：这个模块在启动期就被 graphs/tools 拉起来，别把 ORM 拖进 import 路径
+    # 懒导入：这个模块在启动期就被 graphs/tools 拉起来，别把 ORM 拖进 import 路径。
+    # 这是 graphs 侧唯一一处 import custom：会话文件的元数据行在 custom/db，
+    # 这里只读一次拿 blob key（读模型在 shared/session/store.py，行在 PG）。
     from aegra_api.core.orm import get_session_maker
-    from custom import session_objects
+    from custom.service import session_files
 
     async with get_session_maker()() as session:
-        row = await session_objects.get_one(session, owner, thread_id, name)
+        row = await session_files.get_one(session, owner, thread_id, name)
     if row is None:
         raise FileNotFoundError(f"文件不存在：{path}（先用 /custom/uploads/tables 上传）")
     return store.Remote(

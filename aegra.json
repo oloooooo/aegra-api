@@ -1,12 +1,12 @@
 {
   "graphs": {
-    "supervisor": "./graphs/deepagents_nodes.py:graph",
-    "domain_agent": "./graphs/domain_agents.py:graph"
+    "supervisor": "./graphs/supervisor.py:graph",
+    "domain_agent": "./graphs/space_agent.py:graph"
   },
   "http": {
-    "app": "./custom/fastapi.py:app"
+    "app": "./custom/app.py:app"
   },
   "auth": {
-    "path": "./custom/custom_auth.py:auth"
+    "path": "./custom/middleware/auth.py:auth"
   }
 }

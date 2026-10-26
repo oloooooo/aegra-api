@@ -5,7 +5,7 @@ resume-command validation, and config/context merging logic.
 
 Why a caller-supplied ``run_id`` exists (ADR-0010):
     ``_prepare_run`` is the single place that inserts a ``runs`` row and enqueues
-    it. ``custom/outbox_dispatcher.py`` needs to create a “wake run” for a parent
+    it. ``custom/service/outbox_dispatcher.py`` needs to create a “wake run” for a parent
     thread and must stay idempotent across crashes: it passes a deterministic
     ``run_id`` (uuid5 of the parent thread plus the pending outbox keys), so a retry
     after “run created but not yet marked delivered” collides on the primary key
@@ -321,7 +321,7 @@ async def _prepare_run(
 
     ``run_id`` is an optional idempotency key: pass a deterministic value and a
     retried create collides on the primary key instead of starting a second run
-    (used by ``custom/outbox_dispatcher.py`` for wake runs; see the module docstring).
+    (used by ``custom/service/outbox_dispatcher.py`` for wake runs; see the module docstring).
     """
     await _validate_resume_command(session, thread_id, request.command)
 

@@ -16,8 +16,8 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
-import custom.custom_auth as auth_mod
-from custom.quota import MAX_THREADS_PER_USER
+import custom.middleware.auth as auth_mod
+from custom.service.quota import MAX_THREADS_PER_USER
 
 FAILS: list[str] = []
 

@@ -1,4 +1,4 @@
-"""config.yaml 的读取与优先级（custom/project_config.py）。
+"""config.yaml 的读取与优先级（custom/config.py）。
 
 锁三件事：优先级（env > 文件 > 默认值）、类型写错要报错、仓库里那份 config.yaml 的键
 必须都认识——否则改了文件却没人读，纯靠肉眼发现不了。
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from custom import project_config as pc
+from shared import config as pc
 
 _ENV = {spec[0] for spec in pc._SPEC.values()}
 

@@ -21,7 +21,7 @@ import dotenv  # noqa: E402
 
 dotenv.load_dotenv()
 
-from graphs import okf_mirror  # noqa: E402
+from shared.knowledge import root as okf_mirror  # noqa: E402
 
 
 def main() -> int:

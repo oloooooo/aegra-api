@@ -10,8 +10,9 @@ import pytest
 from fastapi import HTTPException
 
 from aegra_api.models.auth import User
-from custom import blobs, session_objects
-from custom import uploads as uploads_mod
+from shared.session import blobs
+from custom.service import session_files as session_objects
+from custom.api import uploads as uploads_mod
 
 
 class FakeFile:

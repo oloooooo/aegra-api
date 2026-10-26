@@ -8,13 +8,13 @@ import pytest
 from fastapi import FastAPI
 from langchain_core.messages import SystemMessage
 
-from custom import session_store as ss
-from custom.threads_delete import (
+from shared.session import store as ss
+from custom.middleware.threads_delete import (
     assert_shadows_core_delete,
     delete_thread,
     router as threads_delete_router,
 )
-from graphs import session_files as sf
+from graphs.middleware import session_files as sf
 
 
 class FakeItem:
@@ -206,7 +206,7 @@ def test_shadow_assertion_fails_when_core_wins() -> None:
 
 
 async def test_delete_clears_session_files(monkeypatch: pytest.MonkeyPatch) -> None:
-    import custom.threads_delete as td
+    import custom.middleware.threads_delete as td
 
     cleared: list = []
 
@@ -229,7 +229,7 @@ async def test_delete_clears_session_files(monkeypatch: pytest.MonkeyPatch) -> N
 
 async def test_delete_survives_clear_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """thread 行已经删了，清理失败只能记日志；500 会让客户端重试成 404。"""
-    import custom.threads_delete as td
+    import custom.middleware.threads_delete as td
 
     async def fake_core(thread_id, user, session):
         return {"status": "deleted"}
@@ -250,7 +250,7 @@ async def test_delete_survives_clear_failure(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_safe_name_strips_paths() -> None:
-    from custom.uploads import _safe_name
+    from custom.api.uploads import _safe_name
 
     assert _safe_name("a/b/report.md") == "report.md"
     assert _safe_name(r"C:\tmp\x.md") == "x.md"
@@ -272,7 +272,7 @@ def test_safe_name_strips_paths() -> None:
 def test_safe_name_rejects(raw: str, status: int) -> None:
     from fastapi import HTTPException
 
-    from custom.uploads import _safe_name
+    from custom.api.uploads import _safe_name
 
     with pytest.raises(HTTPException) as exc:
         _safe_name(raw)
@@ -282,7 +282,7 @@ def test_safe_name_rejects(raw: str, status: int) -> None:
 async def test_read_limited_caps_size(monkeypatch: pytest.MonkeyPatch) -> None:
     from fastapi import HTTPException, UploadFile
 
-    import custom.uploads as up
+    import custom.api.uploads as up
 
     monkeypatch.setattr(up, "_MAX_BYTES", 8)
 
@@ -308,7 +308,7 @@ def test_supervisor_routes_uploads_to_store() -> None:
     """/uploads/x.md 交给 StoreBackend（key 带前导斜杠），其余仍然按 space 判定。"""
     from deepagents.backends.composite import _route_for_path
 
-    from graphs.deepagents_nodes import supervisor_backend
+    from graphs.supervisor import supervisor_backend
 
     backend = supervisor_backend()
     route = lambda p: _route_for_path(  # noqa: E731
@@ -344,7 +344,7 @@ async def test_upload_rejects_when_session_is_full(monkeypatch: pytest.MonkeyPat
 
     from fastapi import HTTPException
 
-    import custom.uploads as up
+    import custom.api.uploads as up
 
     session = AsyncMock()
     session.scalar = AsyncMock(return_value="t-1")  # 归属校验通过

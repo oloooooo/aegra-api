@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from graphs import okf_mirror
+from shared.knowledge import root as okf_mirror
 
 
 class FakeS3:

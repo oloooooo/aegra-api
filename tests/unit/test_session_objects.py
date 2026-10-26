@@ -2,7 +2,7 @@
 
 import pytest
 
-from custom import session_objects as so
+from custom.service import session_files as so
 
 
 @pytest.mark.parametrize(

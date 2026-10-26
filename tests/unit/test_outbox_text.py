@@ -1,11 +1,11 @@
-"""`custom/outbox.py` 文本口径的回归测试。
+"""`shared/outbox.py` 文本口径的回归测试。
 
 取消通知里那句“别自己重派”是有来历的：主管被别的任务唤醒时看到待办还差一项，
 会把 `was cancelled` 当成“这轮失败”而自动重新派发（2026-10-24 实测，取消后 3 秒
 又派了同名 hybrid-bonding 任务）。
 """
 
-from custom.outbox import PREFIX, completion_text, notice_text, task_status_of_run
+from shared.outbox import PREFIX, completion_text, notice_text, task_status_of_run
 
 
 def test_cancelled_notice_tells_supervisor_not_to_redispatch() -> None:

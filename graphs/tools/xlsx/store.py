@@ -15,8 +15,9 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from custom import blobs, project_config
-from custom.session_store import identity_digest
+from shared.session import blobs
+from shared import config
+from shared.session.store import identity_digest
 
 UPLOADS_PREFIX = "/uploads/"
 
@@ -33,11 +34,11 @@ class Remote:
 
 
 def cache_dir() -> Path:
-    return Path(project_config.get("xlsx.cache_dir")).resolve()
+    return Path(config.get("xlsx.cache_dir")).resolve()
 
 def root() -> Path:
     """与 backend 同一根：虚拟路径 /a.xlsx 落到 <okf>/a.xlsx（s3 模式下是本地镜像）。"""
-    from graphs.okf_mirror import knowledge_root  # 懒导入：避免 tools 包启动时拖上 blobs
+    from shared.knowledge.root import knowledge_root  # 懒导入：避免 tools 包启动时拖上 blobs
 
     return knowledge_root()
 
@@ -51,7 +52,7 @@ def resolve_local(path: str | Path) -> Path:
         p = (root_dir / raw.lstrip("/\\")).resolve()
         if root_dir not in p.parents:
             raise ValueError(f"路径越界：{path}")
-    # 相对路径分支（如 graphs/okf/消融实验1.xlsx）不查越界——那是调用方自己的 cwd
+    # 相对路径分支（如 knowledge/消融实验1.xlsx）不查越界——那是调用方自己的 cwd
     if not p.is_file():
         raise FileNotFoundError(f"文件不存在：{p}")
     return p

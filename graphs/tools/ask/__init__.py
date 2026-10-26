@@ -1,6 +1,6 @@
 """ask 域：主 agent 专用的人工追问工具 + 输入输出 schema。
 
-只有 supervisor（主 agent）装这个工具，子 agent（graphs/domain_agents.py 的领域
+只有 supervisor（主 agent）装这个工具，子 agent（graphs/space_agent.py 的领域
 agent）看不到它——
 物理隔离，不在工具里做鉴权。
 

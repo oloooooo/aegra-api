@@ -8,7 +8,7 @@ okf_version 标记（另行手写），log.md 新建（另行手写）。
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1] / "graphs" / "okf"
+ROOT = Path(__file__).resolve().parents[1] / "knowledge"
 
 # 各 space 概念文档的溯源与生成信息
 META = {
