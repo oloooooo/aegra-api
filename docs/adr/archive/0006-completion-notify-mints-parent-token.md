@@ -1,7 +1,9 @@
 # 完成通知回写父线程：现铸短时父身份 token，不用服务 token
 
+> **已归档**：本文是历史记录，不再约束当前代码；现行决定见 [`../README.md`](../README.md) 总表。
+
 > **状态：已被取代。** 子 agent 侧的 `CompletionNotifierMiddleware` 与现铸父身份 token
-> 的做法已随 [ADR-0010](./0010-task-delivery-idempotency.md) 删除：现在由 `finalize_run`
+> 的做法已随 [ADR-0010](../0010-task-delivery-idempotency.md) 删除：现在由 `finalize_run`
 > 写发件箱行，服务端的 `custom/outbox_dispatcher.py` 在父线程空闲时开唤醒 run。
 > 本文保留作为历史决策记录（当时那三个断点仍然成立，只是解法换了）。
 

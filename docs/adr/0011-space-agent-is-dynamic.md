@@ -1,8 +1,8 @@
 # 空间子 agent 动态化：一个图，名单每次 run 现算
 
 一个 Space 就是一个领域子 agent。旧实现把这件事写死在五处：`aegra.json` 三个 graph key、
-`graphs/deepagents_nodes.py::_DOMAIN_SPECS`、`graphs/domain_agents.py` 三个 builder、
-`graphs/prompts/` 六个 md 与六个常量、`main.md` 里手写的一段名单。加一个 space 要改遍四处
+`graphs/supervisor.py`（原 `deepagents_nodes.py`）里的 `_DOMAIN_SPECS`、`graphs/space_agent.py`
+（原 `domain_agents.py`）的三个 builder、`graphs/prompts/` 六个 md 与六个常量、`main.md` 里手写的一段名单。加一个 space 要改遍四处
 （表、目录、prompt、代码），删一个同理。本文记录为什么改成"空间文件夹即子 agent"。
 
 ## 决定
@@ -10,13 +10,13 @@
 | 关注点 | 决定 | 位置 |
 |---|---|---|
 | 子 agent 的 system prompt 与"何时派给我" | 都放 `<space>/AGENT.md`（frontmatter `description` + 正文 prompt） | 知识空间文件夹 |
-| 子 agent 的图 | **只有一个** `domain_agent` 图，space 经 run config 绑定 | `graphs/domain_agents.py` |
-| 可用名单 | 每次 run 现算：主管自己的 spaces → 各空间 `AGENT.md` 的 description | `graphs/deepagents_nodes.py::domain_specs` |
+| 子 agent 的图 | **只有一个** `domain_agent` 图，space 经 run config 绑定 | `graphs/space_agent.py` |
+| 可用名单 | 每次 run 现算：主管自己的 spaces → 各空间 `AGENT.md` 的 description | `graphs/supervisor.py::domain_specs` |
 | 子 agent 名 | **space 名原样**（`cbam-reporting`），不做 `-`→`_` 映射 | 同上 |
 | 主管的提示词 | 不再列名单——`start_async_task` 的工具描述本来就带 `{available_agents}` | `graphs/prompts/main.md` |
-| 建 space | 名字校验 + 目录由知识根派生 + 从模板生成 `AGENT.md` | `custom/routers.py` → `graphs/space_agents.py` |
+| 建 space | 名字校验 + 目录由知识根派生 + 从模板生成 `AGENT.md` | `custom/api/spaces.py` → `shared/knowledge/spec.py` |
 
-单一来源落在 `graphs/space_agents.py`：目录解析、`AGENT.md` 解析与兜底、脚手架、xlsx 探测。
+单一来源落在 `shared/knowledge/spec.py`：目录解析、`AGENT.md` 解析与兜底、脚手架、xlsx 探测。
 图工厂与 HTTP 路由都从那里取，`custom` 与 `graphs` 两个包不再各存一份名单。
 
 ## 为什么内容跟着文件夹走，而不是进 `space` 表
@@ -70,7 +70,7 @@
   生成，已包含每个子 agent 的 name + description（`deepagents/middleware/async_subagents.py:173`），
   所以主管提示词里那段名单是纯重复。
 - `allowed_spaces(config)` 读的是服务端注入的 `langgraph_auth_user.user_spaces`
-  （`graphs/space_access.py`），建图无需查库。
+  （`graphs/access/spaces.py`），建图无需查库。
 - aegra 的工厂图判定只看参数个数与注解（`graph_factory.py::_classify_factory`），1 参数即
   `config`，且静态图缓存不含工厂图。
 - 子 agent 名在 deepagents 里只当字符串用（工具参数值、`_ClientCache` 的键），带短横线无碍。

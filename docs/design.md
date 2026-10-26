@@ -78,14 +78,14 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 
 > 背景：子 agent 跑完后要把结果送回 supervisor 的 thread，让它不必被问就汇报。**已接线**，
 > 当前实现是两条路：主管 run 开始时由拦截层写进自己的 state；主管已空闲时由服务端的
-> 发件箱分发者（`custom/outbox_dispatcher.py`）开一轮唤醒 run。两条路都只在「模型能反应的
+> 发件箱分发者（`custom/service/outbox_dispatcher.py`）开一轮唤醒 run。两条路都只在「模型能反应的
 > 时刻」投递。
 
 **为什么不是一条路**：LangGraph 没有向运行中的图投递消息的 API；从外部能做的只有读状态、
 杀 run（`runs/cancel`）、另开 run。所以 run 中途想拿结果只能由模型自己 `check_async_task`，
 而「主管早已答完」只能靠另开一个 run 叫醒。
 
-**投递规则**（`graphs/async_task_guard.py::abefore_agent` + `custom/outbox_dispatcher.py`）：
+**投递规则**（`graphs/middleware/async_task_guard.py::abefore_agent` + `custom/service/outbox_dispatcher.py`）：
 
 | 父线程当时 | 谁投递 | 行为 |
 |---|---|---|
@@ -97,16 +97,16 @@ deepagents 0.7.23 经 `langgraph_sdk` 0.4.6 只发五类请求（`deepagents/mid
 
 **去重**：两条路的消息都以 `[Async subagent '<name>' …] Result: …` 开头（前端 `toView`
 靠此前缀识别成「子 agent 返回」），结尾带 `task_id: <id>` 与 `run_id: <id>`；
-格式定义在 `custom/outbox.py`，分发者与 guard 共用同一份。
+格式定义在 `shared/outbox.py`，分发者与 guard 共用同一份。
 
 事务性发件箱（ADR-0010）：子 run 终态时 `finalize_run` 在**同一个事务**里插一行
 `async_task_outbox(task_id, run_id)`（主键即幂等键）；分发者
-`custom/outbox_dispatcher.py` 用 `FOR UPDATE SKIP LOCKED` + 租约领批，父线程
+`custom/service/outbox_dispatcher.py` 用 `FOR UPDATE SKIP LOCKED` + 租约领批，父线程
 **无活跃 run** 才建一轮唤醒 run（“活跃” = `runs` 表有 `pending`/`running` 行，
 **不看 `thread.status`**；`SELECT thread FOR UPDATE` 关掉 check-then-act 竞态，
 run_id 是确定性的，重试赚主键即视为已投）。guard 写 state 前先
 `POST /custom/tasks/{task_id}/deliver-claim` 把行从 `pending` 原子翻成 `delivered`
-（`custom/delivery_api.py`）——**没有 advisory lock、没有时间窗口**，一行一判，
+（`custom/api/delivery.py`）——**没有 advisory lock、没有时间窗口**，一行一判，
 同一批 N 个任务互不影响。
 子任务终态分两类、走两条路（ADR-0014）：**结果**（`success`/`error`/`timeout`）占发件箱行、
 靠 claim 互斥、记 `delivered_run_id`；**状态**（`cancelled`/`interrupted`，后者指被取消而不是
@@ -130,7 +130,7 @@ claim 返回 `None`（服务不可达）时**不投**：行还在 `pending`，�
 run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表），不读 thread state；
 分发者空表时每 tick 一次索引扫描，**不依赖 Redis**（Redis 只用于 `executor.submit`）。
 
-**正文不截断**：投递消息带子 agent 的最后一条消息**原文**（`custom/outbox.py::result_body`），
+**正文不截断**：投递消息带子 agent 的最后一条消息**原文**（`shared/outbox.py::result_body`），
 模型一次就能看到全量，不用再调 `check_async_task`。超过 3000 字只打一条
 `task_result_long` / `outbox_result_long` 告警，不静默切文本——截断会让模型把“被切了”
 当成“写完了”，还多花一轮工具调用。发件箱**不存结果正文**（子 run 不流 `values`，存了也是空）。
@@ -153,7 +153,7 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
 - 分发者与 state 写入不在同一事务：崩溃窗口内可能多开一轮唤醒 run（不会多写消息，
   因为输入消息本身带 `task_id` / `run_id` 标记，guard 会跳过）。
 - **唤醒 run 的 spaces 来自“投递时”的 `user_space` 表**（`_parent_user`），不是派活时的权限；
-  且超级用户的 space 语义在 `allowed_spaces()` 与 `frontend_api._own_space_names()` 里是两套——
+  且超级用户的 space 语义在 `allowed_spaces()` 与 `custom.api.spaces._own_space_names()` 里是两套——
   前者只认表行，后者“有 write ⇒ 全部 Space”。所以**超级用户没有 `user_space` 行时，
   UI 看得到 Space 但唤醒 run 算出 0 个子 agent**（`Available types:` 空、`check_async_task`
   不在工具表、卡片只剩 `(no output)`）。绕过办法：给该账号补 `user_space` 行。
@@ -176,10 +176,10 @@ run 中途不轮询。投递判重是一次单行条件 UPDATE（发件箱表）
 - **工厂图这条路通**：1 参数 `config: RunnableConfig` 工厂（`graph_factory.py:209`）与 async contextmanager 返回值（`generate_graph`，`graph_factory.py:394`）aegra 都支持，按 run 重建，不缓存工厂图（`_base_graph_cache` 只缓存静态图，`langgraph_service.py:300`）。已用探针验证 `@asynccontextmanager async def graph(config: RunnableConfig)` 被 `classify_factory` 判为 factory。
 - **传输**：`get_client()` 不传 url 走进程内 ASGI（需服务端注册，aegra 未见注册）；传 url 走真 HTTP。`langgraph_sdk` 0.4.6 的 `runs.create` 接受 `config` 与 `context` 关键字（`_async/runs.py:364`）。
 - **无并发保护**（同 §9 #4）：aegra 不拦同线程并发 run。所以发件箱分发者必须自己用
-  `SELECT thread FOR UPDATE` + 活跃 run 检查来保证“空闲才建 run”（`custom/outbox_dispatcher.py`）。
+  `SELECT thread FOR UPDATE` + 活跃 run 检查来保证“空闲才建 run”（`custom/service/outbox_dispatcher.py`）。
   `POST /threads/{tid}` 的 `GET /threads/{tid}` 响应含 `status`（`idle` / `busy` / `interrupted` / `error`，
   `models/threads.py:98`），但分发者不再用它——那是“先查后建”的竞态写法。
-- **图文件**（方案变化过，以当前 `aegra.json` 为准）：现在只注册 `supervisor`（`./graphs/deepagents_nodes.py:graph`）与 `domain_agent`（`./graphs/domain_agents.py:graph`）——两个都是工厂图：主管每次 run 按自己拥有的 spaces 现算子 agent 名单，子 agent 按 run config 里的 space 现读 `graphs/okf/<space>/AGENT.md`（ADR-0011）。旧的三张领域图与 `_DOMAIN_SPECS` 已删；`graphs/xlsx_process.py` 及备份 `graphs/xlsx_process copy.py` 也不再是活图。
+- **图文件**（方案变化过，以当前 `aegra.json` 为准）：现在只注册 `supervisor`（`./graphs/supervisor.py:graph`）与 `domain_agent`（`./graphs/space_agent.py:graph`）——两个都是工厂图：主管每次 run 按自己拥有的 spaces 现算子 agent 名单，子 agent 按 run config 里的 space 现读 `knowledge/<space>/AGENT.md`（ADR-0011）。旧的三张领域图与 `_DOMAIN_SPECS` 已删；`graphs/xlsx_process.py` 及备份 `graphs/xlsx_process copy.py` 也不再是活图。
 
 ## 3. 端点契约
 
@@ -315,16 +315,20 @@ Supersede（`multitask_strategy="interrupt"`，**在创建新 run 之前**）：
 
 ```json
 {
-  "dependencies": ["."],
   "graphs": {
-    "researcher": "./graphs/researcher.py:graph",
-    "supervisor": "./graphs/deepagents_nodes.py:graph"
-  }
+    "supervisor": "./graphs/supervisor.py:graph",
+    "domain_agent": "./graphs/space_agent.py:graph"
+  },
+  "http": {"app": "./custom/app.py:app"},
+  "auth": {"path": "./custom/middleware/auth.py:auth"}
 }
 ```
 
+> 键名（`supervisor` / `domain_agent`）**不要改**：它是 DB 里 `assistant.graph_id` 的值；
+> 只改冒号后面的模块路径。四个入口文件都在包的根目录，其余代码按层进子包（见 `CONTEXT.md`「代码布局」）。
+
 ```python
-# graphs/researcher.py —— 子 agent。不要在编译期自带 checkpointer：aegra 每请求注入。
+# 子 agent 图（示意）——不要在编译期自带 checkpointer：aegra 每请求注入。
 from deepagents import create_deep_agent
 
 graph = create_deep_agent(
@@ -341,9 +345,9 @@ supervisor = create_deep_agent(
     model="openai:gpt-5.5",
     subagents=[
         AsyncSubAgent(
-            name="researcher",
+            name="my_subagent",                 # 子 agent 名（本仓库里 = space 名）
             description="Research agent for information gathering and synthesis",
-            graph_id="researcher",              # aegra.json 的键
+            graph_id="my_subagent",             # aegra.json 的键
             url="http://localhost:2026",        # aegra-api
         )
     ],

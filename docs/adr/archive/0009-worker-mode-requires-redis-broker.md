@@ -1,5 +1,7 @@
 # worker / 多副本模式必须开 Redis broker
 
+> **已归档**：本文是历史记录，不再约束当前代码；现行决定见 [`../README.md`](../README.md) 总表。
+
 ## 背景：不开 Redis 时，跨进程取消是静默失效的
 
 一个进程内的 run 由 `active_runs[run_id]`（进程内存 dict）持有 asyncio task，

@@ -1,8 +1,15 @@
 # 会话文件：md 进 Store、xlsx 进对象存储，都私有且随会话删
 
-> 状态：**决定已定，实现未开始**（2026-10-25，第 3 稿）。
+> 状态：**主体已实现**（决定 2026-10-25，第 3 稿；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
 > 本文取代第 1 稿「大表挂 space」的全部内容（那版已作废，理由见文末「作废记录」）。
 > 实现细节见 [`../large-files.md`](../large-files.md)；空间内容进 S3 见 [ADR-0016](./0016-spaces-in-object-storage.md)。
+> 落点：`shared/session/blobs.py`（S3、自管分片可 abort、`delete_prefix`）、`custom/service/session_files.py`（配额与行）、
+> `custom/db/models.py::SessionObject`、`custom/api/uploads.py::POST /custom/uploads/tables`、
+> `custom/middleware/threads_delete.py`（两条删除链合流）、`graphs/tools/xlsx/index.py`（SQLite 索引）、
+> `graphs/access/session_scope.py`（签名凭证）、`graphs/supervisor.py::supervisor_backend`（`/uploads/` 路由）。
+> **仍未做**：预建索引要动 worker（见「后果」）。~~② 未完成分片与 `tmp/` 残留没有清理脚本~~ →
+> 2026-10-26 已补 `blobs.reap_tmp()` + `scripts/reap_multipart.py`（实测清掉一个 24h+ 的
+> `tmp/` 残留对象；用法见 `docs/S3.md` §8）。
 
 ## 背景：三个实测数字
 
@@ -90,12 +97,13 @@
 
 - 必须顺带修两处**既有**缺陷，否则本方案静默失效：
   ① `_check_scope` 的跨空间越权（`/空间A/../空间B/x.xlsx` 现在能读）；
-  ② `graphs/space_agents.py::has_tables` 与 `custom/frontend_api.py::_list_files` 只扫本地盘。
+  ② `shared/knowledge/spec.py::has_tables` 与 `custom/api/spaces.py::_list_files` 只扫本地盘。
 - 首次访问未建索引的大表 **41.7 s**（一次，全集群一次）；预建索引需要动 worker，未做。
 - 新增运行时依赖 `boto3` + 部署组件 SeaweedFS。
-- 多一条运维逻辑：未完成的 multipart 上传 S3 不会自动清，需 `scripts/reap_multipart.py`。
-  注意 aegra 的 crons API 只触发**图 run**，不是运维脚本调度器。
-- 两套载体 = 两套删除链，统一在 `custom/threads_delete.py` 一处。
+- 多一条运维逻辑：未完成的 multipart 上传 S3 不会自动清，需自己定时调
+  `shared/session/blobs.py::abort_stale_multiparts`（仓库没带定时脚本；aegra 的 crons API 只触发
+  **图 run**，不是运维脚本调度器）。
+- 两套载体 = 两套删除链，统一在 `custom/middleware/threads_delete.py` 一处。
 
 ## 作废记录（2026-10-25）
 

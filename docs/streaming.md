@@ -75,7 +75,7 @@ async for part in stream:
 ### A. 进程内 `graph.astream_events(request, version="v3")` → 支持 ✅
 
 ```python
-from graphs.deepagents_nodes import graph   # CompiledStateGraph (Pregel)
+from graphs.supervisor import graph   # CompiledStateGraph (Pregel)
 
 stream = await graph.astream_events(request, version="v3")   # v3 先 await！
 async for ev in stream:
@@ -115,14 +115,14 @@ async for ev in stream:
 ## 7. 已知坑
 
 1. **子 agent 的流不会回传到父线程。** 异步子图跑在独立 run/thread
-   （`graphs/async_task_guard.py` 建的），主管的流里**只有
+   （`graphs/middleware/async_task_guard.py` 建的），主管的流里**只有
    `start_async_task` / `check_async_task` 两次工具调用**；子图的 token / 工具 / `custom`
    进度全在**子图自己的 thread** 上。deepagents `middleware/async_subagents.py` 里没有任何流转发（已 grep 确认）。
    要订閲子图必须先拿到 `task_id`（即子线程 id，存在 `async_tasks` 里），但它是服务身份的
-   thread，终端用户直接读会被 ownership 过滤挡成 404 —— 走 `custom/frontend_api.py` 的
+   thread，终端用户直接读会被 ownership 过滤挡成 404 —— 走 `custom/api/` 的
    `GET /custom/tasks/{task_id}/stream` 代理（见 §8），不要绕着开原生流。
 2. **`custom` 只在代码调 `runtime.stream_writer` 时才有**——主管的 `ls/read_file` 不打
-   （实测主管 `custom ×0`），`graphs/xlsx_tools.py` 打（16 条）。想在主管侧也看到工具进度，
+   （实测主管 `custom ×0`），`graphs/tools/xlsx/__init__.py` 打（16 条）。想在主管侧也看到工具进度，
    需去 `graphs/` 给对应工具补 `stream_writer`。
 3. `values` 里带 `async_tasks`（后台任务注册表），正好给前端渲染任务列表用——但
    `status` 会滞后（见 §8.2），要真实状态查 `GET /custom/tasks/{id}`。
@@ -131,7 +131,7 @@ async for ev in stream:
 
 ### 8.1 代理接口
 
-`GET /custom/tasks/{task_id}/stream?parent_thread_id=...`（`custom/frontend_api.py`）把子 run 的
+`GET /custom/tasks/{task_id}/stream?parent_thread_id=...`（`custom/api/`）把子 run 的
 事件转成同样的 SSE 帧（`event:` + `data:`）转发给浏览器。授权靠「父线程属于当前用户 +
 父 state 的 `async_tasks` 里确实有这个 task_id」，服务 token 只在服务端内部使用。
 

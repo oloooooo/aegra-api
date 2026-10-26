@@ -5,7 +5,7 @@ aegra-api 的配置分三份文件，职责不重叠：
 | | `aegra.json` | `config.yaml` | `.env` / 环境变量 |
 |---|---|---|---|
 | **放什么** | 这个部署**对外提供什么**：图、自定义 HTTP app、store / checkpointer / auth 策略 | 本项目新增的**非密钥**参数：会话配额、文件上限、对象存储地址、OKF、发件箱 | aegra 原生运行参数（host / port、PostgreSQL、Redis、worker、cron、日志、OTEL）+ **密钥** + 第三方 SDK |
-| **谁读** | `src/aegra_api/config.py` | `custom/project_config.py` | `src/aegra_api/settings.py`（`load_dotenv()` 在导入时执行）+ 各模块 `os.environ` |
+| **谁读** | `src/aegra_api/config.py` | `shared/config.py` | `src/aegra_api/settings.py`（`load_dotenv()` 在导入时执行）+ 各模块 `os.environ` |
 | **格式** | JSON | YAML | 项目根 `.env`，`KEY=VALUE` |
 | **放密钥** | 不放 | **不放** | 放 |
 | **优先级** | — | 默认值 < 文件 < 同名环境变量 | 真实环境变量 > `.env` |
@@ -73,11 +73,14 @@ AEGRA_CONFIG=aegra_example.json uv run python src/aegra_api/main.py
 ```json
 {
   "graphs": {
-    "researcher": "./graphs/researcher.py:graph",
-    "supervisor": "./graphs/deepagents_nodes.py:graph"
+    "supervisor": "./graphs/supervisor.py:graph",
+    "domain_agent": "./graphs/space_agent.py:graph"
   }
 }
 ```
+
+> 上面是本仓库的真实配置。`graphs` 的**键名会写进 DB**（`assistant.graph_id`），改名等于让历史
+> assistant 指向不存在的图；要调整布局只改冒号后面的文件路径。
 
 - 值必须是 `"<文件路径>:<导出名>"`。**只接受文件路径**，不支持 `mypackage.graph:graph` 这类点号模块导入（会被当成相对文件路径 `mypackage/graph`，然后报 `Graph file not found`）。
 - `./` 前缀可有可无；路径相对配置文件目录。
@@ -215,7 +218,7 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | 来源 | 放什么 | 谁读 | 优先级 |
 |---|---|---|---|
 | `aegra.json` | aegra 原生：托管哪些图、自定义 HTTP app、store / checkpointer / auth（见 §2） | `src/aegra_api/config.py` | — |
-| `config.yaml`（仓库根） | 本项目新增的**非密钥**参数：配额、会话文件上限、对象存储地址、知识空间、发件箱 | `custom/project_config.py` | 代码默认值 < 文件 < 同名环境变量 |
+| `config.yaml`（仓库根） | 本项目新增的**非密钥**参数：配额、会话文件上限、对象存储地址、知识空间、发件箱 | `shared/config.py` | 代码默认值 < 文件 < 同名环境变量 |
 | `.env` / 环境变量 | aegra 原生 env（§3.1）、**密钥**（§3.3）、第三方 SDK（§3.4） | `settings.py` 与各模块 `os.environ` | 环境变量总优先 |
 
 一个键该放哪：
@@ -265,6 +268,16 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `STUCK_PENDING_THRESHOLD_SECONDS` / `POSTGRES_POLL_INTERVAL_SECONDS` | `120` / `5` | 卡住判定与回退轮询 |
 | `WORKER_QUEUE_KEY` / `WORKER_DRAIN_TIMEOUT` | `aegra:jobs` / `30` | 队列键名与优雅停机时长 |
 
+**多副本 / worker 模式必须开 broker**（原 [ADR-0009](./adr/archive/0009-worker-mode-requires-redis-broker.md)）：
+`REDIS_BROKER_ENABLED=false` 时 run 只活在进程内存里，取消请求落到别的进程就静默失效——实测 2 个
+uvicorn worker 下**约 50% 的取消丢失**（DB 已写 `interrupted`，属主进程里的图继续跑、继续写
+checkpoint），而启动日志里**没有任何告警**。
+
+- 开了 broker：run 进 Redis List，带 `claimed_by` + `lease_expires_at`，取消走 pub/sub 找到属主进程；
+  事件也进 Redis，任一实例都能 attach 并重放，SSE 不再依赖"连到属主进程"。
+- 单机开发想省 Redis：`REDIS_BROKER_ENABLED=false` + **只用单进程**启动即可；但不要用 `uvicorn --workers N`。
+- 代价是 at-least-once 重投：进程崩溃后 lease 过期会被重新执行，幂等由业务方负责。
+
 #### Cron
 
 | 变量 | 默认 | 说明 |
@@ -281,11 +294,11 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | `AEGRA_THREAD_TTL` | 无 | 覆盖 `checkpointer.ttl`；可写分钟数，也可写 `{"strategy":"keep_latest","default_ttl":...}`。别名 `LANGGRAPH_THREAD_TTL` |
 | `AEGRA_CHECKPOINT_DURABILITY` | 无 | 覆盖 `checkpointer.durability` |
 
-### 3.2 本项目新增：`config.yaml`（`custom/project_config.py`）
+### 3.2 本项目新增：`config.yaml`（`shared/config.py`）
 
 非密钥的项目参数全在这一个文件里。密钥不要往里写（§3.3）。
 
-- **位置**：仓库根 `config.yaml`（`custom/project_config.py` 按自身位置找，与 CWD 无关）。
+- **位置**：仓库根 `config.yaml`（`shared/config.py` 按自身位置找，与 CWD 无关）。
 - **生效时机**：import 时读一次 → **改完要重启进程**（与 `aegra.json` 一致）。
 - **优先级**：同名环境变量 > 文件 > 代码内默认值。留口子给容器 `-e` 和单测 `monkeypatch.setenv`。
 - **写错不将就**：YAML 语法错、键拼错、值类型错（该写数字写成了文字）都会在启动时抛 `ValueError`，不会静默退回默认值。
@@ -293,20 +306,27 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 
 下表「覆盖变量」列的用途只有两个：容器里临时改一个键、单测里打桩。日常改配置改 YAML。
 
-#### 配额（`custom/quota.py`）
+#### 配额（`custom/service/quota.py`）
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
 | `quota.max_threads_per_user` | `50` | `MAX_THREADS_PER_USER` | 一个账号最多同时拥有几个会话（主管线程 + 子线程；子线程计到所属主管上）。超额时 `POST /threads` 返回 403。超管不受限。见 [adr/0012](./adr/0012-thread-quota-replaces-task-limit.md) |
 
-#### 身份与 token（`custom/services.py`、`custom/custom_auth.py`、`graphs/space_access.py`）
+#### 身份与 token（`custom/service/account.py`、`custom/middleware/auth.py`、`graphs/access/spaces.py`）
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
-| `auth.service_identity` | `subagent_service` | `SERVICE_IDENTITY` | 服务身份名：子 agent 线程的属主、`custom_auth` 免查库放行、`delivery_api` 跨用户放行都按它判断。三个模块读同一个键，不会各自跑偏 |
-| `auth.access_token_ttl` | `3600` | `ACCESS_TOKEN_TTL` | access token 有效期（秒） |
+| `auth.service_identity` | `subagent_service` | `SERVICE_IDENTITY` | 服务身份名：子 agent 线程的属主、`custom/middleware/auth.py` 免查库放行、`custom/api/delivery.py` 跨用户放行都按它判断。常量定义在 `shared/token.py`，各调用点都从那里取 |
+| `auth.access_token_ttl` | `3600` | `ACCESS_TOKEN_TTL` | **用户** access token 的有效期（秒）。只影响 `/register`、`/login` 签发的 token；子 agent 的服务 token 不受此值影响（见下方说明） |
 
-#### 会话文件 md（`custom/session_store.py`）
+> **两种 token 别混**（都在 `shared/token.py`）：
+>
+> - `create_access_token(identity)` —— **用户的**。`sub` = 具体账号，`exp = iat + auth.access_token_ttl`，默认 1 小时；过期后请求 401，前端回登录页。没有 refresh token，所以这个值就是“用户多久重新登录一次”。
+> - `service_token()` —— **子 agent 的**。`sub` = `auth.service_identity`（默认 `subagent_service`），`exp` **写死 10 年**，进程内缓存；供主管派活（`graphs/supervisor.py`）、前端代理读子线程、取消子任务、发件箱分发使用。
+>
+> 所以：改 `access_token_ttl` 只会变用户的登录频率，子 agent 照常跑；反过来想“让服务 token 失效”只能改 `JWT_SECRET`（代价：所有用户 token 同时失效）。
+
+#### 会话文件 md（`shared/session/store.py`）
 
 md 进 LangGraph Store，按（上传者, 主管 thread）隔离。
 
@@ -316,7 +336,7 @@ md 进 LangGraph Store，按（上传者, 主管 thread）隔离。
 | `session_files.max_files_per_session` | `50` | `MAX_FILES_PER_SESSION` | md 每会话文件数 |
 | `session_files.upload_ttl_minutes` | `4320`（72h） | `UPLOAD_TTL_MINUTES` | md 的孤儿保留期，语义是「最后读取后多久」 |
 
-#### 会话大表 xlsx（`custom/session_objects.py`、`graphs/tools/xlsx/`）
+#### 会话大表 xlsx（`custom/service/session_files.py`、`graphs/tools/xlsx/`）
 
 xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 [large-files.md](./large-files.md)。
 
@@ -325,13 +345,13 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 | `xlsx.max_blob_mb` | `10` | `MAX_BLOB_MB` | xlsx 单文件上限（`POST /custom/uploads/tables`） |
 | `xlsx.max_cells` | `2000000` | `MAX_CELLS` | 表结构硬闸；超了第一次调工具就报错，不静默截断 |
 | `xlsx.max_xlsx_files_per_session` | `20` | `MAX_XLSX_FILES_PER_SESSION` | 每会话 xlsx 个数（同名覆盖不占名额） |
-| `xlsx.max_md_files_per_session` | `10` | `MAX_MD_FILES_PER_SESSION` | 每会话 md 个数（与上面那个分开计） |
+| `xlsx.max_md_files_per_session` | `10` | `MAX_MD_FILES_PER_SESSION` | 每会话 md 个数（与上面那个分开计）。⚠ **当前代码没读这个键**：md 的每会话个数上限实际由 `session_files.max_files_per_session`（50）执行，改这个键不生效 |
 | `xlsx.max_blob_mb_per_user` | `2048` | `MAX_BLOB_MB_PER_USER` | 每用户二进制总量 |
 | `xlsx.cache_dir` | `.cache/xlsx` | `XLSX_CACHE_DIR` | 索引与字节的本机缓存（必须在 OKF 根之外） |
 | `xlsx.cache_ttl_days` | `7` | `XLSX_CACHE_TTL_DAYS` | 本机缓存保留天数 |
 | `xlsx.query_budget_ms` | `5000` | `XLSX_QUERY_BUDGET_MS` | 单次 `where` 查询的 CPU 预算，超了 `interrupt()` |
 
-#### 对象存储（`custom/blobs.py`）
+#### 对象存储（`shared/session/blobs.py`）
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
@@ -339,7 +359,7 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 | `s3.bucket` | `aegra-blobs` | `S3_BUCKET` | 桶名，启动时自动创建（幂等） |
 | `s3.region` | `us-east-1` | `S3_REGION` | 任意值（SeaweedFS 不校验） |
 
-#### 空间知识 OKF（`graphs/okf_mirror.py`、`graphs/space_agents.py`）
+#### 空间知识 OKF（`shared/knowledge/root.py`、`shared/knowledge/spec.py`）
 
 见 [adr/0016](./adr/0016-spaces-in-object-storage.md)、[S3.md](./S3.md)。
 
@@ -350,13 +370,13 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 | `okf.mirror_dir` | `.cache/okf` | `OKF_MIRROR_DIR` | `s3` 模式的镜像目录 |
 | `okf.mirror_ttl_seconds` | `0` | `OKF_MIRROR_TTL_SECONDS` | 镜像过期重拉的间隔；`0` = 只拉一次（改内容后手动跑 `scripts/okf_pull_s3.py`） |
 
-#### 图（`graphs/deepagents_nodes.py`）
+#### 图（`graphs/supervisor.py`）
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
 | `agents.server_url` | `http://127.0.0.1:2026` | `AEGRA_SERVER_URL` | supervisor 给 `AsyncSubAgent` 用的服务地址；容器里要填服务自身可达地址（如 `http://aegra-api:2026`） |
 
-#### 任务结果发件箱（`custom/outbox_dispatcher.py`）
+#### 任务结果发件箱（`custom/service/outbox_dispatcher.py`）
 
 进程内后台循环，每个进程一个，靠 `FOR UPDATE SKIP LOCKED` + 租约分工。
 **不依赖 Redis**（Redis 只用于 `executor.submit`）；不配置也能跑。语义见
@@ -386,7 +406,7 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 
 | 变量 | 默认 | 谁读 |
 |---|---|---|
-| `OPENAI_API_KEY` | 空 | `graphs/llms.py` 显式传给 `ChatOpenAI`（langchain-openai 也能自己从 env 取） |
+| `OPENAI_API_KEY` | 空 | `graphs/model.py` 显式传给 `ChatOpenAI`（langchain-openai 也能自己从 env 取） |
 | `OPENAI_BASE_URL` | 空 | 同上；OpenAI 兼容端点（DeepSeek / Moonshot / vLLM …）才需要 |
 | `OPENAI_MODEL` | 空 | 同上，**没有 SDK 约定**：图代码自己取。留空时 `ChatOpenAI(model="")` 会在首次调用时报错 |
 
@@ -538,8 +558,7 @@ docker run --log-driver json-file --log-opt max-size=10m --log-opt max-file=5 ..
 {
   "dependencies": ["./examples"],
   "graphs": {
-    "agent": "./examples/react_agent/graph.py:graph",
-    "researcher": "./graphs/researcher.py:graph"
+    "agent": "./examples/react_agent/graph.py:graph"
   },
   "http": {
     "app": "./examples/custom_routes_example.py:app",

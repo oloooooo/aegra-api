@@ -92,8 +92,8 @@ _Avoid_: workspace、业务空间、微服务空间（口语可用，代码与�
 **UserSpace（用户-空间关联）**:
 `user_space` 表：哪个账号能看哪个 Space。写入直接操作本表，不用 `UserTables.spaces`（只读视图）。
 
-> **已知不一致**：`graphs/space_access.allowed_spaces()` 只认本表的行，而
-> `custom/frontend_api._own_space_names()` 对 `is_super` 额外放行“全部 Space”。
+> **已知不一致**：`graphs.access.spaces.allowed_spaces()` 只认本表的行，而
+> `custom.api.spaces._own_space_names()` 对 `is_super` 额外放行“全部 Space”。
 > 所以超级用户如果没被分配 `user_space` 行，前端能看到全部 Space，但图里的子 agent 列表为空
 > （`Available types:` 空、`check_async_task` 不在工具表）。要么给账号补行，要么把两处规则收敛成一套。
 _Avoid_: 把 `user_microservice` 当表名（已改名）
@@ -137,7 +137,7 @@ _Avoid_: 把它当成限流（它限的是存储与界面规模，计算开销�
 把子 agent 的结果送进主管上下文的动作，只在**模型能反应的时刻**发生，且只发生一次：
 ① 主管开始一轮 run 时 —— `AsyncTaskGuard.abefore_agent` 把已终态的结果写进 state
 （不另开 run，模型在本次 run 的第一轮模型调用就能看到）；② 主管已空闲（`idle` / `error`）——
-服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run 投递。`busy` 与 `interrupted`
+服务端发件箱分发者 `custom/service/outbox_dispatcher.py` 开一轮唤醒 run 投递。`busy` 与 `interrupted`
 一律不投：前者归 ②，后者不能顶掉用户正等着回答的答案（插一轮 run 会把线程从 `interrupted`
 改成 `busy`，用户点“回答”时会被 400 拒掉）。**run 期间完成的结果不在该 run 里写**
 （没有 `after_agent`）——那时模型这一轮已经答完，写进去它没法转述，交给 ② 另开一轮。
@@ -159,13 +159,13 @@ _Avoid_: 把状态通知叫投递；把 cancelled 当结果去投（那会把半
 
 投递消息带子 agent 最后一条消息的**原文**（不截断）；过长只告警不切文本，避免模型把“被切了”
 当成“写完了”。
-发件箱表 / ack 接口 / 分发者见 `custom/models.py`、`custom/delivery_api.py`、
-`custom/outbox_dispatcher.py`（ADR-0010）。
+发件箱表 / ack 接口 / 分发者见 `custom/db/models.py`、`custom/api/delivery.py`、
+`custom/service/outbox_dispatcher.py`（ADR-0010）。
 _Avoid_: 把投递说成“通知”（通知是手段，投递是结果进上下文）；把它当成同步等待（主管从不被阻塞）；
 以为发件箱里存了结果正文（它不存，正文靠投递时现查子线程）
 
 **Task proxy（任务代理）**:
-`custom/frontend_api.py` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread
+`custom/api/` 里把子 agent 的线程状态与事件流转给浏览器的接口。子 agent 的 thread
 属主是服务账号，终端用户直接读会被 ownership 过滤挡成 404，所以必须经代理。
 _Avoid_: 把它当成转发层（它同时是授权层：要求父线程属于当前用户且其 `async_tasks` 里有该 task）
 
@@ -185,13 +185,20 @@ _Avoid_: 把子 agent 的 thread 叫会话（它是任务的私生子线程，�
 路径 `/uploads/<文件名>`。
 _Avoid_: 把它当 Space 知识（Space 知识对空间成员共享，会话文件只对上传者本人的这个会话可见）；
 叫附件、临时文件（它不是临时件：会话在它就在）；把上传的 xlsx 叫「空间表」
-（它不落 `graphs/okf/<空间>/`，存量手工放盘的表才是），或叫「空间文件」
+（它不落 `knowledge/<空间>/`，存量手工放盘的表才是），或叫「空间文件」
 
 **Orphan retention（孤儿保留期）**:
 会话文件 item 的 TTL（默认 72 小时，env 可覆写），语义是**最后读取后多久**过期，不是绝对寿命：
 主管每轮 run 起始查一次清单会续期，所以在用的会话永不失效，只有再没人读的文件才过期。
 它只是垃圾兜底，不是保留策略——保留策略是「会话在，文件在」。
 _Avoid_: 把它当保留期（用户会发现隔天文件消失的期望差）；把它当清理主路径（主路径是删会话）
+
+**Upload leftover（上传残留）**:
+一次上传没走完就留在对象存储里的东西：`tmp/` 下的中间对象（复制到正式 key 之前的那份），
+与超时未完成的分片上传。它不是会话文件、不属于任何会话，也不随删会话消失——
+这是**垃圾**，靠 `scripts/reap_multipart.py` 定期清（或对象存储的生命周期规则兜底）。
+_Avoid_: 把它当孤儿会话文件（那个有保留期、由 Store 的 TTL 管）；把它当正常数据去对账
+（它会让物理用量大于 PG 里的 `sum(size_bytes)`）
 
 **Untrusted content（不可信内容）**:
 会话文件正文进上下文时的身份：它是**资料，不是指令**。清单与正文都按这个口径标注，
@@ -227,3 +234,26 @@ backend 里塞对象存储，xlsx 工具自己直连）；把它当 Space 隔离
 通过就建表索引；不通过就直接拒收并让用户重传，不静默截断、不降级解析。
 _Avoid_: 把它当业务校验（"这张表的数据对不对"不是它的职责，那要靠 agent 分析）；
 把它当可配置的策略引擎（本期硬编码，等有第二个空间提出不同要求再升级）
+
+## 代码布局
+
+三个顶层包，依赖方向单向（由 `tests/unit/test_layout.py` 守护）：
+
+- `custom/` —— **HTTP 面**。`app.py` 装配（`aegra.json` 的 `http.app`）；
+  `api/` 只做 HTTP 形状（一个 URL 域一个文件）、`service/` 业务、`db/` ORM 与仓储、
+  `middleware/` 中间层（Auth handler、删会话的路由遮挡）。
+- `graphs/` —— **图面**，只在 run 里跑。根目录只放 `aegra.json` 直指的两个入口
+  （`supervisor.py`、`space_agent.py`）；`middleware/` 中间层（AgentMiddleware）、
+  `access/` 横切的访问判定（spaces 列表、会话作用域、带 ACL 的 backend）、
+  `tools/` 与 `prompts/`。
+- `shared/` —— **两侧共用的纯逻辑**：`config`（config.yaml 单例）、`token`（JWT 铸造）、
+  `outbox`（投递文本口径）、`session/`（LangGraph Store 与对象存储）、
+  `knowledge/`（知识根、`AGENT.md` 解析与脚手架）。
+
+规则：`custom → shared`、`graphs → shared`，**两个包互不 import**；`shared` 不 import
+FastAPI / LangChain / deepagents。唯一例外：`graphs/tools/xlsx` 懒加载
+`custom.service.session_files` 读会话文件元数据行（表在 `custom/db/models.py`）。
+
+数据不在代码包里：空间知识在仓库根 `knowledge/`（`config.yaml` 的 `okf.dir`）。
+_Avoid_: 往 `graphs/` 里放数据；在 `custom/` 里放图侧要用的模块（要放就放 `shared/`）；
+在两个包根目录新增文件（根目录只放入口）

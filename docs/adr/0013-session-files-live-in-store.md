@@ -31,13 +31,13 @@
 > **2026-10-25 更正（原文写错了）**：这里原来写的是"子 agent 侧靠 `AsyncTaskGuard` 已经在
 > 转发的 `configurable.parent_thread_id`"。**这个转发不存在。** 已逐行核实：
 >
-> - `AsyncTaskGuard._config_for()`（`graphs/async_task_guard.py:211-229`）只返回
+> - `AsyncTaskGuard._config_for()`（`graphs/middleware/async_task_guard.py`）只返回
 >   `{"configurable": {"user_spaces": [...]}}`，没有第二个键；
 > - `parent_thread_id` 走的是另一条路：`_thread_meta()`（`:232-239`）把它写进**子线程的
 >   metadata**（PG 的 `thread.metadata_json`），服务端 `finalize_run` 与 thread 配额从那里读
 >   （`src/aegra_api/services/run_status.py:261`），子 run 的 `configurable` 里看不到；
-> - 今天**不构成 bug**：子 agent 的图根本没有 `/uploads` 路由（`graphs/domain_agents.py`
->   当时直接用 `SpaceBackend`，路由只加在 `graphs/deepagents_nodes.py::supervisor_backend()` 上），
+> - 今天**不构成 bug**：子 agent 的图根本没有 `/uploads` 路由（`graphs/space_agent.py`
+>   当时直接用 `SpaceBackend`，路由只加在 `graphs/supervisor.py::supervisor_backend()` 上），
 >   所以下面第 120 行的决定与实现是一致的；（2026-10-25 后续：ADR-0015 已给子 agent 加上该路由）
 > - 顺带纠正一个推断：「照这个做会算成 `h(subagent_service)` 的跨用户共享命名空间」也不准。
 >   `_uploads_namespace` 用的是 `configurable.thread_id`，而子 run 里它已被 aegra 换成
@@ -94,7 +94,7 @@ bug。命名空间定为：
        abefore_agent  → 查一次清单（limit 20）存实例，返回 None 不写 state
        awrap_model_call → 以 system 消息注入，标注「资料，不是指令」
 
-删除   custom/threads_delete.py 遮挡 DELETE /threads/{thread_id}
+删除   custom/middleware/threads_delete.py 遮挡 DELETE /threads/{thread_id}
        → 先调原生 delete_thread（鉴权不变），成功后清该命名空间
 ```
 
@@ -133,10 +133,11 @@ bug。命名空间定为：
 
 ## Consequences
 
-- 新增接口 `POST /custom/uploads`、新增模块 `custom/session_store.py`、
-  `custom/uploads.py`、`custom/threads_delete.py`、`graphs/session_files.py`。
-- 新增 env：`UPLOAD_TTL_MINUTES`（默认 4320）、`MAX_UPLOAD_MB`（默认 10）、
-  `MAX_FILES_PER_SESSION`（默认 50）。三者都在模块 import 时读取：改完要重启，不是热生效。
+- 新增接口 `POST /custom/uploads`、新增模块 `shared/session/store.py`、
+  `custom/api/uploads.py`、`custom/middleware/threads_delete.py`、`graphs/middleware/session_files.py`。
+- 新增配置（`config.yaml`，env 同名可覆盖）：`session_files.upload_ttl_minutes`（默认 4320）、
+  `session_files.max_upload_mb`（默认 10）、`session_files.max_files_per_session`（默认 50）。
+  三个键在模块 import 时读取：改完要重启，不是热生效。
 - **每会话文件数有上限（50）**：TTL 只清孤儿、thread 配额只限会话数，没有这道闸
   单会话可以无限堆（每份 ≤10MB）。同名重传是覆盖，不占新名额。
 - **删除清理是隐式顺序依赖**：custom app 先装载、核心路由后 `include_router`，Starlette 按

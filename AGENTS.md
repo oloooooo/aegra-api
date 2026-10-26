@@ -2,7 +2,7 @@
 1. 在进行长时任务时，先使用plan规划任务，并列出任务，完成某一任务的时候要生成简报，告知用户
 2. 环境需要安装新的依赖的时候，使用ask-user-question插件询问用户
 3. 遇到较新的，没遇见的问题或者技术的时候，使用联网搜索功能获取最新信息
-4. 目前请尽量在custom，graphs中修改或者添加代码，其他部分先不改(如果要添加测试样例请添加在tests下面)，除非用户要求进行更改或者使用ask_user_question征询用户许可后改动
+4. 代码只在 `custom/`、`graphs/`、`shared/` 三个包里改（`src/` 是 aegra 原生，尽量不动；测试放 `tests/`；`knowledge/` 是数据）。改 `src/` 或数据目录前先征询用户许可。布局与依赖规则见 `CONTEXT.md`「代码布局」，由 `tests/unit/test_layout.py` 守护：两个包互不 import，`shared/` 不 import 框架。
 5. 该项目是后端项目需要考虑安全性，幂等性，并发性等问题
 
 ## Agent skills

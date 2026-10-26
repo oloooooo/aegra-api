@@ -2,7 +2,8 @@
 
 前端（独立仓库，Vue 3 + Vite）对接本服务时的接口契约。全部结论来自**实测**（真起服务、跑 supervisor 与三个领域子 agent）。
 
-实现位置：`custom/frontend_api.py`、`custom/uploads.py`、`custom/task_control_api.py`（路由前缀都是 `/custom`）。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
+实现位置：`custom/api/`，一个 URL 域一个文件——`account.py`（注册 / 登录 / whoami）、`graphs.py`（图清单）、`spaces.py`（空间与文件树）、
+`tasks.py`（任务状态 / SSE 流 / 取消）、`uploads.py`（会话文件）、`delivery.py`（投递 ack）；路由前缀都是 `/custom`。除了这一层，其余接口直接用 LangGraph 原生端点（见 §4）。
 
 另有 **3 个内部接口**：
 
@@ -56,7 +57,7 @@ POST /custom/login
 
 ```json
 {"is_super": true, "spaces": [
-  {"name": "cbam-reporting", "path": "graphs/okf/cbam-reporting", "accessible": true, "file_count": 6}
+  {"name": "cbam-reporting", "path": "knowledge/cbam-reporting", "accessible": true, "file_count": 6}
 ]}
 ```
 
@@ -65,7 +66,7 @@ POST /custom/login
 ### 3.3 `GET /custom/spaces/{space_name}/files`
 
 ```json
-{"space": "cbam-reporting", "root": "graphs/okf/cbam-reporting", "files": [
+{"space": "cbam-reporting", "root": "knowledge/cbam-reporting", "files": [
   {"path": "/cn_goods_rules.xlsx", "size": 7332, "modified": "2026-10-18T03:50:49+00:00", "ext": ".xlsx"}
 ]}
 ```
@@ -114,7 +115,7 @@ event: end        data: {"status": "success"}
 - 任务已结束时：只发 `metadata` + `values` + `end`，不发实时帧。
 - `stream_mode` 查询参数可覆盖，默认 `messages,custom`；`values` 每步都是整态快照，量大，要才加。
 
-前置条件：子 run 创建时必须声明 `stream_mode=["messages","custom"]`（`graphs/async_task_guard.py` 已声明）。若不声明，aegra 默认只产 `values`，代理订阅不到 token 流。
+前置条件：子 run 创建时必须声明 `stream_mode=["messages","custom"]`（`graphs/middleware/async_task_guard.py` 已声明）。若不声明，aegra 默认只产 `values`，代理订阅不到 token 流。
 
 ### 3.7 `POST /custom/uploads`
 
@@ -128,7 +129,7 @@ event: end        data: {"status": "success"}
 - 校验顺序固定：会话归属 → 文件名 → 扩展名 → 大小 → 编码。先挡归属与文件名，再边读边判大小（超限即 `413`），最后才解码。
 - 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `session_files.max_upload_mb`（默认 10）或本会话文件数已达 `session_files.max_files_per_session`（默认 50）`413`；store 未就绪 `503`。
 - 同名重传 = 覆盖（PUT 语义，`/uploads` 下永远只有一份），不占新名额。
-- 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/session_files.py`），所以本轮 run 看不到刚传的文件。
+- 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/middleware/session_files.py`），所以本轮 run 看不到刚传的文件。
 - 孤儿 TTL 默认 72 小时（`session_files.upload_ttl_minutes`）：活跃会话每轮读清单会续期，没人读才过期；删会话即清空。
 - **没有列表/删除接口**：前端只能自己记住传过什么；要删文件目前只能删会话。
 
@@ -198,7 +199,7 @@ agent 收到的工具结果形如 `{"answer":"键合工艺DOE.xlsx","extra":null
 （判重在服务端做，见 `POST /custom/tasks/{id}/deliver-claim`）：
 
 - 主管的 run 开始 → `AsyncTaskGuard.abefore_agent` 写进自己的 state（不开新 run）；
-- 主管已答完（线程 `idle`）→ 服务端发件箱分发者 `custom/outbox_dispatcher.py` 开一轮唤醒 run
+- 主管已答完（线程 `idle`）→ 服务端发件箱分发者 `custom/service/outbox_dispatcher.py` 开一轮唤醒 run
   （ADR-0010；不再有子 agent 侧的通知中间件，也不需要现铸父身份 token）。
 
 两种都**渲染成「子任务返回结果」区块**，不要当作用户输入。主管在等用户回答（线程 `interrupted`）时

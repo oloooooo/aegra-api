@@ -45,7 +45,7 @@ ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不
 
 ### 二、分发：只有一个组件会开唤醒 run（custom）
 
-`custom/outbox_dispatcher.py`，与 `lease_reaper` / `cron_scheduler` 同款的进程内循环：
+`custom/service/outbox_dispatcher.py`，与 `lease_reaper` / `cron_scheduler` 同款的进程内循环：
 
 ```
 每 1s（可调）：
@@ -70,7 +70,7 @@ ON CONFLICT (task_id, run_id) DO NOTHING      -- worker lease 过期重跑也不
   会对 thread 行取 `FOR KEY SHARE`——多进程下第二个分发者会阻塞到第一个提交，然后看到新
   run 并让路（与 `thread_ttl.py` 处理同一竞态的做法一致）。
 
-**“父线程忙”的判据有两条**（`custom/outbox_dispatcher.py::_dispatch_parent`）：
+**“父线程忙”的判据有两条**（`custom/service/outbox_dispatcher.py::_dispatch_parent`）：
 
 1. `runs` 表里有 `pending` / `running` 的行（`ACTIVE_RUN_STATES`）——那一轮的 `before_agent`
    会负责投，这里让路；

@@ -14,7 +14,7 @@ GET /threads/{子线程}/state   → 404 not_found   （实测，root 也不行�
 
 aegra 的每个 thread 查询都带 `user_id == user.identity` 过滤（`threads.py`）。
 
-**选中的做法**：在 `custom/frontend_api.py` 加带鉴权的代理——
+**选中的做法**：在 `custom/api/` 加带鉴权的代理（`tasks.py`）——
 `GET /custom/tasks/{task_id}` 与 `/custom/tasks/{task_id}/stream?parent_thread_id=...`。
 授权条件是「父线程属于当前用户（借原生接口的 ownership 校验）**且** 父 state 的 `async_tasks` 里
 确实有这个 `task_id`」；通过后再用服务 token 去读子线程 / 订阅子 run。服务 token 不下发浏览器。
@@ -63,7 +63,7 @@ async_tasks: {'d9eb5ea6': 'running'}   ← 子 run 早已 success，父 state �
 - **回写完成后让 notifier 顺手把状态改成终态**：notifier 拿不到父 state 的写权限（它只是往父线程
   发一条消息），且需要新表或新接口来落状态。
   > **该方案已随 [ADR-0010](./0010-task-delivery-idempotency.md) 失效**：notifier 已删除，
-  > 现在是 `finalize_run` 写发件箱行、服务端的 `custom/outbox_dispatcher.py` 在父线程空闲时
+  > 现在是 `finalize_run` 写发件箱行、服务端的 `custom/service/outbox_dispatcher.py` 在父线程空闲时
   > 开唤醒 run。本条保留为历史评估记录（“拿不到父 state 写权限”这个限制仍然成立）。
 - **前端各自刷新**：只解决显示，不解决派活被拒。
 - **拦截层派活前核实**（选中）：唯一的判上限的地方就是拦截层，修在这里最靠根因。
@@ -71,6 +71,6 @@ async_tasks: {'d9eb5ea6': 'running'}   ← 子 run 早已 success，父 state �
 ### Consequences
 
 - 每次派活多 N 次 `runs.get`（N = 当时非终态任务数，≤3），可接受。
-- `GET /custom/tasks/{id}` 独立实现了一份同样的「向子 run 核实状态」逻辑（`custom/frontend_api.py::_fresh_status`），因此口径与拦截层一致，但**是两份代码**（另两份在 `graphs/async_task_guard.py::_refreshed_sync/_refreshed_async`）；把三处收敛成一处是已知的后续清理项。
+- `GET /custom/tasks/{id}` 独立实现了一份同样的「向子 run 核实状态」逻辑（`custom/api/tasks.py::_fresh_status`），因此口径与拦截层一致，但**是两份代码**（另两份在 `graphs/middleware/async_task_guard.py::_refreshed_sync/_refreshed_async`）；把三处收敛成一处是已知的后续清理项。
 - state 里的 `status` 仍是「上次核实时」的快照，不是实时值；文档（`docs/streaming.md` §8.2、
   `docs/frontend-api.md` §5.4）明确要求前端用代理接口而非直接读 state。

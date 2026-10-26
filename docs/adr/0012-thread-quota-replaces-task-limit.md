@@ -5,7 +5,7 @@
 
 ## 为什么不是"再加一道限额"
 
-旧机制（[ADR-0008](./0008-active-task-limit-is-per-process.md)，已 superseded）要判
+旧机制（[ADR-0008](archive/0008-active-task-limit-is-per-process.md)，已 superseded）要判
 "读活跃数 → 判上限 → 占名额"原子，而这份账本在进程内存里，多 worker 部署下上限必然
 退化成 `N × MAX_ACTIVE_TASKS`。要么加数据库名额表（一次派活一次事务），要么接受不准。
 
@@ -24,7 +24,7 @@
 
 ## 机制
 
-### 1. 子线程记归属（`graphs/async_task_guard.py`）
+### 1. 子线程记归属（`graphs/middleware/async_task_guard.py`）
 
 子线程是服务账号用 service token 建的，`thread.user_id = subagent_service`，按属主根本
 数不到终端用户头上。所以派活时把父用户写进 metadata：
@@ -36,7 +36,7 @@ client.threads.create(metadata={
 })
 ```
 
-### 2. 建会话时判配额（`custom/custom_auth.py`）
+### 2. 建会话时判配额（`custom/middleware/auth.py`）
 
 `POST /threads` 已经会 dispatch `@auth.on.threads.create`（`src/aegra_api/api/threads.py`），
 所以不用改 `src/`：
@@ -54,9 +54,9 @@ async def _quota_threads_create(ctx, value):
 - 只数 `parent_thread_id IS NULL` 的线程：子线程跟着主管线程走，单独数会把同一份
   占用算两遍（建一个主管 + 派 3 个子 = 4，但用户眼里只开了 1 个会话）。
 - 超管（权限含 `write`）不受限：管理员要能排查别人的问题。
-- 上限在 `custom/quota.py::MAX_THREADS_PER_USER`（env `MAX_THREADS_PER_USER`，默认 200）。
+- 上限在 `custom/service/quota.py::MAX_THREADS_PER_USER`（`config.yaml` 的 `quota.max_threads_per_user`；env `MAX_THREADS_PER_USER` 可覆盖）。
 
-### 3. 删会话时级联删子线程（`custom/custom_auth.py`）
+### 3. 删会话时级联删子线程（`custom/middleware/auth.py`）
 
 子线程归服务账号，用户既看不见也删不掉。不级联的话它们成为永久孤儿：一直占着
 checkpoint 存储，而且**因为父线程被删了，连数都数不回来**。
@@ -79,8 +79,8 @@ async def _cascade_child_threads(ctx, value):
 
 | 位置 | 删了什么 |
 |---|---|
-| `graphs/limits.py` | 整个文件（`MAX_ACTIVE_TASKS` 的唯一来源） |
-| `graphs/async_task_guard.py` | `_LEDGER` / `_LEDGER_LOCK` / `_active_count` / `_over_limit` / `_reserve` / `_settle` / `_start_args`、`_parent_key`、`threading` 与 `uuid` 导入 |
+| `graphs/limits.py` | 整个文件（`MAX_ACTIVE_TASKS` 的唯一来源，已删） |
+| `graphs/middleware/async_task_guard.py` | `_LEDGER` / `_LEDGER_LOCK` / `_active_count` / `_over_limit` / `_reserve` / `_settle` / `_start_args`、`_parent_key`、`threading` 与 `uuid` 导入 |
 | `graphs/prompts/__init__.py` | `MAIN_SYSTEM_PROMPT` 里的 `{max_active_tasks}` 替换 |
 | `graphs/prompts/main.md` | "同时最多 N 个后台任务" → "可以同时派多个，它们在服务端排队执行" |
 
@@ -104,8 +104,8 @@ async def _cascade_child_threads(ctx, value):
   （aegra 在 handler 之后才 insert）。同一用户在毫秒内并发建 N 个会话，可能多建几个。
   `WORKER_COUNT=2` 下这是已知的小窗口；要严格就得把计数与插入塞进一个事务，
   那要改 `src/`，本期不做。
-- **子线程仍是服务账号持有**：前端看子 agent 的输出必须经 `custom/frontend_api.py` 的代理
-  （ADR-0007 不变）。本 ADR 只加了 metadata，没改归属。
+- **子线程仍是服务账号持有**：前端看子 agent 的输出必须经 `custom/api/` 的代理
+  （`tasks.py`；ADR-0007 不变）。本 ADR 只加了 metadata，没改归属。
 
 ## Considered Options
 
@@ -120,7 +120,7 @@ async def _cascade_child_threads(ctx, value):
 
 ## Consequences
 
-- 新增 env：`MAX_THREADS_PER_USER`（默认 200）。改完重启生效（`custom/quota.py` 在 import 时读）。
+- 新增配置：`config.yaml` 的 `quota.max_threads_per_user`（env `MAX_THREADS_PER_USER` 可覆盖）。改完重启生效（`custom/service/quota.py` 在 import 时读）。
 - 建会话被拒时返回 **403**，body 是 `{"detail": "会话数已达上限（N），请先删除不用的会话再新建"}`
   ——前端已按 `detail` 取文案（`web/src/api/client.ts::errorText`），无需改代码。
 - 删会话现在会连带删子线程的 checkpoint：一次删除可能比过去慢（每个子线程一次

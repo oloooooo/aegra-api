@@ -1,6 +1,8 @@
 # 异步派活的并发上限只在单进程内成立
 
-> **Status: Superseded by [ADR-0012](./0012-thread-quota-replaces-task-limit.md)（2026-10-19）**
+> **已归档**：本文是历史记录，不再约束当前代码；现行决定见 [`../README.md`](../README.md) 总表。
+
+> **Status: Superseded by [ADR-0012](../0012-thread-quota-replaces-task-limit.md)（2026-10-19）**
 >
 > 业务改成「不再限制一个主管派多少子 agent，改成限制一个用户拥有多少会话（thread）」。
 > `MAX_ACTIVE_TASKS`、进程内账本（`_LEDGER` / `_LEDGER_LOCK`）、派活前的名额判定与

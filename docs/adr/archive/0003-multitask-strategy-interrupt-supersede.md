@@ -1,5 +1,7 @@
 # `multitask_strategy="interrupt"` 从静默忽略改为真执行 Supersede
 
+> **已归档**：本文是历史记录，不再约束当前代码；现行决定见 [`../README.md`](../README.md) 总表。
+
 deepagents 的 `update_async_task` 靠 `POST /threads/{tid}/runs` 带 `multitask_strategy="interrupt"` 表达"杀掉当前 run、保留线程历史、用新消息开新 run"。aegra-api 目前把该字段存进 `RunJob.behavior` 后**没有任何消费**——旧 run 继续跑，与新 run 并存于同一线程。
 
 **决定**：实现 `interrupt` 策略（Supersede）。语义：建新 run 之前，对该线程所有 `pending | running` 的 run 走一次标准取消（无主 → DB 落 `interrupted`；有主 → broker 信号 + 执行器落 `interrupted`，`interrupted_by="cancel"`），checkpoint / 线程历史不动，再照常建新 run。其余策略值（`reject` / `enqueue` / `rollback`）维持现状（收下不执行），另开期处理。

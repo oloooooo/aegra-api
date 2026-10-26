@@ -6,7 +6,10 @@ How the engineering skills should consume this repo's domain documentation when 
 
 - **`CONTEXT.md`** at the repo root, or
 - **`CONTEXT-MAP.md`** at the repo root if it exists: it points at one `CONTEXT.md` per context. Read each one relevant to the topic.
-- **`docs/adr/`**: read ADRs that touch the area you're about to work in. In multi-context repos, also check `src/<context>/docs/adr/` for context-scoped decisions.
+- **`docs/adr/README.md`**: the index — every decision with a one-line conclusion and where it lives in
+  code. Read the entries touching the area you're about to work in, then open only those files.
+  Historical decisions are in `docs/adr/archive/` (superseded, or already folded into code/other docs).
+  In multi-context repos, also check `src/<context>/docs/adr/` for context-scoped decisions.
 
 If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/domain-modeling` skill (reached via `/grill-with-docs` and `/improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
 
@@ -18,8 +21,10 @@ Single-context repo (most repos):
 /
 ├── CONTEXT.md
 ├── docs/adr/
-│   ├── 0001-event-sourced-orders.md
-│   └── 0002-postgres-for-write-model.md
+│   ├── README.md                      ← index: id → file + one-line conclusion
+│   ├── 0001-event-sourced-orders.md   ← still binds the code
+│   └── archive/
+│       └── 0002-postgres-for-write-model.md   ← superseded / folded elsewhere
 └── src/
 ```
 

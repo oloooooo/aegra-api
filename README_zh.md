@@ -13,8 +13,10 @@
 - **图**（`graphs/`）：
   - `supervisor` — 主 agent，负责理解意图、拆清单、把活派给领域子 agent；
   - `supervisor` + `domain_agent` — 主 agent 与**唯一一个**领域子 agent 图；后者按 run config 里的 space 现读 prompt，所以用户有几个空间就有几个子 agent（不用改代码）。
-- **知识空间**：`graphs/okf/<空间名>/`，每个空间是一份 OKF（Markdown + YAML frontmatter，可带 xlsx 表格）。
+- **知识空间**：`knowledge/<空间名>/`，每个空间是一份 OKF（Markdown + YAML frontmatter，可带 xlsx 表格）。
 - **前端**（`web/`）：Vue 3 + Vite，左边会话、中间对话、右边面板（子任务实时进度 / 知识库文件树 / 定时任务）。
+- **文件上传**：md 进 LangGraph Store（白拿 fs 工具 + TTL）、xlsx 进对象存储（+ PG 元数据行），落点、限额、删除链见 [`UPLOAD.md`](./UPLOAD.md)。
+- **代码布局**：`custom/`（HTTP 面：`app.py` + `middleware/ api/ service/ db/`）、`graphs/`（图面：入口 `supervisor.py` / `space_agent.py` + `middleware/ access/ tools/ prompts/`）、`shared/`（两侧共用的纯逻辑：`config token outbox session/ knowledge/`），`knowledge/` 只放数据。依赖单向：两个包都只依赖 `shared/`，互不 import。详见 [`CONTEXT.md`](./CONTEXT.md) 的「代码布局」。
 
 ---
 
@@ -69,7 +71,7 @@ JWT_SECRET=换成长随机串
 PASSWORD_PEPPER=换成长随机串
 SESSION_SCOPE_SECRET=换成长随机串     # 子 agent 读会话文件用
 
-# --- C. 第三方：模型（OpenAI 兼容接口，graphs/llms.py 读取） ---
+# --- C. 第三方：模型（OpenAI 兼容接口，graphs/model.py 读取） ---
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.deepseek.com      # 用官方则可留空
 OPENAI_MODEL=deepseek-flash
@@ -129,9 +131,9 @@ update user_tables set is_super = true where identity = 'root';
 
 -- 2) 登记知识空间（path 相对项目根，不是绝对路径）
 insert into space(name, path) values
-  ('cbam-reporting', 'graphs/okf/cbam-reporting'),
-  ('hybrid-bonding', 'graphs/okf/hybrid-bonding'),
-  ('sbol3-synbio',   'graphs/okf/sbol3-synbio')
+  ('cbam-reporting', 'knowledge/cbam-reporting'),
+  ('hybrid-bonding', 'knowledge/hybrid-bonding'),
+  ('sbol3-synbio',   'knowledge/sbol3-synbio')
 on conflict (name) do nothing;
 
 -- 3) 把空间分配给 root（子 agent 只能看到派给它的那一个）
@@ -203,7 +205,7 @@ PYTHONPATH=. uv run uvicorn aegra_api.main:app --port 2026 --reload \
 | 多 worker | `uvicorn aegra_api.main:app --host 127.0.0.1 --port 2026 --workers 2 --loop asyncio:SelectorEventLoop`（需 Redis） | 吞吐上来；会话配额存数据库，多 worker 下仍然准确（ADR-0012） |
 
 两者都依赖 `REDIS_BROKER_ENABLED`：开了走 Redis worker 队列（可多进程、跨进程取消可靠），
-关了走进程内执行器（只能单进程，多进程下取消约 50% 失效，见 [adr/0009](./docs/adr/0009-worker-mode-requires-redis-broker.md)）。
+关了走进程内执行器（只能单进程，多进程下取消约 50% 失效，见 [adr/0009](./docs/adr/archive/0009-worker-mode-requires-redis-broker.md)）。
 
 ### 6.2 启动 Redis（多 worker 必需）
 
@@ -257,7 +259,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 | 前端登录后一片空白 | 后端没起 / `VITE_API_BASE` 指错；浏览器控制台看 `Failed to fetch` |
 | 改了 `graphs/` 下的图或 `aegra.json` 但没生效 | 后端启动时只读一次注册表，**重启服务** |
 | 子 agent 一直显示 `running` | 父 state 里的状态是快照（只在 check 时更新）。看真实状态用 `GET /custom/tasks/{id}` |
-| 主管说「`check_async_task` 不是有效的工具」/ `Available types:` 为空 | 那一轮 run 的 `user_spaces` 为空 → deepagents 不挂 `AsyncSubAgentMiddleware`（`specs` 空）。检查该账号在 `user_space` 表里有没有行（超级用户也要有）；唤醒 run 的 spaces 由 `custom/outbox_dispatcher.py::_parent_user` 现查库 |
+| 主管说「`check_async_task` 不是有效的工具」/ `Available types:` 为空 | 那一轮 run 的 `user_spaces` 为空 → deepagents 不挂 `AsyncSubAgentMiddleware`（`specs` 空）。检查该账号在 `user_space` 表里有没有行（超级用户也要有）；唤醒 run 的 spaces 由 `custom/service/outbox_dispatcher.py::_parent_user` 现查库 |
 | 子 agent 返回的卡片只有 `Result: (no output)` | 唤醒 run 取不到子线程正文。日志出现 `outbox_summary_fetch_failed` = 服务自调（`127.0.0.1:{PORT}`）失败或子线程不存在；没有该日志但仍是空 = specs 为空导致 guard 拿不到摘要。卡住时可让主管直接读空间文件（`ls` / `read_file`） |
 | 子 agent 返回后主管不说话（死锁） | Redis 挂了：唤醒 run 同样要入队才能执行。`docker ps` 看 redis6，按 §6.2 启动。旧版（notifier）只试一次所以会永久丢，现版会退避重试，Redis 恢复后自动补投 |
 | 端口 2026 被占 | `netstat -ano \| grep :2026` 找到 PID 后结束，或改 `.env` 的 `PORT`（前端同步改 `VITE_API_BASE`） |
@@ -272,7 +274,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 1. 在中间输入框问：「CBAM 默认排放因子里铝的因子是多少？」
 2. 主管先 `write_todos` 拆任务 → `start_async_task` 派给 `cbam-reporting` → 回你一句「已派给 CBAM 领域 agent（task_id: …）」。
 3. 右侧「任务」面板出现一张卡：状态从 `running` → `success`，卡片里能看到子 agent 的实时输出与工具步骤（`xlsx_info` / `xlsx_query`）。
-4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则由服务端的**发件箱分发者**（`custom/outbox_dispatcher.py`）开一轮新 run 把它叫醒（失败/崩溃会退避重试，不会丢）。所以你不用手动催「跑完了吗」；结果消息带的是子 agent 的**完整最后一条消息**，不用再让主管去取。
+4. 子 agent 跑完，结果会被送到主管面前：主管那次 run 的开始/结束时由 `AsyncTaskGuard` 写进它的 state（不打断、不开新 run）；主管已经答完、线程空闲则由服务端的**发件箱分发者**（`custom/service/outbox_dispatcher.py`）开一轮新 run 把它叫醒（失败/崩溃会退避重试，不会丢）。所以你不用手动催「跑完了吗」；结果消息带的是子 agent 的**完整最后一条消息**，不用再让主管去取。
 
 ## 10. 父子 agent 之间的信息流通
 
@@ -286,7 +288,7 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 └───┬──────────────────────────────────────────────────────────▲─────────────┘
     │ ① 任务描述（消息，单向给出）                                │ ③ 结果投递（消息，单向送回）
     │  runs.create(thread_id=子线程,                              │  主管 run 开始 → before_agent 写一条消息
-    │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → 发件箱分发者开新一轮（custom/outbox_dispatcher.py）
+    │    input={messages:[{role:user, content:description}]})     │  主管已空闲 → 发件箱分发者开新一轮（custom/service/outbox_dispatcher.py）
     │  ❗只传这段 description，父对话历史一概不传                    │    "[Async subagent 'X' has completed] Result: …"
     │                                                            │  结果 = 子 agent 最后一条消息原文（不截断）
     │ ② config.configurable（元数据，不进消息）                   │  身份：以父线程属主的身份建 run（服务端按 user_space 复原权限）
@@ -308,11 +310,11 @@ cd web && node scripts/smoke.mjs      # 20 个断言：登录→建会话→流�
 
 | # | 方向 | 载体 | 谁写 | 代码位置 | 失败时 |
 |---|---|---|---|---|---|
-| ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
+| ① | 父 → 子 | 子线程第一条 `user` 消息 | 拦截层 | `graphs/middleware/async_task_guard.py::_start_sync/_astart` | 工具返回 `Failed to launch…` |
 | ② | 父 → 子 | `config.configurable` | 拦截层 | 同上 `_config_for()` | 无权限时直接拒绝派活 |
-| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 发件箱分发者 | `async_task_guard.py::abefore_agent`（run 开始）/ `custom/outbox_dispatcher.py`（主管空闲或 run 期间完成的） | 分发者会重试；仍失败时靠 `check_async_task` 兜底 |
+| ③ | 子 → 父 | 父线程里一条消息（写 state 或新 run） | 主管侧 guard / 发件箱分发者 | `async_task_guard.py::abefore_agent`（run 开始）/ `custom/service/outbox_dispatcher.py`（主管空闲或 run 期间完成的） | 分发者会重试；仍失败时靠 `check_async_task` 兜底 |
 | ④ | 子 → 父 | 工具返回值 + state 更新 | 主管主动调用 | `deepagents/…/async_subagents.py::_build_check_result` | 返回 `Failed to get run status` |
-| ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/frontend_api.py::stream_task` | 发 `error` 帧后 `end` |
+| ⑤ | 子 → 前端 | SSE 帧 | 代理接口 | `custom/api/::stream_task` | 发 `error` 帧后 `end` |
 
 `update_async_task(task_id, message)` 是 ① 的复用：往**同一个**子线程追加一条 `user` 消息并开新 run（`multitask_strategy="interrupt"` 顶掉旧 run）。
 
@@ -353,8 +355,8 @@ run 会再试；只有“确实抢到”才投，所以同一个结果不会出�
 
 子 agent 自身不受影响：每个任务在自己的线程里独立执行，同时完成只是把结果一起排队送到主管。
 
-投递的重试退避与领取租约是 `custom/outbox_dispatcher.py` 的模块常量（`OUTBOX_*` 环境变量
-可覆盖），语义见 [adr/0010](./docs/adr/0010-task-delivery-idempotency.md)。
+投递的重试退避与领取租约是 `custom/service/outbox_dispatcher.py` 的模块常量，取值在根 `config.yaml` 的
+`outbox.*`（也可以用同名环境变量覆盖），语义见 [adr/0010](./docs/adr/0010-task-delivery-idempotency.md)。
 
 **仍然存在的空隙**：结果在主管 run 期间完成时不会插进那一轮，而要等 run 结束后另开一轮
 唤醒 run（多花一轮 LLM，换来模型能对结果说一句话）；主管一直忙且用户不停说话时，
@@ -387,14 +389,14 @@ curl -s -X POST http://127.0.0.1:2026/custom/spaces/create \
 ```
 
 接口会做三件事：名字校验（字母/数字/下划线/点/短横线，1–64 字符）、按知识空间根派生目录
-（`graphs/okf/bio-lab`，请求里的 `path` 已废弃）、目录里没有 `AGENT.md` 时从模板生成一份。
+（`knowledge/bio-lab`，请求里的 `path` 已废弃）、目录里没有 `AGENT.md` 时从模板生成一份。
 
 手写也行，但**三样缺一不可**：
 
 ```bash
-mkdir -p graphs/okf/bio-lab
+mkdir -p knowledge/bio-lab
 psql -U postgres -d aegra <<'SQL'
-insert into space(name, path) values ('bio-lab', 'graphs/okf/bio-lab') on conflict (name) do nothing;
+insert into space(name, path) values ('bio-lab', 'knowledge/bio-lab') on conflict (name) do nothing;
 -- 谁能用这个空间（不给就没任何人能派活给它）
 insert into user_space(identity, space_name) values ('root', 'bio-lab') on conflict do nothing;
 SQL
@@ -405,7 +407,7 @@ SQL
 
 ### 11.2 写 `AGENT.md`（唯一的 prompt 来源）
 
-`graphs/okf/bio-lab/AGENT.md`：frontmatter 的 `description` 是**主管选人用的描述**
+`knowledge/bio-lab/AGENT.md`：frontmatter 的 `description` 是**主管选人用的描述**
 （比正文更关键），正文是**子 agent 自己的 system prompt**。
 
 ```markdown
@@ -429,7 +431,7 @@ description: 生物实验室领域专家，运行在 bio-lab 知识空间。负�
 ### 11.3 放知识（磁盘）
 
 ```
-graphs/okf/bio-lab/
+knowledge/bio-lab/
 ├── AGENT.md          # 上面那份：description + system prompt
 ├── index.md          # 必备：OKF v0.2（frontmatter `okf_version: "0.2"` + 分组链接）
 └── xxx.md / *.xlsx   # 概念文档与表格
@@ -447,7 +449,7 @@ graphs/okf/bio-lab/
 ```bash
 # 空间能被解析、AGENT.md 读得到
 PYTHONPATH=. uv run python -c "
-from graphs.space_agents import load_agent_spec, has_tables
+from shared.knowledge.spec import load_agent_spec, has_tables
 d, p = load_agent_spec('bio-lab'); print(has_tables('bio-lab'), d[:40], len(p))"
 ```
 
@@ -460,20 +462,20 @@ d, p = load_agent_spec('bio-lab'); print(has_tables('bio-lab'), d[:40], len(p))"
 
 | 能力 | 来自 |
 |---|---|
-| 只能读本 space 的文件（含 ls/grep/glob 过滤） | `graphs/space_backend.py::SpaceBackend` |
+| 只能读本 space 的文件（含 ls/grep/glob 过滤） | `graphs/access/backend.py::SpaceBackend` |
 | 写操作全禁（纵深防御） | `FilesystemPermission(write=deny)` + backend |
-| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `custom/outbox_dispatcher.py`（主管空闲时开一轮唤醒 run） |
-| 任务级权限收窄（只下发本 space） | `graphs/async_task_guard.py::_config_for` |
-| 一个账号最多几个会话（`quota.max_threads_per_user`，默认 50，含子线程）+ 僵尸状态核实 | `custom/custom_auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
+| 完成/出错时把结果送回父线程 | `AsyncTaskGuard`（主管 run 首尾写 state）+ `custom/service/outbox_dispatcher.py`（主管空闲时开一轮唤醒 run） |
+| 任务级权限收窄（只下发本 space） | `graphs/middleware/async_task_guard.py::_config_for` |
+| 一个账号最多几个会话（`quota.max_threads_per_user`，默认 50，含子线程）+ 僵尸状态核实 | `custom/middleware/auth.py::_quota_threads_create` + `AsyncTaskGuard._refreshed_*` |
 | 前端能实时看这个子 agent 的输出 | `runs.create(stream_mode=["messages","custom"])` |
-| prompt 与描述 | `<space>/AGENT.md`（`graphs/space_agents.py`） |
+| prompt 与描述 | `<space>/AGENT.md`（`shared/knowledge/spec.py`） |
 
 ### 11.11 常见坑
 
 | 现象 | 原因 |
 |---|---|
 | 主管永远不派给新 agent | 没给这个用户分配 space，或 `AGENT.md` 的 `description` 写得太宽/太窄 |
-| `Unknown async subagent type` | `space` 表没登记，或表里有但目录 `graphs/okf/<space>/` 不存在（会被跳过并记日志） |
+| `Unknown async subagent type` | `space` 表没登记，或表里有但目录 `knowledge/<space>/` 不存在（会被跳过并记日志） |
 | `用户没有空间 'bio-lab' 的权限` | `user_space` 表没登记（§11.1） |
 | 子 agent 说「无权访问 /bio-lab/...」 | 磁盘目录不存在，或 `space.path` 与实际目录不一致（由接口建的不会错） |
 | 子 agent 读不到 xlsx 工具 | 空间里没有 `.xlsx`（按文件自动决定） |

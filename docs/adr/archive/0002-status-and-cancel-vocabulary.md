@@ -1,5 +1,7 @@
 # 服务端不引入 cancelled；取消与 HITL 共用 interrupted，用 interrupted_by 归因
 
+> **已归档**：本文是历史记录，不再约束当前代码；现行决定见 [`../README.md`](../README.md) 总表。
+
 三套词表打架：agent-protocol 0.1.6 与官方 Agent Server 的 `Run.status` 枚举都没有 `cancelled`（`[pending, running, error, success, timeout, interrupted]`）；deepagents 客户端把 `cancelled` 写在自己本地的 task 缓存里（`_TERMINAL_STATUSES`），且 cancel 工具**从不读服务端响应**；aegra 的 cancel 端点则收 `action=cancel|interrupt`（两者行为相同）且没有 `rollback`。
 
 **决定**：服务端 `Run.status` 保持规范枚举（含与生产一致的 `running`），不引入 `cancelled`；取消与 HITL 都落 `interrupted`，新增非规范字段 `interrupted_by: "cancel" | "hitl" | null` 归因；cancel 动作词表取规范的 `{interrupt, rollback}`，`cancel` 作为 `interrupt` 的别名保留，默认值从 `cancel` 改为 `interrupt`；`rollback` 维持 422 不实现。
