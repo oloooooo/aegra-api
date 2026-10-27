@@ -22,6 +22,7 @@ spaces 解析见 ``space_access.allowed_spaces``：无鉴权上下文（本地 d
 
 from __future__ import annotations
 
+import posixpath
 from pathlib import Path
 
 import structlog
@@ -30,7 +31,6 @@ from deepagents.backends.protocol import (
     DeleteResult,
     EditResult,
     FileDownloadResponse,
-    FileUploadResponse,
     FileUploadResponse,
     GlobResult,
     GrepResult,
@@ -47,19 +47,28 @@ logger = structlog.getLogger(__name__)
 _INTERNAL_PREFIXES = ("/large_tool_results", "/conversation_history", "/blobs")
 
 
+def _norm(vpath: str) -> str:
+    """折叠 `.`/`..`：`/space-a/../secret/x` 要先变成 `/secret/x` 再判首段。
+
+    只靠下游 backend 拦 `..` 不够（存储实现不相同，对象存储那边是 key 前缀），
+    判定层自己折好才不会漏。
+    """
+    return posixpath.normpath("/" + vpath.strip().replace("\\", "/").lstrip("/"))
+
+
 def _first_segment(vpath: str) -> str:
     """/space1/x.md -> "space1"；"/" -> ""。"""
-    return vpath.strip("/").split("/", 1)[0]
+    return _norm(vpath).strip("/").split("/", 1)[0]
 
 
 def _is_internal(vpath: str) -> bool:
-    v = "/" + vpath.strip("/")
+    v = _norm(vpath)
     return any(v == p or v.startswith(p + "/") for p in _INTERNAL_PREFIXES)
 
 
 def _is_root_file(vpath: str) -> bool:
     """单段路径且指向根下真实文件（根散文件共享只读）。"""
-    return "/" not in vpath.strip("/")
+    return "/" not in _norm(vpath).strip("/")
 
 
 class SpaceGuard:

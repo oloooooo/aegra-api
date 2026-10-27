@@ -3,7 +3,7 @@ from typing import Annotated
 import asyncio
 
 from deepagents import AsyncSubAgent, create_deep_agent
-from deepagents.backends import CompositeBackend, StoreBackend
+from deepagents.backends import CompositeBackend
 from deepagents.middleware import FilesystemPermission
 import dotenv
 
@@ -27,12 +27,11 @@ class deepAgentContext(BaseModel):
 from langchain.tools import InjectedToolArg, tool, ToolRuntime
 from langgraph.graph.state import RunnableConfig
 from langchain.agents.middleware import TodoListMiddleware
-from graphs.access import session_scope
+from graphs.access.factory import session_backend
 from graphs.middleware.async_task_guard import AsyncTaskGuard
 from graphs.middleware.session_files import SessionFilesMiddleware
 from graphs.access.spaces import allowed_spaces
-from shared.knowledge.spec import knowledge_root, list_spaces, load_agent_spec, space_dir
-from graphs.access.backend import SpaceBackend
+from shared.knowledge.spec import list_spaces, load_agent_spec, space_dir
 from graphs.prompts import MAIN_SYSTEM_PROMPT
 from graphs.tools import MAIN_TOOLS, XLSX_TOOLS
 
@@ -111,26 +110,9 @@ def domain_specs(config: RunnableConfig) -> dict[str, dict]:
     return specs
 
 
-def _uploads_namespace(_runtime: object) -> tuple[str, ...]:
-    """`/uploads/` 路由的 store 命名空间（ADR-0013 / ADR-0015 §4.1）。
-
-    主管 run：身份与线程都取服务端注入的 config（不用 ``runtime.context``，那是客户端可控的）。
-    子 agent run：取派活时 `AsyncTaskGuard` 签发的 `session_scope`（验签后）——所以同一条
-    会话里的 md 对子 agent 也可读，但它读不到别的主管的会话。
-    """
-    return session_scope.uploads_namespace()
-
-
 def supervisor_backend() -> CompositeBackend:
-    """主管的存储路由：默认仍按 space 隔离，`/uploads/` 走本会话的 store 命名空间。
-
-    包在外面而不是改 `SpaceBackend`：后者是「这次 run 能读哪些 space」的判定单点（ADR-0005），
-    路由是另一件事；`CompositeBackend` 是纯前缀匹配，`/uploads/x.md` 根本不会到它那里。
-    """
-    return CompositeBackend(
-        default=SpaceBackend(root_dir=knowledge_root()),
-        routes={"/uploads/": StoreBackend(namespace=_uploads_namespace)},
-    )
+    """主管的存储路由：见 `graphs/access/factory.py`（图和 xlsx 工具共用同一个装配点）。"""
+    return session_backend()
 
 
 def graph(config: RunnableConfig):  # noqa: ANN201 — 返回编译后的图
@@ -141,7 +123,7 @@ def graph(config: RunnableConfig):  # noqa: ANN201 — 返回编译后的图
         system_prompt=MAIN_SYSTEM_PROMPT,
         tools=[*MAIN_TOOLS, *XLSX_TOOLS],
         # 按空间隔离的 backend + 会话文件的 /uploads 路由（ADR-0013）
-        backend=supervisor_backend(),
+        backend=session_backend(),
         context_schema=deepAgentContext,
         # 拆任务清单（write_todos）；guard 拦截 start/update_async_task：按 spec 绑定的
         # space 经 run config 转发给子 agent（ADR-0005）+ 并发上限
