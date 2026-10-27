@@ -1,12 +1,13 @@
-"""会话文件上传的 e2e（ADR-0013）：真服务器 + 真 Postgres + 真 Redis。
+"""会话文件上传的 e2e（ADR-0015 / ADR-0017）：真服务器 + 真 Postgres + 真对象存储。
 
-不用图跑一轮（那要 LLM，慢且不稳）：断言分两层——
-接口层面的行为，以及 store 表里的真实落库（prefix / key / ttl_minutes / 过期时间）。
+不用图跑一轮（那要 LLM，慢且不稳）：断言分两层——接口层面的行为，以及真实落库
+（PG `session_object` 行 + 对象存储里的字节）。
+
+**需要对象存储**：md 与 xlsx 现在同一条链，没有 `s3.endpoint` 时上传接口整体 503，
+所以涉及字节的断言在未配置对象存储时会 skip（接口层的 415/422/404 仍可跑）。
 """
 
 from __future__ import annotations
-
-import hashlib
 
 import uuid
 from typing import Any
@@ -16,6 +17,7 @@ import psycopg
 import pytest
 
 from aegra_api.settings import settings
+from shared.session import blobs
 
 pytestmark = pytest.mark.e2e
 
@@ -50,18 +52,25 @@ async def _create_thread(http: httpx.AsyncClient, token: str) -> str:
     return r.json()["thread_id"]
 
 
-def _namespace(identity: str, thread_id: str) -> str:
-    """与 shared/session/store.py 同一套推导：点点拼成 store 的 prefix 列。"""
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-    return f"uploads.{digest}.{thread_id}"
-
-
-def _store_rows(prefix: str) -> list[tuple[str, Any, Any, Any]]:
+def _ledger(identity: str, thread_id: str) -> list[tuple[str, Any, str, int]]:
+    """按台账读这个会话的文件：(name, space, object_key, size_bytes)。"""
     with psycopg.connect(settings.db.database_url_sync) as conn:
         return conn.execute(
-            "SELECT key, ttl_minutes, expires_at, updated_at FROM store WHERE prefix = %s ORDER BY key",
-            (prefix,),
+            "SELECT name, space, object_key, size_bytes FROM session_object"
+            " WHERE owner_identity = %s AND thread_id = %s ORDER BY name",
+            (identity, thread_id),
         ).fetchall()
+
+
+def _object(key: str) -> bytes | None:
+    got = blobs.get_object(key)
+    return None if got is None else got[0]
+
+
+@pytest.fixture(autouse=True)
+def _require_object_storage():
+    if not blobs.configured():
+        pytest.skip("对象存储未配置（s3.endpoint 为空）：上传接口本来就不可用")
 
 
 async def _upload(
@@ -85,23 +94,25 @@ async def http():
         yield client
 
 
-async def test_upload_lands_in_store_with_ttl(http: httpx.AsyncClient) -> None:
+async def test_upload_lands_in_ledger_and_object_storage(http: httpx.AsyncClient) -> None:
     who = await _register_and_login(http)
     thread_id = await _create_thread(http, who["token"])
 
-    r = await _upload(http, who["token"], thread_id, "会议纪要.md", "# 结论\n用 A 方案\n".encode())
+    content = "# 结论\n用 A 方案\n".encode()
+    r = await _upload(http, who["token"], thread_id, "会议纪要.md", content)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["path"] == "/uploads/会议纪要.md"
     assert body["name"] == "会议纪要.md"
-    assert body["bytes"] > 0
-    assert body["ttl_minutes"] >= 1
+    assert body["bytes"] == len(content)
+    assert "ttl_minutes" not in body, "md 不再有 TTL（ADR-0017 决定 10）"
 
-    rows = _store_rows(_namespace(who["identity"], thread_id))
-    assert [row[0] for row in rows] == ["/会议纪要.md"], "key 必须带前导斜杠，否则 /uploads/x.md 读不到"
-    _, ttl_minutes, expires_at, _ = rows[0]
-    assert ttl_minutes == body["ttl_minutes"]
-    assert expires_at is not None, "必须写 expires_at，否则 sweeper 无从清理（ADR-0013）"
+    rows = _ledger(who["identity"], thread_id)
+    assert [row[0] for row in rows] == ["会议纪要.md"]
+    name, space, key, size = rows[0]
+    assert space is None, "md 不属于任何空间"
+    assert key.startswith("uploads/") and key.endswith("/会议纪要.md")
+    assert size == len(content) and _object(key) == content
 
 
 async def test_reupload_same_name_overwrites(http: httpx.AsyncClient) -> None:
@@ -109,9 +120,15 @@ async def test_reupload_same_name_overwrites(http: httpx.AsyncClient) -> None:
     thread_id = await _create_thread(http, who["token"])
 
     await _upload(http, who["token"], thread_id, "a.md", b"v1")
+    first = _ledger(who["identity"], thread_id)[0][2]
     await _upload(http, who["token"], thread_id, "a.md", b"v2")
-    rows = _store_rows(_namespace(who["identity"], thread_id))
+
+    rows = _ledger(who["identity"], thread_id)
     assert len(rows) == 1, "同名覆盖（PUT 语义），不做版本链"
+    second = rows[0][2]
+    assert second != first, "每次上传新 key"
+    assert _object(second) == b"v2"
+    assert _object(first) is None, "旧对象在提交成功后删掉"
 
 
 async def test_rejects_non_md(http: httpx.AsyncClient) -> None:
@@ -136,24 +153,24 @@ async def test_rejects_foreign_thread(http: httpx.AsyncClient) -> None:
     # 别人的会话一律 404：不给"存在但无权"的信号
     r = await _upload(http, other["token"], thread_id, "a.md", b"x")
     assert r.status_code == 404
-    assert _store_rows(_namespace(other["identity"], thread_id)) == []
+    assert _ledger(other["identity"], thread_id) == []
 
 
 async def test_delete_thread_clears_uploads(http: httpx.AsyncClient) -> None:
     who = await _register_and_login(http)
     thread_id = await _create_thread(http, who["token"])
     await _upload(http, who["token"], thread_id, "a.md", b"hello")
-    prefix = _namespace(who["identity"], thread_id)
-    assert len(_store_rows(prefix)) == 1
+    key = _ledger(who["identity"], thread_id)[0][2]
+    assert _object(key) == b"hello"
 
     r = await http.delete(f"/threads/{thread_id}", headers=_auth(who["token"]))
     assert r.status_code == 200, r.text
-    # 遮挡路由生效才会清：只靠孤儿保留期的话这里还有行
-    assert _store_rows(prefix) == []
+    assert _ledger(who["identity"], thread_id) == [], "先删行"
+    assert _object(key) is None, "再删对象"
 
 
-async def test_store_prefix_is_hashed_identity(http: httpx.AsyncClient) -> None:
-    """身份在命名空间里是 hash：中文账号名也过得了 StoreBackend 的 ASCII 校验。"""
+async def test_non_ascii_identity_can_upload(http: httpx.AsyncClient) -> None:
+    """身份允许中文（对象 key 里没有身份，所以不可能撞上 ASCII 限制）。"""
     identity = f"张三-{uuid.uuid4().hex[:6]}"
     password = _password()
     r = await http.post(
@@ -161,84 +178,36 @@ async def test_store_prefix_is_hashed_identity(http: httpx.AsyncClient) -> None:
         json={"identity": identity, "display_name": "中文", "password": password},
     )
     assert r.status_code == 200, r.text
-    token = (
-        await http.post("/custom/login", json={"identity": identity, "password": password})
-    ).json()["access_token"]
+    token = (await http.post("/custom/login", json={"identity": identity, "password": password})).json()[
+        "access_token"
+    ]
 
     thread_id = await _create_thread(http, token)
     r = await _upload(http, token, thread_id, "报告.md", b"x")
     assert r.status_code == 200, r.text
-
-    prefix = _namespace(identity, thread_id)
-    assert identity not in prefix and prefix.startswith("uploads.")
-    assert len(_store_rows(prefix)) == 1
+    assert len(_ledger(identity, thread_id)) == 1
 
 
-def test_store_sweeps_expired_items() -> None:
-    """落库带 expires_at 只是半步；物理删除靠 sweeper（ADR-0013 / Q21）。
+async def test_upload_is_readable_through_uploads_backend(http: httpx.AsyncClient) -> None:
+    """真台账 + 真对象存储 + 真 backend：证明写进去的东西 agent 下得出来。
 
-    这里不依赖 60 分钟的 tick：手写一行已过期的数据，再直接调 sweep_ttl()，
-    验证 sweep 在当前 schema 上真的删得掉（也是 ttl_config 形状的验证）。
+    这条不经过模型：台账里没有这个会话的「作用域」就查不到 key，key 写错就读不到字节。
     """
-    import uuid as _uuid
-
-    from langgraph.store.base import TTLConfig
-    from langgraph.store.postgres import PostgresStore
-    from psycopg.types.json import Jsonb
-
-    prefix = f"uploads.sweeptest.{_uuid.uuid4().hex[:8]}"
-    with psycopg.connect(settings.db.database_url_sync) as conn:
-        conn.execute(
-            "INSERT INTO store (prefix, key, value, expires_at)" " VALUES (%s, %s, %s, now() - interval '1 hour')",
-            (prefix, "/old.md", Jsonb({"content": "x", "encoding": "utf-8"})),
-        )
-        conn.commit()
-
-    with PostgresStore.from_conn_string(
-        settings.db.database_url_sync,
-        ttl=TTLConfig(omit_expired=True, sweep_interval_minutes=60),
-    ) as store:
-        assert store.sweep_ttl() >= 1
-
-    with psycopg.connect(settings.db.database_url_sync) as conn:
-        left = conn.execute("SELECT count(*) FROM store WHERE prefix = %s", (prefix,)).fetchone()[0]
-    assert left == 0
-
-
-async def test_upload_is_readable_through_supervisor_backend(http: httpx.AsyncClient) -> None:
-    """真 store + 真 CompositeBackend：证明写进去的东西 agent 用 read_file 读得出来。
-
-    这条不经过模型：key 少一个前导斜杠、value 不符合 FileData 形状，都会在这里挂。
-    """
-    from deepagents.backends import CompositeBackend, StoreBackend
-    from langgraph.store.postgres import PostgresStore
-
-    from shared.session.store import session_namespace
-    from graphs.supervisor import supervisor_backend
+    import graphs.access.s3_backend as sb
 
     who = await _register_and_login(http)
     thread_id = await _create_thread(http, who["token"])
     await _upload(http, who["token"], thread_id, "readme.md", b"# T body")
 
-    # 用同步 store：Windows 的 ProactorEventLoop 跑不了 psycopg 的 async 连接（见 README #513）
-    with PostgresStore.from_conn_string(settings.db.database_url_sync) as store:
-        real = supervisor_backend()
-        # 只替换 uploads 路由的 store（真进程里由 runtime 注入），namespace 推导保持一致
-        backend = CompositeBackend(
-            default=real.default,
-            routes={
-                "/uploads/": StoreBackend(
-                    namespace=lambda _rt: session_namespace(who["identity"], thread_id),
-                    store=store,
-                )
-            },
-        )
-        result = backend.read("/uploads/readme.md")
-        assert result.error is None, result.error
-        assert result.file_data is not None
-        assert "body" in result.file_data["content"]
+    # 图外没有 run config：直接把「我这次 run 是谁」喂给 backend 的取作用域入口
+    original = sb.session_scope.current_config
+    sb.session_scope.current_config = lambda: {
+        "configurable": {"thread_id": thread_id, "langgraph_auth_user": {"identity": who["identity"]}}
+    }
+    try:
+        res = await sb.UploadsBackend().adownload_files(["/readme.md"])
+    finally:
+        sb.session_scope.current_config = original
 
-        # ls /uploads 也要看得见（清单注入靠 store.search，这条靠 backend.ls）
-        listing = backend.ls("/uploads")
-        # CompositeBackend 会把 route 前缀拼回路径
-        assert any(e["path"] == "/uploads/readme.md" for e in (listing.entries or [])), listing
+    assert res[0].error is None, res[0].error
+    assert res[0].content == b"# T body"
