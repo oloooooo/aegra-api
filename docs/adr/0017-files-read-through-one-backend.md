@@ -78,6 +78,17 @@
 `S3Backend._key_of` 对它们走 `artifacts/` 前缀，`_keys()` 同时 LIST 两个前缀——所以框架驱逐后
 仍能按路径 `read` 回来，但 `okf/` 里查不到它们。
 
+### 9. `read`/`ls`/`download_files` 不做全量 LIST
+
+只有 `glob`/`grep` 需要「整个前缀的 key 表」。`read_file`、`ls`、`download_files` 的 key 都能
+由虚拟路径算出来，所以：
+
+- `read`/`download_files` 只把被问的那一个 key 交给 `_ObjectTree`（存在与否由 GET 回答）
+- `ls` 走单次**分隔** LIST（`blobs.list_dir`），只取这一层
+
+实测（本地 SeaweedFS，2000 个对象 / 100 目录 × 20 文件）：`read` 122 ms → **1.8 ms**，
+`ls` 132 ms → **2.9 ms**。这是纯浪费的账：一次 `read_file` 不值得先付一遍全空间的 LIST。
+
 ## 取舍
 
 | 取舍点 | 选了什么 | 为什么不选另一个 |
@@ -97,10 +108,14 @@
 2. **`edit` 的 CAS 只在支持条件写的对象存储上成立**。SeaweedFS 自 PR #7154 起支持
    `If-Match`/`If-None-Match`（filer 同一把锁内判定+写入）；**别的 S3 实现若忽略该头**，
    `edit` 静默退化成 last-write-wins。`edit` 冲突只重试 1 次，之后把「文件已被改过」交给模型重读。
-3. **`ls` 每次 LIST 整个前缀**：`S3Backend._keys()` = `list_tree("okf/")` + `list_tree("artifacts/")`，空间对象数大时
-   一次 ls 就是全量 LIST。升级触发：单空间对象数 > ~1 万或 LIST 耗时 > 200 ms。
-4. **`grep` 是 N+1 GET**：先 LIST 再逐个 GET 文本文件。`max_count` 只省掉「已满足后不再取」。
-   大文件量下要加 per-run 的 ETag→内容缓存。
+3. **`glob`/`grep` 仍付一次全空间 LIST**（`read`/`ls`/`download_files` 已不再——见决定 9）。
+   一次 `list_tree("okf/")` 在 2000 个对象上是 115 ms 且随对象数线性增长；`glob`/`grep` 本身
+   就是「扫一批」，暂时接受。升级触发：单空间对象数 > ~1 万，或 LIST > 500 ms 时改成按子路径
+   分段 LIST + etag 缓存。
+4. **`grep` 是 N+1 GET**：文本候选逐个 GET（本地 SeaweedFS 单次 GET ~1.8 ms）。
+   已按 path 圈定候选（原来 `grep /空间/子目录/` 会把**整个前缀**的字节都 GET 一遍，
+   2000 个对象实测 3.95 s → 圈定后 172 ms）。`max_count` 只省掉「已满足后不再取」。
+   大文件量下的下一步是 per-run 的 ETag→内容缓存。
 5. **`has_tables()` 已统一为递归**（原缺陷：两种形态都只看 `<space>/` 一层，表放子目录就不装
    xlsx 四件套——agent 的失败表现是“我没有读表工具”，不报错、最难排查）。现在两模式都递归
    扫整棵子树；代价是每次 run 多一次 LIST（`s3fs`）/目录遍历（本地）。

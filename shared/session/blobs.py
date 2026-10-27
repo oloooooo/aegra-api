@@ -191,6 +191,33 @@ def list_tree(prefix: str) -> dict[str, dict[str, Any]]:
         token = page.get("NextContinuationToken")
 
 
+def list_dir(prefix: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """只列**一层**：`(子目录前缀, {key: {size, etag, modified}})`。
+
+    分隔符 LIST：一次只回这一层的对象与子目录前缀，不拉整棵树——`ls` 在对象多的时候
+    不能是 O(全空间)（ADR-0017 缺陷 3）。
+    """
+    prefix = prefix.rstrip("/") + "/" if prefix else prefix
+    dirs: list[str] = []
+    files: dict[str, dict[str, Any]] = {}
+    token: str | None = None
+    while True:
+        kw: dict[str, Any] = {"Bucket": bucket(), "Prefix": prefix, "Delimiter": "/"}
+        if token:
+            kw["ContinuationToken"] = token
+        page = client().list_objects_v2(**kw)
+        dirs.extend(p["Prefix"] for p in page.get("CommonPrefixes", []) if p.get("Prefix"))
+        for o in page.get("Contents", []):
+            files[o["Key"]] = {
+                "size": int(o.get("Size") or 0),
+                "etag": o.get("ETag") or "",
+                "modified": o.get("LastModified"),
+            }
+        if not page.get("IsTruncated"):
+            return dirs, files
+        token = page.get("NextContinuationToken")
+
+
 def exists_prefix(prefix: str) -> bool:
     """前缀下有没有对象（对象存储没有空目录，目录的「存在」就是有东西）。"""
     page = client().list_objects_v2(Bucket=bucket(), Prefix=prefix, MaxKeys=1)
@@ -389,6 +416,7 @@ __all__ = [
     "exists_prefix",
     "get",
     "get_object",
+    "list_dir",
     "list_tree",
     "object_dir",
     "put_bytes",

@@ -20,6 +20,13 @@ _FILES = {
 }
 
 
+def _dir_listing(prefix: str) -> tuple[list[str], dict[str, dict[str, int]]]:
+    """模拟分隔 LIST：只回这一层的子目录与文件。"""
+    dirs = sorted({k[: k.index("/", len(prefix)) + 1] for k in _FILES if k.startswith(prefix) and "/" in k[len(prefix) :]})
+    files = {k: v for k, v in _FILES.items() if k.startswith(prefix) and "/" not in k[len(prefix) :]}
+    return dirs, files
+
+
 @pytest.fixture
 def backend(monkeypatch: pytest.MonkeyPatch) -> sb.S3Backend:
     # 空间清单来自配置（默认只有一个空间），这里不需要它：判定规则本身由 test_space_guard 守
@@ -27,6 +34,7 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> sb.S3Backend:
     monkeypatch.setattr(backend_mod, "spaces_from_config_or_runtime", lambda: None)
     monkeypatch.setattr(sb, "spaces_from_config_or_runtime", lambda: None)
     monkeypatch.setattr(sb.blobs, "list_tree", lambda prefix: {k: v for k, v in _FILES.items() if k.startswith(prefix)})
+    monkeypatch.setattr(sb.blobs, "list_dir", _dir_listing)
     monkeypatch.setattr(sb, "_get_bytes", lambda obj: b"PK\x03\x04zipish" if obj.key.endswith(".xlsx") else b"hello")
     return sb.S3Backend()
 
@@ -60,3 +68,24 @@ def test_evicted_files_live_outside_the_space_prefix(backend: sb.S3Backend) -> N
     assert backend.read("/large_tool_results/r1.txt").file_data is not None
     # 空间可见性判定对内部前缀单独放行（`_is_internal`），与 okf/ 前缀无关
     assert backend._gate("/large_tool_results/r1.txt") is None
+
+
+def test_read_and_download_do_not_list(backend: sb.S3Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`read`/`download_files` 不能付全量 LIST 的账（2000 个对象实测 115ms，单 GET 2ms）。"""
+    monkeypatch.setattr(sb.blobs, "list_tree", lambda _p: pytest.fail("read/download 不该 LIST"))
+    assert backend.read("/sp/a.md").file_data is not None
+    assert backend.download_files(["/sp/a.md"])[0].content == b"hello"
+
+
+def test_grep_fetches_only_files_under_the_given_path(backend: sb.S3Backend, monkeypatch: pytest.MonkeyPatch) -> None:
+    """grep 一个子目录只能下去这个子目录的字节（原来会把整个前缀 GET 一遍）。"""
+    fetched: list[str] = []
+
+    def _fake(obj: sb._Obj) -> bytes:
+        fetched.append(obj.key)
+        return b"hit"
+
+    monkeypatch.setattr(sb, "_get_bytes", _fake)
+    result = backend.grep("hit", "/sp/sub/")
+    assert fetched == ["okf/sp/sub/deep.md"]
+    assert [m["path"] for m in result.matches or []] == ["/sp/sub/deep.md"]

@@ -223,8 +223,14 @@ class _ObjectTree:
         vpath = _vpath(path)
         if err := self._gate(vpath):
             return GrepResult(error=err, matches=[])
-        # 只下文本候选：xlsx/图片/视频进 grep 既慢又只会解码失败
-        cand = {p: o for p, o in keys.items() if o.size and self._shown(p) and not _is_binary(p, b"")}
+        # 只下文本候选：先按 path 圈定范围（否则 grep 一个子目录会下去整个前缀的字节），
+        # 再排除 xlsx/图片/视频（进 grep 既慢又只会解码失败）
+        base = "/" if vpath == "/" else vpath + "/"
+        cand = {
+            p: o
+            for p, o in keys.items()
+            if (p == vpath or p.startswith(base)) and o.size and self._shown(p) and not _is_binary(p, b"")
+        }
         if glob:
             found = self._match(cand, glob, vpath)
             if isinstance(found, GlobResult):
@@ -306,6 +312,14 @@ class S3Backend(SpaceGuard, _ObjectTree, BackendProtocol):
         spaces = spaces_from_config_or_runtime()
         return True if spaces is None else self._visible(vpath, spaces)
 
+    def _one(self, vpath: str) -> dict[str, _Obj]:
+        """只给被问的那一个 key：key 由路径算出来，存在与否交给 GET。
+
+        全量 `_keys()` 是 O(整个前缀) 的 LIST（2000 个对象实测 115ms，单个 GET 2ms），
+        `read`/`download_files` 用不起它（ADR-0017 缺陷 3）。
+        """
+        return {vpath: _Obj(self._key_of(vpath))}
+
     def _gate(self, vpath: str) -> str | None:
         return self._check_read(vpath)
 
@@ -323,10 +337,35 @@ class S3Backend(SpaceGuard, _ObjectTree, BackendProtocol):
     # ---------- 协议：读家族 ----------
 
     def ls(self, path: str) -> LsResult:
-        return self._ls(self._keys(), path)
+        return self._ls_layer(path)
+
+    def _ls_layer(self, path: str) -> LsResult:
+        """单次分隔 LIST：只取这一层。全量 `_keys()` 是 O(整个空间)，`ls`/`read` 用不起。"""
+        vpath = _vpath(path)
+        if err := self._gate(vpath):
+            return LsResult(error=err)
+        top = self._artifacts if _is_internal(vpath) else self._prefix
+        prefix = self._key_of(vpath).rstrip("/") + "/" if vpath != "/" else top
+        dirs, files = blobs.list_dir(prefix)
+        entries: list[FileInfo] = []
+        for key in sorted(dirs):
+            v = "/" + key[len(top) :]
+            if self._shown(v):
+                entries.append(FileInfo(path=v, is_dir=True, size=0))
+        for key, meta in sorted(files.items()):
+            v = "/" + key[len(top) :]
+            if self._shown(v):
+                entries.append(FileInfo(path=v, is_dir=False, size=int(meta.get("size") or 0)))
+        entries.sort(key=lambda e: e["path"])  # 与 FilesystemBackend 同序（纯按虚拟路径排）
+        if not entries and vpath != "/":
+            # 不是目录：区分「路径不存在」与「路径是个文件」（对象存储两者都是“有/没对象”）
+            if blobs.stat(self._key_of(vpath)) is not None:
+                return LsResult(error=f"Path '{vpath}' is not a directory")
+            return LsResult(error=f"Path '{vpath}' not found")
+        return LsResult(entries=entries)
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
-        return self._read(self._keys(), file_path, offset, limit)
+        return self._read(self._one(_vpath(file_path)), file_path, offset, limit)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         return self._glob(self._keys(), pattern, path)
@@ -342,7 +381,7 @@ class S3Backend(SpaceGuard, _ObjectTree, BackendProtocol):
         return self._grep(self._keys(), pattern, path, glob, max_count=max_count)
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        return self._download(self._keys(), paths)
+        return self._download({v: _Obj(self._key_of(v)) for v in map(_vpath, paths)}, paths)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         return self._upload(files)
