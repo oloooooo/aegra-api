@@ -118,15 +118,81 @@ agent 视角                       真实落点
 `graphs/access/session_scope.py`）：它读得到本会话的 `/uploads/*`，读不到别的主管的会话。
 两条载体都走 `graphs/access/factory.py::session_backend()` —— 读文件只有一个入口（ADR-0017）。
 
-## 5. 删除与垃圾：三个责任人
+### 可见性边界
 
-| 什么 | 谁负责 |
+| 谁 | 看到清单 | 看到内容 | 靠什么 |
+|---|---|---|---|
+| 主管 agent | 是（md + xlsx，最多 20 条，超出提示 `ls /uploads/`） | 是 | 清单由 `SessionFilesMiddleware` 每轮 run 起始查一次台账；内容走 `/uploads/` 路由 |
+| 子 agent（被派活） | **否** | 是（仅本会话） | 清单要自己 `ls /uploads/` 或由主管在派活文本里点名；内容靠派活签发的 `session_scope` |
+| 同用户的另一个会话 | 否 | 否 | 台账按 `(identity, thread_id)` 查，别的会话连 key 都拿不到 |
+| 另一个用户 | 否 | 否 | 上传接口强制 thread ownership（不是你的 → 404）；空间内容另有 `SpaceGuard` |
+
+两件事容易搞混：
+
+- **清单注入 ≠ 后端能力**。清单是「告诉 agent 有什么」，后端是「按路径取字节」。主管两样都有，
+  子 agent 只有后者。所以子 agent 不知道有哪些文件，除非它 `ls`——这不是 bug，是权限收窄。
+- **看不见 ≠ 不存在**。`ls /uploads/` 只列台账里的行；对象存储里可能有孤儿对象（删会话失败、
+  上传中途失败留下的），对 agent 一律不可见，靠 `scripts/reap_orphans.py` 对账。
+
+**写入恒被拒**：`/uploads/` 路由对 `write_file` / `edit_file` / `delete` 一律回一句
+「会话上传目录只读：请走上传接口」。新增与替换只有 HTTP 上传一条路（ADR-0017 决定 8）。
+
+## 5. agent 怎么读 xlsx
+
+`read_file('/uploads/x.xlsx')` 只回一句「这是二进制表格，用 xlsx 工具」——zip 里的字节对模型没用。
+真正的路是四个工具：`xlsx_info` / `xlsx_query` / `xlsx_search` / `xlsx_profile`（`graphs/tools/xlsx/`）。
+
+```
+工具调用
+  └─ _fetch(path, runtime)                每次调用都重新取字节：文件换了也不会答旧表
+       ├─ backend.adownload_files([path])   /uploads/ 路由 → 查台账拿 key → 取原始字节
+       ├─ store.cache_bytes(path, data)     落 {xlsx.cache_dir}/{sha16}{后缀}（tmp + 原子替换）
+       └─ index.ensure(xlsx, cache_dir, sha16, header)
+            ├─ 先探单元格数（openpyxl read_only，不把表读进内存）> xlsx.max_cells → 直接报错
+            ├─ openpyxl 逐 sheet → pandas → sqlite：meta / col_meta / s0..sN
+            └─ 落 {cache_dir}/{sha16}-h{header}-v{BUILD}.sqlite（建临时文件再原子换名）
+  └─ 同步实现丢线程池（sqlite 阻塞）；异常转成错误文本返回，不炸图
+```
+
+- **索引键 = 内容 sha16 + header 行 + BUILD**。内容变 → sha 变 → 新索引，永远不会拿旧表回答；
+  `header` 指「表头在第几行」，不同 header 是不同索引，互不覆盖。
+- **建索引很贵**（实测 129 MB / 41.7 s），所以 `ensure` 先探单元格数把「能上传但处理不了」的表
+  提前拒掉。建好的索引留在盘上，`xlsx.cache_ttl_days` 到期后每进程启动扫一次删掉，用到再建。
+- **查询侧只读三件套**：`mode=ro&immutable=1` + `set_authorizer` 白名单（只放 SELECT 与白名单函数）
+  + 每 20k 条指令查一次 `xlsx.query_budget_ms` 预算，跑飞的长查询会被掐断。
+- **四个工具的分工**：`info` 看结构（sheet / 列 / 类型 / 行数），`query` 按结构化条件取行
+  （`columns` / `where` / `limit` / `offset`），`search` 做文本包含检索，`profile` 对每列出统计。
+  四个都只读，都走同一份索引。
+- **空间里的表**（`has_tables(space)` 为真）走 `CodeInterpreterMiddleware` 的 ptc 模式；只有本会话
+  上传的表时装工具本身（不额外起 JS 解释器）。两条路的取字节方式完全相同。
+- 上传响应里的 `indexed: false` 恒定：上传只写字节与台账，索引是第一次用工具时才建的缓存。
+
+## 6. 删会话：谁清什么
+
+`DELETE /threads/{id}` 被 `custom/middleware/threads_delete.py` 截下来（注册一条同名路由**遮挡**
+核心路由；启动时 `assert_shadows_core_delete` 核对首个匹配确实是它，aegra 升级改了装载顺序就
+启动失败，而不是静默退化成「删会话留垃圾」）。顺序固定：
+
+```
+1. 原生 delete_thread   鉴权与 404 语义照旧（不是你的会话 → 404，之后什么都不碰）
+2. 查台账              session_object 里这个 (identity, thread_id) 的所有 object_key
+3. 删行                先删行：行留着会让配额虚高
+4. 删对象              再删对象：删不掉只是垃圾，有对账脚本兜底
+5. 清 Store 命名空间   只清老部署（ADR-0013 时代）留在 Store 里的 md
+```
+
+第 3、4、5 步各自兜底——任何一步失败只记日志，不把删除变成 500（线程行已经删了，报错只会让
+客户端重试到 404）。所以删除是幂等的，残留交给下一轮对账：
+
+| 残留 | 谁清 |
 |---|---|
-| 删会话 | `custom/middleware/threads_delete.py`：先删 `session_object` 行 → 再删对象 → 最后清 Store（老部署遗留的 md）。任何一步失败只记日志，不把删除变成 500 |
-| 孤儿对象 / 悬空行 | `PYTHONPATH=. python scripts/reap_orphans.py`：双向对账 `uploads/` 前缀 × `session_object`，缺省只报告，`--delete-*` 才真删 |
-| 上传残留 | `tmp/` 中间对象与未完成分片：`PYTHONPATH=. python scripts/reap_multipart.py`（见 `docs/S3.md` §8） |
+| 孤儿对象（对象在、行没了） | `PYTHONPATH=. python scripts/reap_orphans.py`：缺省只报告，`--delete-orphans` 才真删 |
+| 悬空行（行在、对象没了） | 同上，`--delete-rows` |
+| `tmp/` 中间对象与未完成分片 | `PYTHONPATH=. python scripts/reap_multipart.py`（`docs/S3.md` §8） |
+| 本机 xlsx 索引缓存 | `xlsx.cache_ttl_days` 到期后进程启动自清；不删也只是一份可再生缓存 |
+| 老 Store 里的 md | 只在删会话时清；不删会话就一直留着（没有 TTL 了） |
 
-## 6. 配置
+## 7. 配置
 
 ```yaml
 # config.yaml
@@ -146,7 +212,7 @@ s3:
 两套部署形态：`s3.endpoint` 为空 → 上传接口整体不可用（503），知识空间走本地目录；填上 →
 两种文件都能用，所有副本读同一份对象（生产）。
 
-## 7. 常见问题
+## 8. 常见问题
 
 | 现象 | 原因 |
 |---|---|
@@ -159,7 +225,7 @@ s3:
 | 传了但这一轮看不到 | 清单在**下一轮** run 起始才读；先发一条消息再问 |
 | `read_file` 读 xlsx 只有一句提示 | 那是二进制表格，用 `xlsx_info` / `xlsx_query` 等工具 |
 
-## 8. 有意的非目标
+## 9. 有意的非目标
 
 秒传预检、前端直传、断点续传、按内容去重、**agent 写回 xlsx**——都不做，理由见
 [ADR-0017](./docs/adr/0017-files-read-through-one-backend.md)：写表要重算公式缓存、重建索引，
