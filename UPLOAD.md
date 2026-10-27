@@ -101,11 +101,12 @@ agent 视角                       真实落点
 /uploads/cbam-reporting_x.xlsx →  盘上 <uploads.dir>/<uuid>/x.xlsx（归属在 PG 台账）
                                 ├─ UploadsBackend：查台账（异步）→ backend.download_files 取字节
                                 ├─ xlsx 工具：落 .cache/xlsx（按内容 sha16）→ 建 SQLite 索引
-                                └─ read_file 只能拿到 base64、grep 会跳过它（zip 二进制）
+                                └─ ls 列得出（合并台账）、read_file 给一句「用 xlsx 工具」的提示
 ```
 
 **子 agent** 读同一条会话的文件靠派活时签发的 `session_scope`（HMAC 签名，
 `graphs/access/session_scope.py`）：它读得到本会话的 `/uploads/*`，读不到别的主管的会话。
+它**没有清单注入**（`SessionFilesMiddleware` 只装在主管图），靠 `ls /uploads/` 自己发现文件。
 
 `h(identity)` = sha256 前 16 位（`shared/session/store.py::identity_digest`），只用于 md 的
 Store 命名空间；xlsx 的 key 不含身份，隔离靠台账行 + 每次读都按当前会话过滤。

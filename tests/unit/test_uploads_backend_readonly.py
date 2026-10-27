@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from langgraph.store.memory import InMemoryStore
 
-from graphs.access import session_scope
+from graphs.access import session_scope, uploads_backend
 from graphs.access.uploads_backend import UploadsBackend
 
 
@@ -41,3 +41,39 @@ async def test_nothing_lands_in_store(backend: UploadsBackend) -> None:
     await backend.awrite("/x.xlsx", "text")
     ls = await backend.als("/")
     assert [e["path"] for e in (ls.entries or [])] == []
+
+
+class _Row:
+    """台账行的最小形状（真行是 ORM 对象，这里只要 `ls`/`read` 用到的两个字段）。"""
+
+    def __init__(self, object_key: str, size_bytes: int) -> None:
+        self.object_key = object_key
+        self.size_bytes = size_bytes
+
+
+def _ledger(monkeypatch: pytest.MonkeyPatch, rows: dict[str, _Row]) -> None:
+    async def fake() -> dict[str, _Row]:
+        return rows
+
+    monkeypatch.setattr(uploads_backend, "_ledger", fake)
+
+
+async def test_als_lists_tables_from_ledger(backend: UploadsBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+    """上传的表也是 `/uploads/` 里的文件：`ls` 必须列出来。
+
+    否则没有清单的子 agent 永远发现不了上传的表（ADR-0018 决定 8 / 缺陷 5）。
+    """
+    _ledger(monkeypatch, {"/t.xlsx": _Row("a" * 32 + "/t.xlsx", 7)})
+    ls = await backend.als("/")
+    assert [(e["path"], e.get("size")) for e in (ls.entries or [])] == [("/t.xlsx", 7)]
+
+
+async def test_aread_on_table_points_at_xlsx_tools(
+    backend: UploadsBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_file` 对表不能回「没有这个文件」——它就在那儿，只是要用 xlsx 工具。"""
+    _ledger(monkeypatch, {"/t.xlsx": _Row("b" * 32 + "/t.xlsx", 7)})
+    result = await backend.aread("/t.xlsx")
+    assert result.error and "xlsx_info" in result.error
+    # 台账里没有的路径仍然交回 Store（md 的 file_not_found 语义不变）
+    assert (await backend.aread("/nope.md")).error

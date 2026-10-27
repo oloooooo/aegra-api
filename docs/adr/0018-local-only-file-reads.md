@@ -34,10 +34,12 @@
 7. **删掉对象存储**：`shared/session/blobs.py`、`scripts/okf_{push,pull}_s3.py`、
    `scripts/reap_multipart.py`、`s3.*` / `okf.backend` / `okf.mirror_*` 配置项、
    `boto3` 依赖、`docs/S3.md`。
-8. **`UploadsBackend` 叠在 `StoreBackend` 上，只覆写取字节与写家族**：md 的
-   `ls/read/grep/glob` 语义继续用 Store 那份（文本、分页、TTL 续期），二进制只有一件不同——
-   `download_files` 要返回真字节，而字节在盘上、路径只在台账里，所以覆写 `adownload_files`：
-   先查台账（async PG）命中就读盘，未命中交回 Store（md）。
+8. **`UploadsBackend` 叠在 `StoreBackend` 上，覆写取字节、`ls`、`read` 与写家族**：md 的
+   `grep/glob` 与文本/分页/TTL 语义继续用 Store 那份；二进制有两件不同的事——`download_files`
+   要返回真字节（字节在盘上、路径只在台账里），`ls` 要把表也列出来（表就是同一目录里的文件，
+   漏了它，没装清单的子 agent 永远发现不了上传的表）。所以覆写 `adownload_files`（命中台账
+   读盘、未命中交回 Store）、`als`（Store 的 md ∪ 台账的表）、`aread`（对表给一句指向 xlsx
+   工具的提示，而不是会让人以为文件丢了的 `file_not_found`）。
 9. **agent 不能写会话文件，也不能改表**：`write`/`edit`/`delete`/`upload_files`（含异步版，
    `StoreBackend` 两套都有）全部返回「会话上传目录只读」；唯一的写入方是上传接口。
    xlsx 四件套保持只读——写表需要先解决「openpyxl 会抹掉公式缓存值」（后文缺陷 14）。
@@ -63,12 +65,12 @@
    不存在的字节（`disk.read` 抛 `FileNotFoundError` → 工具报错，不会静默出错数据）。
 3. **孤儿对象无 GC**：正常替换/删除路径会删旧字节，但崩溃、提交失败、手工改库都会留下孤儿 key
    与 `.part-*`。对账方法见 `docs/large-files.md`。
-4. **`UploadsBackend` 每次取字节都查一次 PG**：`_ledger_keys()` 无缓存，一次 run 里多次
-   `download_files` 会重复查（xlsx 四件套每次调用都走这条）。
-5. **同步路径拿不到 xlsx 字节**：`read`/`download_files`/`grep`/`glob` 的同步版继承
-   `StoreBackend`，只看得见 Store 里的 md——对 `/uploads/*.xlsx` 会返回 `file_not_found`，
-   而 `grep`/`glob` 的同步版会**静默漏掉**盘上的表（不报错、只少结果）。当前所有调用方都是
-   async（图与工具），但这是隐式契约：将来谁写一个同步调用方，就会看到“文件不存在”。
+4. **`UploadsBackend` 每次取字节/列举都查一次 PG**：`_ledger()` 无缓存，一次 run 里多次
+   `download_files` / `ls` 会重复查（xlsx 四件套每次调用都走这条）。
+5. **同步路径拿不到 xlsx**：`ls`/`read`/`download_files`/`grep`/`glob` 的同步版继承
+   `StoreBackend`，只看得见 Store 里的 md——`ls` 同步版漏列所有表（不报错、只少结果），
+   `read` 对 `/uploads/*.xlsx` 返回 `file_not_found`，`grep`/`glob` 也静默跳过表。当前所有调用方
+   都是 async（图与工具），但这是隐式契约：将来谁写一个同步调用方，就会看到“文件不存在”。
 6. **没有 TTL 清理**：`session_files.upload_ttl_minutes` 仍只作用于 Store 里的 md
    （`shared/session/store.py`），盘上字节不会过期。
 7. **空间清单是实时扫盘**：`has_tables()` / `space_files()` 每次 run 递归扫 `knowledge/`，

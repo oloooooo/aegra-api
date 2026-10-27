@@ -10,21 +10,26 @@ TTL 续期）都在 Store 那份实现里，重写一遍只会引入偏差。二
 - 写家族（`write`/`edit`/`delete`/`upload_files` 及异步版）返回只读文案：唯一的写入入口是
   上传接口（`POST /custom/uploads[/tables]`），agent 不能改会话文件。
 
-`ls` / `read` / `grep` 仍只看 Store（md）：xlsx 是 zip，这些工具对它本来也没意义
-（`grep` 会跳过二进制、`read` 只能给 base64）。agent 知道有哪个 xlsx 靠系统提示里的
-清单（`graphs/middleware/session_files.py`），用哪个靠 xlsx 四件套。
+`ls` 要把两半合起来：md 在 Store，表在台账指向的盘上——它是**同一个目录**里的文件。`ls`
+漏掉表的话，agent（尤其没装清单的子 agent）就只能等别人把路径告诉它。`grep` / `glob`
+仍只看 Store（xlsx 是 zip，本来也没意义）；`read` 遇到表给一句指向 xlsx 工具的提示，
+而不是一句会让人以为文件丢了的 `file_not_found`。
 """
 
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from deepagents.backends import StoreBackend
 from deepagents.backends.protocol import (
     DeleteResult,
     EditResult,
     FileDownloadResponse,
+    FileInfo,
     FileUploadResponse,
+    LsResult,
+    ReadResult,
     WriteResult,
 )
 
@@ -44,6 +49,30 @@ class UploadsBackend(StoreBackend):
 
     def __init__(self) -> None:
         super().__init__(namespace=session_scope.uploads_namespace)
+
+    # ---------- 读家族：Store 的 md + 台账里的表 ----------
+
+    async def als(self, file_path: str) -> LsResult:
+        """合并台账：上传的表也是 `/uploads/` 里的文件，不能只列 Store 里的 md。"""
+        base = await super().als(file_path)
+        if base.error or file_path.strip("/"):
+            return base
+        ledger = await _ledger()
+        seen = {e["path"] for e in base.entries or []}
+        extra: list[FileInfo] = [
+            FileInfo(path=path, is_dir=False, size=row.size_bytes)
+            for path, row in ledger.items()
+            if path not in seen
+        ]
+        return LsResult(entries=sorted([*(base.entries or []), *extra], key=lambda e: e["path"]))
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        """表就在这儿，只是 `read` 读不了：给指向 xlsx 工具的提示，而不是「没有这个文件」。"""
+        if "/" + file_path.lstrip("/") in await _ledger():
+            return ReadResult(
+                error=f"{file_path} 是二进制表格，read_file 读不了；用 xlsx_info / xlsx_query 等工具，路径原样传"
+            )
+        return await super().aread(file_path, offset=offset, limit=limit)
 
     # ---------- 写家族：一律拒绝 ----------
 
@@ -81,23 +110,25 @@ class UploadsBackend(StoreBackend):
         return [FileUploadResponse(path=p, error=_READ_ONLY) for p, _ in files]
 
     async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        ledger = await _ledger_keys()
+        ledger = await _ledger()
         out: list[FileDownloadResponse] = []
         for raw in paths:
-            key = ledger.get("/" + raw.lstrip("/"))
-            if key is None:
+            row = ledger.get("/" + raw.lstrip("/"))
+            if row is None:
                 out.extend(await super().adownload_files([raw]))  # md 在 Store
                 continue
             try:
-                out.append(FileDownloadResponse(path=raw, content=await asyncio.to_thread(disk.read, key)))
+                out.append(
+                    FileDownloadResponse(path=raw, content=await asyncio.to_thread(disk.read, row.object_key))
+                )
             except FileNotFoundError:
                 # 行还在、字节没了：当不存在，别让 agent 以为文件可用
                 out.append(FileDownloadResponse(path=raw, content=None, error="file_not_found"))
         return out
 
 
-async def _ledger_keys() -> dict[str, str]:
-    """本会话会话文件的 `{"/<名>": 盘上 key}`。拿不到作用域就是空表。
+async def _ledger() -> dict[str, Any]:
+    """本会话会话文件的 `{"/<名>": 台账行}`。拿不到作用域就是空表。
 
     懒导入：图模块不该把 ORM 拖进启动路径，`shared/` 也不能被 `custom/` 反向依赖。
     """
@@ -109,4 +140,4 @@ async def _ledger_keys() -> dict[str, str]:
 
     async with get_session_maker()() as session:
         rows = await session_files.list_for_thread(session, *scope)
-    return {f"/{row.name}": row.object_key for row in rows}
+    return {f"/{row.name}": row for row in rows}
