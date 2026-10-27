@@ -12,7 +12,10 @@
 `_check_scope`（`graphs/tools/xlsx/__init__.py:68`）只判原始字符串第一段，`_resolve`（`:51`）
 用 `.resolve()` 展开 `..`。实测 `/cbam-reporting/../secret/x.xlsx` 两关都过，
 `knowledge/secret/机密.txt` 真实存在。修法：`PurePosixPath` 规范化后拒绝任何 `..`，
-并校验规范化后仍是 `/<空间>/<文件>` 两段。**搬 store 之前必须修**，否则漏洞一起搬过去。
+并校验规范化后仍是 `/<空间>/<文件>` 两段。
+
+实际落地：判定只剩 backend 一份（`graphs/access/backend.py::SpaceBackend._check_read`，`PurePosixPath`
+规范化后拒任何 `..`），xlsx 工具里那份 `_check_scope` 已删；回归测试 `tests/unit/test_backend_scope.py`。
 
 ### 0.2 只扫本地盘的判定
 
@@ -102,7 +105,7 @@ sha256，超限抛 `TooLarge`；崩在中途只留 `.part` 垃圾，不会出现
 2. BEGIN
      SELECT 1 FROM user_tables WHERE identity=$1 FOR UPDATE     ← 配额串行化
      SELECT COALESCE(sum(bytes),0) FROM session_object WHERE owner_identity=$1
-     文件数：md<10、xlsx<20（同名覆盖不占新名额）
+     文件数：md<50、xlsx<20（同名覆盖不占新名额）
      if 超预算 → 413
      INSERT … ON CONFLICT (owner_identity, thread_id, name) DO UPDATE
    COMMIT
@@ -150,7 +153,7 @@ sha256，超限抛 `TooLarge`；崩在中途只留 `.part` 垃圾，不会出现
 
 ## 4. 读取：字节从哪来
 
-`graphs/tools/xlsx/__init__.py::_fetch(path)` → `runtime.backend.download_files([path])`；
+`graphs/tools/xlsx/__init__.py::_fetch(path)` → `session_backend().adownload_files([path])`；
 `graphs/tools/xlsx/store.py::cache_bytes` 只负责落缓存。
 
 ```
@@ -304,14 +307,14 @@ SESSION_SCOPE_SECRET=<hmac key>
 | `graphs/tools/xlsx/{store,index}.py` + `__init__.py` | 字节解析、ingest → SQLite、四个工具改跑 SQL |
 | `custom/middleware/threads_delete.py` | 删会话连带清台账行 + 盘上字节 |
 | `shared/knowledge/root.py` | 只有一条路：`knowledge_root()` = 仓库根 `knowledge/`（无开关、无镜像） |
-| `tests/unit/test_{backend_scope,session_objects,upload_tables,session_scope,xlsx_index,threads_delete_blobs,session_files}.py` | 约 70 条单测 |
+| `tests/unit/test_{backend_scope,session_objects,upload_tables,uploads_backend_readonly,session_scope,xlsx_index,threads_delete_blobs,session_files,frontend_space_files}.py` | 约 100 条单测 |
 
 ## 9. 测试策（已落地）
 
-单测共约 70 条，位于 `tests/unit/`（盘层 monkeypatch `shared.session.disk`，不碰真盘）：
+单测共约 100 条，位于 `tests/unit/`（盘层 monkeypatch `shared.session.disk`，不碰真盘）：
 `test_backend_scope.py`、`test_session_objects.py`、`test_upload_tables.py`、
-`test_session_scope.py`、`test_xlsx_index.py`、`test_threads_delete_blobs.py`、
-`test_session_files.py`。
+`test_uploads_backend_readonly.py`、`test_session_scope.py`、`test_xlsx_index.py`、
+`test_threads_delete_blobs.py`、`test_session_files.py`、`test_frontend_space_files.py`。
 重点覆盖：越权回归（含 `..` 与符号链接逃逸）、文件名/空间规则、流式超限与失败清理、
 配额两闸、删会话的「先读 key 再删」、行号公式 `rowid + header + 1`、`xlsx_search` 的单元格
 语义、`where` 语义矩阵、authorizer 边界、`session_scope` 验签。
