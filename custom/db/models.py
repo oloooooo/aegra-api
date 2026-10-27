@@ -160,8 +160,10 @@ class SessionObject(Base):
     name: Mapped[str] = mapped_column(
         String(200), primary_key=True, comment="上传文件名，形如 <空间名>_<表名>.xlsx"
     )
-    space: Mapped[str] = mapped_column(
-        String(100), comment="从文件名前缀解析出的空间名，只用于路由到子 agent 与展示，**不是**隔离键"
+    space: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="从文件名前缀解析出的空间名；md 没有空间，为 NULL。只用于路由与展示，**不是**隔离键",
     )
     object_key: Mapped[str] = mapped_column(String(512), comment="对象存储 key（含 {sha16}）")
     sha256: Mapped[str] = mapped_column(String(64), comment="内容哈希；表索引的缓存键")

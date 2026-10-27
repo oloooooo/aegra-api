@@ -25,18 +25,16 @@ auth:
   # 登录/注册签发的用户 token 用它；子 agent 的服务 token 写死 10 年，不受此值影响。
   access_token_ttl: 3600
 
-# --- 会话文件 md（shared/session/store.py，ADR-0013）---
+# --- 会话文件 md（custom/service/session_files.py，ADR-0017）---
 session_files:
   max_upload_mb: 10             # 单文件上限（POST /custom/uploads）
-  max_files_per_session: 50     # 每会话文件数
-  upload_ttl_minutes: 4320      # 孤儿保留期（72h），语义是「最后读取后多久」
+  max_files_per_session: 50     # 每会话 md 文件数（同名覆盖不占名额；xlsx 另有上限）
 
 # --- 会话大表 xlsx（custom/service/session_files.py、graphs/tools/xlsx/，ADR-0015）---
 xlsx:
   max_blob_mb: 10               # 单个 xlsx 的 HTTP 上限（与 md 的 max_upload_mb 分开）
   max_cells: 2000000            # 结构性硬闸，超了第一次调工具就报错
   max_xlsx_files_per_session: 20  # 同名覆盖不占名额
-  max_md_files_per_session: 10   # 未生效：md 个数上限走 session_files.max_files_per_session（见 UPLOAD.md §6）
   max_blob_mb_per_user: 2048    # 每用户二进制总量（2GB）
   cache_dir: .cache/xlsx        # 索引与字节的本机缓存，必须在 okf.dir（knowledge/）之外
   cache_ttl_days: 7

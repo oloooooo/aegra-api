@@ -25,14 +25,14 @@
 
 | 存什么 | 放哪 | 生命周期 | 是真相吗 |
 |---|---|---|---|
-| md 会话文件 | LangGraph Store `(uploads, h(identity), thread_id)` | 72h 孤儿 TTL + 删会话即删 | 是 |
-| xlsx 字节 | S3 `sessions/{h}/{thread}/{sha16}/{name}` | 删会话即删 | 是 |
-| 元数据 | PG `session_object` | 事务 | 是 |
-| 表索引 | S3 `sessions/{h}/{thread}/idx/{name}.h{hdr}.v{build}.sqlite` + 本机缓存 | 可丢 | **否** |
-| 空间知识 | S3 `okf/<space>/`（ADR-0016） | 随空间 | 是 |
+| md / xlsx 字节 | S3 `uploads/{uuid}/{name}`（key 每次新分配） | 删会话即删 | 是 |
+| 元数据（归属） | PG `session_object`（owner+thread+name，`space` 仅 xlsx 有） | 事务 | 是 |
+| 表索引 | **只在本机** `{xlsx.cache_dir}/{sha16}-h{hdr}-v{build}.sqlite` | 可丢、7 天清扫 | **否** |
+| 空间知识 | 本地 `knowledge/` 或 S3 `okf/<space>/`（ADR-0017） | 随空间 | 是 |
 
-**所有会话文件都在 `sessions/{h}/{thread}/` 一个前缀下**，所以「删会话」= list 该前缀 +
-delete，一次覆盖字节与索引——比上一稿的独立 `index/` 前缀省一套删除逻辑。
+**key 里没有 owner/thread**（ADR-0017）：归属只在 `session_object` 一张表里，所以「删会话」=
+按台账取 key → 删对象 → 删行，顺带一条 Store 清场（老部署的 md）。对象存储没有 rename，
+「把文件转给别人」也只是改一行。
 
 一条规矩定死：**本地磁盘上的一切都是缓存**。
 
@@ -40,15 +40,15 @@ delete，一次覆盖字节与索引——比上一稿的独立 `index/` 前缀�
 
 ```
 tmp      tmp/{uuid4}/{name}
-blob     sessions/{h(identity)}/{thread_id}/{sha16}/{name}
-index    sessions/{h(identity)}/{thread_id}/idx/{name}.h{header}.v{BUILD}.sqlite
-cache    {xlsx.cache_dir}/{h}-{thread}-{sha16}-{header}-v{BUILD}.sqlite
+blob     uploads/{uuid4}/{name}                   每次上传新 key（同名=新 key，旧对象提交后删）
+index    {xlsx.cache_dir}/{sha16}-h{header}-v{BUILD}.sqlite   （只在本机，不进对象存储）
+cache    {xlsx.cache_dir}/{sha16}{suffix}                     （下载下来的原始字节）
 ```
 
-- `{sha16}` = sha256 前 16 hex，进路径 → 并发同名不同内容各写各的 key，**不会出现
-  「行说 A、字节是 B」**；同内容重传 = 同 key + 同索引键 → 不重建。
+- `{uuid4}` 每次上传新分配 → 并发同名不同内容各写各的 key，**不会出现「行说 A、字节是 B」**；
+  内容有没有变由台账的 `sha256` 列判断，缓存键也用 sha16，所以同内容重传不重建索引。
 - `v{BUILD}`：改 schema 就 +1，否则永远读到旧结构。
-- 本地缓存名包含 `h + thread + sha16 + header + BUILD`，少一个维度就会串表。
+- 本地缓存名含 `sha16 + header + BUILD`：内容不同 sha16 就不同，少一个维度会串表。
 
 **表规则（硬逻辑，`CONTEXT.md`「Table rule」）**：文件名必须形如
 `<space>_<名字>.xlsx`，且 `<space>` ∈ 该用户的 `user_spaces`；否则 422。
@@ -103,7 +103,7 @@ CREATE TABLE session_object (
 ```
 0. 读 PG 现有行（若有），记 old_key
 1. 流式 upload_fileobj → tmp/{uuid}/{name}          计数 + sha256
-2. copy_object tmp → sessions/{h}/{thread}/{sha16}/{name}   单次原子出现
+2. copy_object tmp → uploads/{uuid}/{name}            单次原子出现
 3. BEGIN
      SELECT 1 FROM user_tables WHERE identity=$1 FOR UPDATE     ← 配额串行化
      SELECT COALESCE(sum(bytes),0) FROM session_object WHERE owner_identity=$1
@@ -159,7 +159,7 @@ CREATE TABLE session_object (
 **不替换 `langgraph_auth_user`**，否则 `allowed_spaces()` 会走普通用户分支读
 `auth_user.user_spaces`，把子 agent 从「本任务 space」放大成「用户全部 space」。
 
-子 agent 的 backend：`CompositeBackend(default=SpaceBackend, routes={"/uploads/": StoreBackend(ns=f(scope))})`，
+子 agent 的 backend：`CompositeBackend(default=SpaceBackend|S3Backend, routes={"/uploads/": UploadsBackend()})`，
 xlsx 工具用 `scope` 算 S3 前缀（工具仍绕 backend 直读字节）。主管的
 `_uploads_namespace()` 改成「有 `session_scope` 且验签通过就用它，否则用自身 config」。
 
@@ -232,10 +232,10 @@ UNION ALL SELECT rowid, 1, CAST(c1 AS TEXT) FROM s0 WHERE c1 LIKE ? ESCAPE '\'
 | 第 2 步完、第 3 步崩 | 孤儿 blob | 生命周期；**不会有行没字节** |
 | 第 3 步失败（配额） | 旧行完好 | 只在 `new_key != old_key` 时删最终 key |
 | 上传超限被打断 | 未完成分片 | `abort_stale_multiparts`（脚本未写，需自建定时任务，见 §10） |
-| 删会话 | 前缀全清 | list `sessions/{h}/{thread}/` → delete（覆盖字节+索引） |
+| 删会话 | 台账逐对象删 | 先删行 → 再删对象（失败只留孤儿，用 `reap_orphans.py` 对账） |
 | 并发同名不同内容 | 行指向最后提交者，另一份孤儿 | `{sha16}` 进 key |
 | 配额并发 | 严格 | `SELECT … FROM user_tables FOR UPDATE` |
-| 旧缓存 | 自然失效 | 文件名含 sha16 + BUILD |
+| 旧缓存 | 自然失效 | 文件名含 sha16 + BUILD；另有 7 天清扫 |
 
 **不需要**：Redis 广播、分布式锁、`If-None-Match`、引用计数、leader election。
 
@@ -263,7 +263,6 @@ okf:
 xlsx:
   max_blob_mb: 10
   max_cells: 2000000
-  max_md_files_per_session: 10   # 未生效：md 个数上限走 session_files.max_files_per_session
   max_xlsx_files_per_session: 20
   max_blob_mb_per_user: 2048
   cache_dir: .cache/xlsx

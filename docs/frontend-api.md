@@ -119,7 +119,7 @@ event: end        data: {"status": "success"}
 
 ### 3.7 `POST /custom/uploads`
 
-把一个 md 文件挂到当前会话（[adr/0013](./adr/0013-session-files-live-in-store.md)）。`multipart/form-data`，字段 `thread_id` + `file`。
+把一个 md 文件挂到当前会话（[adr/0017](./adr/0017-files-read-through-one-backend.md)）。`multipart/form-data`，字段 `thread_id` + `file`。
 
 ```json
 {"name": "报告.md", "path": "/uploads/报告.md", "bytes": 12034,
@@ -129,8 +129,8 @@ event: end        data: {"status": "success"}
 - 校验顺序固定：会话归属 → 文件名 → 扩展名 → 大小 → 编码。先挡归属与文件名，再边读边判大小（超限即 `413`），最后才解码。
 - 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `session_files.max_upload_mb`（默认 10）或本会话文件数已达 `session_files.max_files_per_session`（默认 50）`413`；store 未就绪 `503`。
 - 同名重传 = 覆盖（PUT 语义，`/uploads` 下永远只有一份），不占新名额。
-- 文件落在 LangGraph Store，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/middleware/session_files.py`），所以本轮 run 看不到刚传的文件。
-- 孤儿 TTL 默认 72 小时（`session_files.upload_ttl_minutes`）：活跃会话每轮读清单会续期，没人读才过期；删会话即清空。
+- 字节落在对象存储（`uploads/<uuid>/<名>`），归属记 PG `session_object`，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/middleware/session_files.py`），所以本轮 run 看不到刚传的文件。
+- 没有 TTL：删会话即清空（先删行 → 再删对象）；漏掉的对象用 `scripts/reap_orphans.py` 对账。
 - **没有列表/删除接口**：前端只能自己记住传过什么；要删文件目前只能删会话。
 
 ### 3.8 `POST /custom/uploads/tables`
@@ -150,9 +150,9 @@ event: end        data: {"status": "success"}
   文件名非法 / 空间没权限 `422`；对象存储未就绪 `503`。
 - **`indexed:false` 是正常状态**：索引在第一次调 `xlsx_*` 工具时才建，建完写回对象存储。
 - 同名重传 = 覆盖（PUT 语义）；同内容重传命中同一个 key，不重建索引。
-- 字节进对象存储（`sessions/{h(identity)}/{thread_id}/…`），**md 仍进 Store**；
+- 字节进对象存储（`uploads/<uuid>/<名>`），归属记 PG `session_object`（md 走同一条链）；
   子 agent 只能在同一条会话里读（靠派活时签发的 `session_scope`）。
-- 没有列表/删除接口：删除走删会话（`DELETE /threads/{id}`，连带清 PG 行与整个前缀）。
+- 没有列表/删除接口：删除走删会话（`DELETE /threads/{id}`，连带清 PG 行与对象）。
   运维细节见 [S3.md](./S3.md)。
 
 ## 4. 直接用的原生接口

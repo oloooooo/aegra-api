@@ -3,13 +3,11 @@
 图和读文件的工具都从这里拿 backend:同一个装配点,`/uploads/` 走哪条路由只在一处决定。
 """
 
-from deepagents.backends import CompositeBackend, StoreBackend
+from deepagents.backends import CompositeBackend
 
-from graphs.access import session_scope
 from graphs.access.backend import SpaceBackend
 from graphs.access.s3_backend import S3Backend, UploadsBackend
 from shared.knowledge.root import backend_mode, knowledge_root
-from shared.session import blobs
 
 
 def session_backend() -> CompositeBackend:
@@ -22,10 +20,8 @@ def session_backend() -> CompositeBackend:
     其余模式是本地目录（`SpaceBackend`，`s3` 模式读的就是镜像下来的副本）。两条路共用同
     一套空间判定（`SpaceGuard`），所以「这次 run 能读哪些 space」在两种模式下等价。
 
-    上传字节在对象存储时按台账读（`UploadsBackend`）；没配对象存储（本地 demo）退回
-    会话的 LangGraph Store 命名空间。
+    上传的文件（md 与 xlsx）字节都在对象存储、key 记在 PG 台账，所以 `/uploads/` 恒为
+    `UploadsBackend`；没配对象存储就没有上传，这个路由自然读不到东西。
     """
     default = S3Backend() if backend_mode() == "s3fs" else SpaceBackend(root_dir=knowledge_root())
-    if not blobs.configured():
-        return CompositeBackend(default=default, routes={"/uploads/": StoreBackend(namespace=session_scope.uploads_namespace)})
     return CompositeBackend(default=default, routes={"/uploads/": UploadsBackend()})

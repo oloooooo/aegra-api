@@ -89,6 +89,19 @@
 实测（本地 SeaweedFS，2000 个对象 / 100 目录 × 20 文件）：`read` 122 ms → **1.8 ms**，
 `ls` 132 ms → **2.9 ms**。这是纯浪费的账：一次 `read_file` 不值得先付一遍全空间的 LIST。
 
+### 10. md 也进对象存储，`StoreBackend` 退役
+
+第一版把 md 留在 LangGraph Store（`/uploads/` 路由到 `StoreBackend`），xlsx 走对象存储。
+这条路在「`/uploads/` 换成 `UploadsBackend`」那一刻就断了：Store 里的 md 立刻谁都看不见——
+agent 的 `ls`/`read_file` 全打到新 backend，而新 backend 只查台账。实测复现（写 md →
+`ls` → `read` 全走 Store，xlsx 工具却读盘），旧数据还在，没有任何报错。
+
+所以 md 与 xlsx 合并成一条链：字节进 `uploads/<uuid>/<名>`，归属只记 `session_object`
+（md 的 `space` 为 NULL，因此这一列改成可空）。`StoreBackend` 只剩一件事：
+`shared/session/store.py::clear()` —— 删会话时把老部署留在 Store 命名空间里的 md 清掉。
+
+代价：md 失去了 Store 的 72 小时 TTL（缺陷 8），孤儿只能靠删会话与对账脚本。
+
 ## 取舍
 
 | 取舍点 | 选了什么 | 为什么不选另一个 |
@@ -98,6 +111,7 @@
 | `write` 用条件写 vs 覆盖 | 覆盖（last-write-wins） | 协议要求 write 是覆盖语义；把 CAS 加在 write 上会让「第二次写」失败，违反契约。CAS 加在真正有读-改-写窗口的 `edit` 上 |
 | `UploadsBackend` 实现同步版 vs 只异步 | 只异步 | 同步读要把 async PG 会话跑在另一个事件循环里（`asyncio.run` 嵌套），本地和单副本都不成立；框架调用的正是异步方法 |
 | 写能力（2026-02-12 用户拍板） | 先不开写：`write`/`edit` 的实现与 `edit` 的 CAS 留着，但不做启动探测 | 写入方还没定下来；加探测会让“写能用”这件事看起来已就绪。真要开写时再议探测与降级 |
+| md 留在 Store vs 并入对象存储 | 并入 | 两个后端就是两套可见性：`/uploads/` 一换路由，Store 里的 md 立刻谁都看不见（实测静默失败）。并入后多了一条 md 的大小闸与配额，但读路径只有一条 |
 | `spec.py` 模式分支 vs 抽象一层「虚拟文件系统」 | 分支 | 抽象层要同时包住 `Path` 和对象存储，两个调用面（`rglob`/`read_text`/`mkdir`）语义对不齐；分支只有 5 个函数 |
 
 ## 缺陷与已知风险
@@ -126,8 +140,9 @@
    失败就留下孤儿（另有并发同名上传、覆盖后旧对象删除失败两个来源）。`scripts/reap_orphans.py`
    双向比对 `uploads/` 与台账，缺省只报告，`--delete-orphans` / `--delete-rows` 才动手。
    它是**人工运维脚本**，不是定时任务；要自动就得挂 cron（同 `reap_multipart.py`）。
-8. **md 的 TTL 续期在台账模式下消失了**：Store 路径有 `refresh_ttl=True`，台账模式没有。
-   结果是孤儿 md 到期不再被续命——这其实是想要的，但它不再是「靠 TTL 兜底」而是「靠删会话」。
+8. **md 不再有 TTL**：Store 时代有 `refresh_ttl=True` 的 72 小时保留期，现在没了；孤儿一律
+   靠「删会话」+ `scripts/reap_orphans.py`。对用户是**语义变化**（旧文档写过 72h），对实现是
+   少一个后台 sweeper 依赖。
 9. **驱逐文件已挪出 `okf/`**（原缺陷：`/large_tool_results`、`/conversation_history`、`/blobs`
    在 `s3fs` 下写成 `okf/large_tool_results/…`，与空间知识同前缀 → 运维对账/备份会把垃圾算进去、
    将来按前缀授权会连缓存目录一起暴露、也没法按会话整批清）。现在内部前缀映射到 `artifacts/`，

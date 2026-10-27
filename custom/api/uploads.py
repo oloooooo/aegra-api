@@ -1,16 +1,20 @@
-"""会话文件上传的总入口：两个接口、两条载体、一套会话隔离。
+"""会话文件上传的总入口：两个接口、同一个存储链路、一套会话隔离。
 
 ===============================================================================
-一、两个接口 / 两种载体
+一、两个接口 / 一个载体
 ===============================================================================
 
-    POST /custom/uploads          md   → LangGraph Store（JSON 文本）
+    POST /custom/uploads          md   → 对象存储（字节）+ PG `session_object`（行）
     POST /custom/uploads/tables   xlsx → 对象存储（字节）+ PG `session_object`（行）
 
-为什么 md 不进 S3、xlsx 不进 Store：agent 读文件靠 deepagents 的 fs 工具
-（ls/read/grep/glob），它们只认 backend。Store 就是 md 的 backend（`/uploads/` 路由到
-`StoreBackend`），文本放进去白拿这四件工具；xlsx 是 zip 二进制，read/grep 读不了，
-只能走 xlsx 四件套（自己直连对象存储 + SQLite 索引）。见 ADR-0013 / ADR-0015。
+两者只差三件事：文件名规则（xlsx 必须 `<空间名>_<表名>.xlsx`，md 随便）、大小闸
+（`max_upload_mb` vs `max_blob_mb`）、以及 md 的 `space` 为 NULL。字节与行都是同一套
+代码写、同一条读路径读：agent 读文件靠 backend（`/uploads/` 路由到 `UploadsBackend`，
+key 查台账，ADR-0017），xlsx 的二进制额外由 xlsx 四件套解析。见 ADR-0015 / ADR-0017。
+
+为什么 md 曾经在 LangGraph Store：那是 ADR-0013 的方案（`StoreBackend` 直接当 md 的
+backend）。换掉的原因见 ADR-0017——两个后端就意味着两套可见性，`/uploads/` 一旦换路由，
+Store 里的 md 立刻变得谁都看不见。
 
 ===============================================================================
 二、共同前置：会话归属
@@ -31,12 +35,14 @@
       │ 1. _safe_name()        basename + 消毒（控制字符 / 超长 / 后缀），不合规 422
       │ 2. _read_limited()     分块读并卡 MAX_UPLOAD_MB（不信 Content-Length，它会撒谎或缺失）
       │ 3. decode("utf-8")     不是文本就 422 —— 排在大小闸之后，别为大文件先读满再看编码
-      │ 4. list_files()        数一遍现有文件；**同名覆盖不占名额**
-      │ 5. put_md()            store.aput(ns, "/<name>", {content, encoding, 时间戳}, ttl=72h)
+      │ 4. list_for_thread()  数一遍现有**同类**文件；**同名覆盖不占名额**
+      │ 5. put_bytes()        字节进对象存储 `uploads/<uuid>/<名>`
+      │ 6. upsert()           锁用户行算配额 → 写/覆盖 `session_object` 行（space = NULL）→ commit
       ▼
-    {"name": …, "path": "/uploads/<name>", "bytes": …, "ttl_minutes": 4320}
+    {"name": …, "path": "/uploads/<name>", "bytes": …}
 
-同名 = 覆盖（PUT 语义）：`ls /uploads` 里永远只有一份，不做版本链。
+同名 = 覆盖（PUT 语义）：`ls /uploads` 里永远只有一份，不做版本链。md 与 xlsx 走同一条存储
+链路，只是 md 不属于任何空间（台账里 `space` 为 NULL）。
 
 ===============================================================================
 四、xlsx 分支
@@ -46,9 +52,9 @@
       │ 1. file.size 先挡一次           不读身体就能 413
       │ 2. _safe_name(suffix=".xlsx") + parse_space()
       │      文件名前缀必须是上传者拥有的 space —— 但它**只决定主管派哪个子 agent**，
-      │      不决定存哪（存储前缀恒为 sessions/{h}/{thread}/）
+      │      不决定存哪（key 恒为 uploads/<uuid>/<名>，归属只在台账）
       │ 3. put_stream(file, tmp/…)       手写分片：边读边算 sha256；超限自己 abort
-      │ 4. copy(tmp, sessions/{h}/{thread}/{sha16}/<name>)   服务端复制，不搬字节
+      │ 4. copy(tmp, uploads/<uuid>/<name>)   服务端复制，不搬字节
       │ 5. session_files.upsert()        锁用户行算配额 → 写/覆盖行 → commit
       │ 6. 删 tmp；**提交成功后**再删被替换掉的旧对象
       ▼
@@ -68,26 +74,24 @@
 五、落到哪里 / 谁能读到
 ===============================================================================
 
-    md    Store 命名空间 (uploads, h(identity), thread) + key "/<name>"
-          读：SessionFilesMiddleware（每轮 run 起始的清单注入）、
-              StoreBackend（agent 对 /uploads/<name> 的 ls/read/grep/glob）
-    xlsx  对象存储 sessions/{h(identity)}/{thread}/{sha16}/<name>
-          读：xlsx 四件套 —— 先查 PG 拿 object_key，再下到本机缓存并建 SQLite 索引
+    md / xlsx  对象存储 `uploads/<uuid>/<名>`（`blobs.upload_key`，uuid 每次新分配）
+               归属只在 PG `session_object`：主键 (owner, thread, name)
+               读：SessionFilesMiddleware（清单注入）+ UploadsBackend（ls/read/grep/glob/
+                   download_files，key 每次查台账）；xlsx 的二进制再交给 xlsx 四件套解析
 
 子 agent 读**同一条会话**的文件靠派活时签发的 `session_scope`（graphs/access/session_scope.py），
 它读不到别的主管的会话。
 
-`h()` = `identity_digest`（sha256 前 16 位），Store 命名空间与对象存储前缀共用它——
-两处若不一致，同一份内容会落在两套前缀下（排查极难）。
+key 里**没有** owner/thread：归属由台账唯一决定，所以 key 不能反推身份（否则台账与 key
+就成了两本账，改名/迁移得同时改对两处）。
 
 ===============================================================================
 六、删除与垃圾（各自的清理责任，别在这里加「顺手删」）
 ===============================================================================
 
-    删会话      custom/middleware/threads_delete.py：先删行 → 删 S3 前缀 → 清 Store
-    孤儿 md     Store 自带 TTL（aegra 启动时 start_ttl_sweeper），读一次续期
+    删会话      custom/middleware/threads_delete.py：先删行 → 再删对象 → 清 Store（历史遗留）
     上传残留    tmp/ 对象与未完成分片 → scripts/reap_multipart.py（定期跑）
-    容量对账    PG 的 sum(size_bytes) 不含索引与被覆盖的旧对象（docs/large-files.md §10）
+    容量对账    scripts/reap_orphans.py：孤儿对象 / 悬空行（缺省只报告）
 
 ===============================================================================
 七、代码分区（改代码前先看这张表）
@@ -105,6 +109,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import re
 from pathlib import PureWindowsPath
 from typing import Annotated
@@ -115,20 +120,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aegra_api.core.auth_deps import require_auth
-from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session
 from aegra_api.models.auth import User
 from custom.api.schemas import UploadFileResponse, UploadTableResponse
 from custom.service import session_files
+from custom.service.session_files import MAX_FILES_PER_SESSION, MAX_UPLOAD_MB
 from shared.session import blobs
-from shared.session.store import (
-    MAX_FILES_PER_SESSION,
-    MAX_UPLOAD_MB,
-    list_files,
-    put_md,
-    virtual_path,
-)
 
 router = APIRouter(prefix="/custom", tags=["/custom"])
 logger = structlog.getLogger(__name__)
@@ -185,45 +183,69 @@ async def upload_session_file(
 ) -> UploadFileResponse:
     """把一个 md 文件挂到某个会话上，返回它在 agent 眼里的路径。
 
-    同名文件覆盖（PUT 语义）：`ls /uploads` 里永远只有一份，不做版本链。
+    与 xlsx 同一条链（ADR-0017）：字节进对象存储 `uploads/<uuid>/<名>`，行进 `session_object`
+    （`space` 为 NULL——md 不属于任何空间）。同名覆盖（PUT 语义），不做版本链。
     """
     await _require_owned_thread(session, user, thread_id)
 
     name = _safe_name(file.filename)
     data = await _read_limited(file)
     try:
-        text = data.decode("utf-8")
+        data.decode("utf-8")
     except UnicodeDecodeError as e:
         raise HTTPException(
             status_code=422,
             detail=f"文件不是合法 UTF-8 文本（第 {e.start} 字节处解码失败）",
         ) from None
 
-    try:
-        store = db_manager.get_store()
-    except RuntimeError:
-        logger.exception("upload_without_store", thread_id=thread_id)
-        raise HTTPException(status_code=503, detail="存储未就绪，请稍后重试") from None
-
-    # 同名重传是覆盖，不占新名额；只有真新增才判配额（不续期：判额度不该延长 TTL）
-    rows, _ = await list_files(
-        store, user.identity, thread_id, limit=MAX_FILES_PER_SESSION, refresh_ttl=False
-    )
-    if len(rows) >= MAX_FILES_PER_SESSION and virtual_path(name) not in {r["path"] for r in rows}:
+    # 同类文件数上限：同名重传是覆盖，不占新名额（字节配额在 upsert 里锁用户行统一算）
+    rows = await session_files.list_for_thread(session, user.identity, thread_id)
+    if len(rows) >= MAX_FILES_PER_SESSION and name not in {r.name for r in rows}:
         raise HTTPException(
             status_code=413,
             detail=f"本会话文件数已达上限（{MAX_FILES_PER_SESSION}），同名覆盖不受限",
         )
 
-    meta = await put_md(store, user.identity, thread_id, name, text)
+    existing = await session_files.get_one(session, user.identity, thread_id, name)
+    old_key = existing.object_key if existing else None
+    final = blobs.upload_key(name)
+    try:
+        await asyncio.to_thread(blobs.put_bytes, final, data)
+        await session_files.upsert(
+            session,
+            owner=user.identity,
+            thread_id=thread_id,
+            name=name,
+            space=None,
+            object_key=final,
+            sha256=hashlib.sha256(data).hexdigest(),
+            size_bytes=len(data),
+        )
+        await session.commit()
+    except blobs.BlobUnavailable:
+        logger.exception("upload_md_without_store", thread_id=thread_id)
+        await _drop_new(final, old_key)
+        raise HTTPException(status_code=503, detail="存储未就绪，请稍后重试") from None
+    except session_files.QuotaExceeded as e:
+        await _drop_new(final, old_key)
+        raise HTTPException(status_code=413, detail=str(e)) from None
+    except Exception:
+        logger.exception("upload_md_failed", thread_id=thread_id, name=name)
+        await _drop_new(final, old_key)
+        raise
+
+    # 提交成功后才删被替换掉的旧对象
+    if old_key and old_key != final:
+        await asyncio.to_thread(blobs.delete, old_key)
+
     logger.info(
         "session_file_uploaded",
         identity=user.identity,
         thread_id=thread_id,
         name=name,
-        bytes=meta["bytes"],
+        bytes=len(data),
     )
-    return UploadFileResponse(**meta)
+    return UploadFileResponse(name=name, path=f"/uploads/{name}", bytes=len(data))
 
 
 @router.post("/uploads/tables", response_model=UploadTableResponse, status_code=201)
@@ -236,7 +258,7 @@ async def upload_session_table(
     """把一个 xlsx 挂到会话上（ADR-0015）：字节进对象存储，行进 `session_object`。
 
     文件名必须是 `<空间名>_<表名>.xlsx`；空间名校验的是**上传者有没有该空间**，
-    它只决定主管派哪个子 agent，不决定存哪——存储前缀恒为 `sessions/{h}/{thread}/`。
+    它只决定主管派哪个子 agent，不决定存哪——key 恒为 `uploads/<uuid>/<名>`，`space` 只是台账一列。
 
     写序：tmp → copy 到正式 key → PG 事务 → 删 tmp。中途崩只会留孤儿对象，
     不会出现"有行没字节"；提交失败时只在 `新 key != 旧 key` 时删新对象

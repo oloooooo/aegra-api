@@ -4,7 +4,6 @@
 以及**子 agent 不能借它拿到用户全部 space**（那是 `allowed_spaces` 的独立判定）。
 """
 
-from shared.session.store import session_namespace
 from graphs.access import session_scope as ss
 
 
@@ -65,25 +64,6 @@ def test_resolve_uses_own_identity_for_supervisor():
 def test_resolve_without_auth_is_none():
     assert ss.resolve({"configurable": {"thread_id": "t-1"}}) is None
     assert ss.resolve({}) is None
-
-
-def test_uploads_namespace_matches_store_namespace():
-    """主管与子 agent 必须落到**同一个** store 命名空间，否则 md 读不到。"""
-    scope = ss.mint("u1", "t-1")
-    expected = session_namespace("u1", "t-1")
-
-    ns = ss.uploads_namespace()
-    assert ns != expected  # 跑外没有 config → 死命名空间
-    assert ns[1] == "_none"
-
-    import graphs.access.session_scope as mod
-
-    original = mod.current_config
-    mod.current_config = lambda: {"configurable": {"session_scope": scope}}
-    try:
-        assert ss.uploads_namespace() == expected
-    finally:
-        mod.current_config = original
 
 
 def test_service_identity_without_scope_is_denied():

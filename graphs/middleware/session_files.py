@@ -4,8 +4,8 @@
 
 - 写 state 要 `aupdate_state`，落在 run 之外，会额外造 checkpoint，且文件删了/覆盖了
   那条提示不会自己消失；
-- 清单是**派生视图**，真相在台账（字节存对象存储时的 `session_object` 行）或本地 demo 的
-  LangGraph Store。每次查一次、渲染一次，天然幂等。
+- 清单是**派生视图**，真相在 PG 台账（`session_object`，ADR-0017：md 与 xlsx 的行都在这里）。
+  每次查一次、渲染一次，天然幂等。
 
 实例属性即 run 作用域：`graphs/supervisor.py` 是工厂图，每 run 重建中间件，
 所以 `_files` 不需要清理，也不会跨会话泄漏。
@@ -22,11 +22,9 @@ import structlog
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.messages import SystemMessage
-from langgraph.config import get_config, get_store
+from langgraph.config import get_config
 
 from graphs.access.spaces import current_identity
-from shared.session import blobs
-from shared.session.store import list_files
 
 logger = structlog.getLogger(__name__)
 
@@ -54,9 +52,8 @@ async def _ledger_files(identity: str, thread_id: str) -> tuple[list[dict[str, A
 class SessionFilesMiddleware(AgentMiddleware):
     """每 run 查一次会话文件清单，在每次模型调用时作为系统提示附加。"""
 
-    def __init__(self, store: Any = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._store = store
         self._files: list[dict[str, Any]] | None = None
         self._truncated = False
         self._loaded = False
@@ -79,18 +76,7 @@ class SessionFilesMiddleware(AgentMiddleware):
         if not identity or not thread_id:
             return
         try:
-            if blobs.configured():
-                self._files, self._truncated = await _ledger_files(identity, thread_id)
-                return
-            try:
-                store = self._store or get_store()
-            except (RuntimeError, KeyError):
-                logger.warning("session_files_without_store", thread_id=thread_id)
-                return
-            # refresh_ttl=True：活跃会话每轮读一次清单即续期（ADR-0013 的孤儿保留期）
-            self._files, self._truncated = await list_files(
-                store, identity, thread_id, limit=_LIST_LIMIT, refresh_ttl=True
-            )
+            self._files, self._truncated = await _ledger_files(identity, thread_id)
         except Exception:  # noqa: BLE001 — 清单是增强，读失败不该让整个 run 挂
             logger.exception("session_files_list_failed", thread_id=thread_id)
 

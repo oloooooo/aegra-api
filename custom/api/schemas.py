@@ -1,7 +1,7 @@
-from ast import List
 from typing import Literal
 
 from pydantic import BaseModel
+
 Permission = Literal["read", "write"]
 
 class MessagesBaseModel(BaseModel):
@@ -10,7 +10,7 @@ class MessagesBaseModel(BaseModel):
 
 class RegisterRequest(BaseModel):
     identity: str
-    display_name: str 
+    display_name: str
     org_id: str | None = None
     email: str | None = None
     password: str
@@ -51,13 +51,11 @@ class CreateUserSpaceResponse(CreateSpaceResponse):
 
 
 class UploadFileResponse(BaseModel):
-    """上传成功的会话文件（ADR-0013）：path 是 agent 眼里的路径。"""
+    """上传成功的会话文件（ADR-0017）：path 是 agent 眼里的路径。"""
 
     name: str
     path: str
     bytes: int
-    uploaded_at: str
-    ttl_minutes: int
 
 class UploadTableResponse(BaseModel):
     """上传成功的大表（ADR-0015）：字节在对象存储，行在 `session_object`。"""

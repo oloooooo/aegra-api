@@ -97,17 +97,3 @@ def current_config() -> Any:
         return get_config() or {}
     except RuntimeError:
         return {}
-
-
-def uploads_namespace(_runtime: Any = None) -> tuple[str, ...]:
-    """`/uploads/` 路由的 Store 命名空间。
-
-    主管 run 用自身的 `(identity, thread)`；子 agent 用派活时签发的 `session_scope`。
-    拿不到作用域时返回一个**死命名空间**——读不到任何会话文件，也不会撞上真会话。
-    """
-    from shared.session.store import NAMESPACE_PREFIX, session_namespace
-
-    scope = resolve(current_config())
-    if scope is None:
-        return (NAMESPACE_PREFIX, "_none", "_none")
-    return session_namespace(*scope)

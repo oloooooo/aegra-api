@@ -1,8 +1,8 @@
-"""删会话时连带清掉它的会话文件（ADR-0013 / ADR-0015）。
+"""删会话时连带清掉它的会话文件（ADR-0015 / ADR-0017）。
 
-两种载体的删除链在这里合流：md 在 LangGraph Store（`session_store.clear`），
-二进制（xlsx）在对象存储（前缀 `sessions/{h(identity)}/{thread_id}/`）+ PG 的
-`session_object` 行。顺序：先删行、再删前缀——行留着会让配额虚高，对象删不掉只是垃圾。
+两种载体（md / xlsx）合流在这里：字节在对象存储，归属在 PG `session_object`。
+顺序：先删行、再删对象——行留着会让配额虚高，对象删不掉只是垃圾（有对账脚本）。
+最后再清一次 LangGraph Store：只有老部署（ADR-0013 时代）的 md 还躺在那儿。
 
 为什么用「注册一条同名路由遮挡核心路由」：aegra 的 `delete_thread` 只删 checkpoint 与
 thread 行，不认识 store。`src/` 默认不动，所以把清理放在这一层。可行是因为

@@ -179,25 +179,25 @@ _Avoid_: 把子 agent 的 thread 叫会话（它是任务的私生子线程，�
 
 **Session file（会话文件）**:
 用户在某个 Session 里上传的原文件，**只对上传者本人、只在这个会话可见，不属于任何 Space**。
-两种载体：md 存 LangGraph Store（`(uploads, hash(identity), 会话 thread_id)`）；xlsx 等二进制存
-对象存储（`(hash(identity), 会话 thread_id)` 前缀），字节不进 Store。**生命周期都是「会话在它就在」**：
-会话删除即删；md 靠孤儿保留期兜底，二进制靠删除链 + 对象存储生命周期兜底。
+两种载体（md / xlsx）走同一条链：字节进对象存储 `uploads/<uuid>/<名>`，归属只记 PG
+`session_object` 行（md 的 `space` 为 NULL）。**生命周期都是「会话在它就在」**：会话删除即删
+（先删行 → 再删对象）；漏掉的对象靠 `scripts/reap_orphans.py` 对账。
 路径 `/uploads/<文件名>`。
 _Avoid_: 把它当 Space 知识（Space 知识对空间成员共享，会话文件只对上传者本人的这个会话可见）；
 叫附件、临时文件（它不是临时件：会话在它就在）；把上传的 xlsx 叫「空间表」
 （它不落 `knowledge/<空间>/`，存量手工放盘的表才是），或叫「空间文件」
 
-**Orphan retention（孤儿保留期）**:
-会话文件 item 的 TTL（默认 72 小时，env 可覆写），语义是**最后读取后多久**过期，不是绝对寿命：
-主管每轮 run 起始查一次清单会续期，所以在用的会话永不失效，只有再没人读的文件才过期。
-它只是垃圾兜底，不是保留策略——保留策略是「会话在，文件在」。
-_Avoid_: 把它当保留期（用户会发现隔天文件消失的期望差）；把它当清理主路径（主路径是删会话）
+**Orphan object（孤儿对象）**:
+对象存储里有字节、`session_object` 里没有对应行的东西（例如删会话时行已删、对象没删成）。
+它不属于任何会话，也没有 TTL——靠 `scripts/reap_orphans.py` 对账（缺省只报告）。
+_Avoid_: 把它当保留策略（保留策略是「会话在，文件在」）；指望它自己过期（旧版 md 在 LangGraph
+Store 时代有 72h TTL，现在没有了）
 
 **Upload leftover（上传残留）**:
 一次上传没走完就留在对象存储里的东西：`tmp/` 下的中间对象（复制到正式 key 之前的那份），
 与超时未完成的分片上传。它不是会话文件、不属于任何会话，也不随删会话消失——
 这是**垃圾**，靠 `scripts/reap_multipart.py` 定期清（或对象存储的生命周期规则兜底）。
-_Avoid_: 把它当孤儿会话文件（那个有保留期、由 Store 的 TTL 管）；把它当正常数据去对账
+_Avoid_: 把它当孤儿对象（那个由 `reap_orphans.py` 对账）；把它当正常数据去对账
 （它会让物理用量大于 PG 里的 `sum(size_bytes)`）
 
 **Untrusted content（不可信内容）**:
@@ -222,11 +222,10 @@ _Avoid_: 把它当第二个真相（真相是对象存储里的字节 + PG 里�
 （没有转换语义，只是换个存储引擎）；对它做配额或计费（它随时会消失）
 
 **Blob store（对象存储）**:
-SeaweedFS，S3 协议。存会话文件里的二进制（xlsx）与由它派生的表索引，前缀按
-`(hash(上传者 identity), 会话 thread_id)` 隔离——与 Store 的会话文件命名空间同一组键。
-它和 LangGraph Store 是两套东西：Store 放 JSON 文本（md 会话文件），对象存储放二进制。
-_Avoid_: 把两者都说成 "store"；用 S3Backend 之类的说法（本仓库不往 deepagents 的
-backend 里塞对象存储，xlsx 工具自己直连）；把它当 Space 隔离（它按会话隔离，不是按空间）
+SeaweedFS，S3 协议。存会话文件的字节（md 与 xlsx）与由 xlsx 派生的表索引；上传 key 是
+`uploads/<uuid>/<名>`，隔离靠 PG 台账 `session_object`（owner + thread + name）而不是前缀。
+md 与 xlsx 的字节**都在这里**（`uploads/<uuid>/<名>`）；LangGraph Store 只剩历史遗留数据。
+_Avoid_: 把两者都说成 "store"；用 S3Backend 之类的说法（对象存储只经 `shared/session/blobs.py` 与 `graphs/access/` 访问）；把它当 Space 隔离（它按会话隔离，不是按空间）
 
 **Table rule（表规则）**:
 「这张上传的表能不能被当成表来处理」的判定：**只看结构合法性**——是 `.xlsx`、能被解析、
@@ -261,6 +260,6 @@ FastAPI / LangChain / deepagents。唯一例外：`graphs/tools/xlsx` 懒加载
 `okf.backend` 只有两种：`local`（读 `knowledge/`，本地盘）与 `s3fs`（直读对象存储
 `okf/` 前缀，无本地副本）；两种模式共用同一套空间判定（`graphs/access/backend.py`
 的 `SpaceGuard`）。会话上传的字节在对象存储里（`uploads/<uuid>/<名>`，归属只记 PG
-台账 `session_object`），拿不到对象存储时退回 LangGraph Store 命名空间。
+台账 `session_object`），没有对象存储时上传接口整体不可用（503）。
 _Avoid_: 往 `graphs/` 里放数据；在 `custom/` 里放图侧要用的模块（要放就放 `shared/`）；
 在两个包根目录新增文件（根目录只放入口）

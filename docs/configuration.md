@@ -328,13 +328,12 @@ checkpoint），而启动日志里**没有任何告警**。
 
 #### 会话文件 md（`shared/session/store.py`）
 
-md 进 LangGraph Store，按（上传者, 主管 thread）隔离。
+md 与 xlsx 走同一条链（ADR-0017）：字节进对象存储 `uploads/<uuid>/<名>`，归属按（上传者, 主管 thread）记在 PG `session_object`。
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
 | `session_files.max_upload_mb` | `10` | `MAX_UPLOAD_MB` | md 单文件上限（`POST /custom/uploads`） |
 | `session_files.max_files_per_session` | `50` | `MAX_FILES_PER_SESSION` | md 每会话文件数 |
-| `session_files.upload_ttl_minutes` | `4320`（72h） | `UPLOAD_TTL_MINUTES` | md 的孤儿保留期，语义是「最后读取后多久」 |
 
 #### 会话大表 xlsx（`custom/service/session_files.py`、`graphs/tools/xlsx/`）
 
@@ -345,8 +344,7 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 | `xlsx.max_blob_mb` | `10` | `MAX_BLOB_MB` | xlsx 单文件上限（`POST /custom/uploads/tables`） |
 | `xlsx.max_cells` | `2000000` | `MAX_CELLS` | 表结构硬闸；超了第一次调工具就报错，不静默截断 |
 | `xlsx.max_xlsx_files_per_session` | `20` | `MAX_XLSX_FILES_PER_SESSION` | 每会话 xlsx 个数（同名覆盖不占名额） |
-| `xlsx.max_md_files_per_session` | `10` | `MAX_MD_FILES_PER_SESSION` | 每会话 md 个数（与上面那个分开计）。⚠ **当前代码没读这个键**：md 的每会话个数上限实际由 `session_files.max_files_per_session`（50）执行，改这个键不生效 |
-| `xlsx.max_blob_mb_per_user` | `2048` | `MAX_BLOB_MB_PER_USER` | 每用户二进制总量 |
+| `xlsx.max_blob_mb_per_user` | `2048` | `MAX_BLOB_MB_PER_USER` | 每用户字节总量（**md + xlsx 合算**） |
 | `xlsx.cache_dir` | `.cache/xlsx` | `XLSX_CACHE_DIR` | 索引与字节的本机缓存（必须在 OKF 根之外） |
 | `xlsx.cache_ttl_days` | `7` | `XLSX_CACHE_TTL_DAYS` | 本机缓存保留天数 |
 | `xlsx.query_budget_ms` | `5000` | `XLSX_QUERY_BUDGET_MS` | 单次 `where` 查询的 CPU 预算，超了 `interrupt()` |

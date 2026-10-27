@@ -62,8 +62,19 @@ def test_quota_overwrite_does_not_take_a_new_slot(limits):
 
 
 def test_quota_rejects_new_file_when_session_full(limits):
-    msg = limits.quota_violation(used_bytes=0, old_bytes=0, new_bytes=10, thread_count=3, is_overwrite=False)
-    assert msg and "xlsx 文件数已达上限" in msg
+    """上限由调用方按类别传入（md 与 xlsx 各算各的）。"""
+    msg = limits.quota_violation(
+        used_bytes=0, old_bytes=0, new_bytes=10, thread_count=3, is_overwrite=False, thread_limit=3, kind="xlsx"
+    )
+    assert msg and "xlsx 文件数已达上限（3）" in msg
+
+
+def test_quota_kind_appears_in_message(limits):
+    """md 与 xlsx 走同一个函数，报错里得说清是哪一类满了。"""
+    msg = limits.quota_violation(
+        used_bytes=0, old_bytes=0, new_bytes=10, thread_count=9, is_overwrite=False, thread_limit=9, kind="md"
+    )
+    assert msg and "md 文件数已达上限（9）" in msg
 
 
 def test_quota_counts_other_sessions_for_bytes(limits):

@@ -1,7 +1,7 @@
 # 会话文件：md 进 Store、xlsx 进对象存储，都私有且随会话删
 
 > 状态：**已由 [ADR-0017](./0017-files-read-through-one-backend.md) 订正**（2026-02-12）：
-> md 也进对象存储，**Store 只在「本地没配对象存储」的 demo 模式用**；xlsx 的对象 key 改成
+> md 也进对象存储（**Store 只剩清场老数据的 `clear()`**）；存储 key 改成
 > `uploads/<uuid>/<名>`，归属只记台账 `session_object`（不再从 key 或文件名推导）。
 > 本文其余结论（私有、随会话删、配额）不变。
 >
@@ -52,7 +52,7 @@
 
 - 必须 ∈ 该用户的 `user_spaces`，否则 422 拒收（这是「表规则」的一部分）；
 - 主管据此决定派哪个 space 子 agent 分析（表不属于任何 space，但主题属于）；
-- **存储前缀仍是 `sessions/{h(identity)}/{thread_id}/`**，与 space 无关。
+- **存储 key 仍是 `uploads/<uuid>/<名>`**（ADR-0017 改的；此前的 `sessions/{h}/{thread}/{sha16}/` 不再使用），与 space 无关。
 
 这样"按空间分配"和"仅上传者可见 + 随会话删"同时成立。
 

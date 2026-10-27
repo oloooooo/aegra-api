@@ -17,12 +17,14 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared import config
 from custom.db.models import SessionObject, UserTables
+from shared import config
 
 # 每会话文件数：md 与 xlsx 分开计（文件名规则、载体、读法都不同）
-MAX_MD_FILES_PER_SESSION = int(config.get("xlsx.max_md_files_per_session"))
+MAX_FILES_PER_SESSION = int(config.get("session_files.max_files_per_session"))
 MAX_XLSX_FILES_PER_SESSION = int(config.get("xlsx.max_xlsx_files_per_session"))
+# 单个 md 的 HTTP 层上限
+MAX_UPLOAD_MB = int(config.get("session_files.max_upload_mb"))
 # 每用户二进制总量：会话数 × 每会话文件数相乘会失控，必须有这道闸
 MAX_BYTES_PER_USER = int(config.get("xlsx.max_blob_mb_per_user")) * 1024 * 1024
 # 单个 xlsx 的 HTTP 层上限（与 md 的 max_upload_mb 分开）
@@ -55,6 +57,8 @@ def quota_violation(
     new_bytes: int,
     thread_count: int,
     is_overwrite: bool,
+    thread_limit: int = MAX_XLSX_FILES_PER_SESSION,
+    kind: str = "xlsx",
 ) -> str | None:
     """返回拒绝原因，或 None 表示放行。纯函数：不碰 DB，便于覆盖边界。"""
     total = used_bytes - old_bytes + new_bytes
@@ -63,8 +67,8 @@ def quota_violation(
             f"二进制文件总量超出上限（{MAX_BYTES_PER_USER // (1024 * 1024)}MB），"
             f"本次上传后约 {total // (1024 * 1024)}MB，请删掉不用的文件"
         )
-    if not is_overwrite and thread_count >= MAX_XLSX_FILES_PER_SESSION:
-        return f"本会话的 xlsx 文件数已达上限（{MAX_XLSX_FILES_PER_SESSION}），同名覆盖不受限"
+    if not is_overwrite and thread_count >= thread_limit:
+        return f"本会话的 {kind} 文件数已达上限（{thread_limit}），同名覆盖不受限"
     return None
 
 
@@ -74,7 +78,7 @@ async def upsert(
     owner: str,
     thread_id: str,
     name: str,
-    space: str,
+    space: str | None,
     object_key: str,
     sha256: str,
     size_bytes: int,
@@ -91,10 +95,22 @@ async def upsert(
         select(func.coalesce(func.sum(SessionObject.size_bytes), 0)).where(SessionObject.owner_identity == owner)
     )
     old = await session.get(SessionObject, (owner, thread_id, name))
+    # 文件名决定类别：md 与 xlsx 的文件数上限各算各的（不分类的话 md 会吃掉表的配额）
+    is_table = name.lower().endswith(_XLSX_SUFFIX)
+    kind = "xlsx" if is_table else "md"
+    kind_filter = (
+        SessionObject.name.ilike(f"%{_XLSX_SUFFIX}")
+        if is_table
+        else ~SessionObject.name.ilike(f"%{_XLSX_SUFFIX}")
+    )
     count = await session.scalar(
         select(func.count())
         .select_from(SessionObject)
-        .where(SessionObject.owner_identity == owner, SessionObject.thread_id == thread_id)
+        .where(
+            SessionObject.owner_identity == owner,
+            SessionObject.thread_id == thread_id,
+            kind_filter,
+        )
     )
 
     message = quota_violation(
@@ -103,6 +119,8 @@ async def upsert(
         new_bytes=size_bytes,
         thread_count=int(count or 0),
         is_overwrite=old is not None,
+        thread_limit=MAX_XLSX_FILES_PER_SESSION if is_table else MAX_FILES_PER_SESSION,
+        kind=kind,
     )
     if message:
         raise QuotaExceeded(message)

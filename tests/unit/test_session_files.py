@@ -1,4 +1,4 @@
-"""会话文件存储层与清单注入的单元测试（ADR-0013）。"""
+"""会话文件存储层与清单注入的单元测试（ADR-0015 / ADR-0017）。"""
 
 from __future__ import annotations
 
@@ -60,40 +60,7 @@ def test_namespace_is_ascii_safe_and_deterministic() -> None:
     assert ss.session_namespace("李四", "thread-1") != ns  # 不同用户不共享
 
 
-def test_key_keeps_leading_slash() -> None:
-    """CompositeBackend 把 /uploads/x.md 剥成 /x.md 直接当 store key，丢了斜杠就读不到。"""
-    assert ss.session_key("报告.md") == "/报告.md"
-    assert ss.session_key("/报告.md") == "/报告.md"
-    assert ss.virtual_path("报告.md") == "/uploads/报告.md"
-
-
-# ---------- 读写 ----------
-
-
-async def test_put_md_sets_ttl_and_file_data_shape() -> None:
-    store = FakeStore()
-    meta = await ss.put_md(store, "luoxin", "t-1", "a.md", "hello")
-
-    ns, key, value, ttl = store.puts[0]
-    assert ns == ss.session_namespace("luoxin", "t-1")
-    assert key == "/a.md"
-    assert ttl == ss.UPLOAD_TTL_MINUTES
-    # deepagents StoreBackend 只认这几个键
-    assert value["content"] == "hello" and value["encoding"] == "utf-8"
-    assert value["created_at"] and value["modified_at"]
-    assert meta["path"] == "/uploads/a.md" and meta["bytes"] == 5
-
-
-async def test_list_files_reports_truncation() -> None:
-    items = [FakeItem(f"/f{i}.md", {"content": "x", "created_at": "2026-01-01"}) for i in range(3)]
-    store = FakeStore(items)
-    rows, truncated = await ss.list_files(store, "u", "t", limit=2)
-
-    assert len(rows) == 2 and truncated is True
-    assert rows[0]["path"] == "/uploads/f0.md"
-    # 活跃会话读清单即续期，孤儿才过期
-    assert store.searches[0][1]["refresh_ttl"] is True
-    assert store.searches[0][1]["limit"] == 3  # limit+1 只为判断截断
+# ---------- Store 遗留清场（老部署的 md 还在 store 里） ----------
 
 
 async def test_clear_deletes_by_putting_none() -> None:
@@ -120,14 +87,32 @@ def _patch_config(monkeypatch: pytest.MonkeyPatch, thread_id: str = "t-1") -> No
     monkeypatch.setattr(sf, "get_config", fake_config)
 
 
+def _patch_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict],
+    truncated: bool = False,
+    calls: list | None = None,
+) -> None:
+    async def fake_ledger(identity: str, thread_id: str):
+        if calls is not None:
+            calls.append((identity, thread_id))
+        return rows, truncated
+
+    monkeypatch.setattr(sf, "_ledger_files", fake_ledger)
+
+
+_ROW = {"name": "a.md", "path": "/uploads/a.md", "bytes": 5, "created_at": "now"}
+
+
 async def test_middleware_queries_once_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_config(monkeypatch)
-    store = FakeStore([FakeItem("/a.md", {"content": "hello", "created_at": "now"})])
-    mw = sf.SessionFilesMiddleware(store=store)
+    calls: list = []
+    _patch_ledger(monkeypatch, [_ROW], calls=calls)
+    mw = sf.SessionFilesMiddleware()
 
     assert await mw.abefore_agent({}, None) is None  # 不写 state
     assert await mw.abefore_agent({}, None) is None
-    assert len(store.searches) == 1
+    assert len(calls) == 1
 
 
 class FakeRequest:
@@ -142,8 +127,8 @@ class FakeRequest:
 
 async def test_middleware_injects_listing_as_untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_config(monkeypatch)
-    store = FakeStore([FakeItem("/a.md", {"content": "hello", "created_at": "now"})])
-    mw = sf.SessionFilesMiddleware(store=store)
+    _patch_ledger(monkeypatch, [_ROW, {**_ROW, "name": "b.xlsx", "path": "/uploads/b.xlsx"}])
+    mw = sf.SessionFilesMiddleware()
 
     seen: list = []
 
@@ -156,13 +141,14 @@ async def test_middleware_injects_listing_as_untrusted(monkeypatch: pytest.Monke
 
     content = seen[0].system_message.content
     assert "原本的提示" in content
-    assert "/uploads/a.md" in content
+    assert "/uploads/a.md" in content and "/uploads/b.xlsx" in content  # 两张载体同一份清单
     assert "不可信" in content  # 文件内容是资料，不是指令
 
 
 async def test_middleware_passes_through_without_files(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_config(monkeypatch)
-    mw = sf.SessionFilesMiddleware(store=FakeStore([]))
+    _patch_ledger(monkeypatch, [])
+    mw = sf.SessionFilesMiddleware()
 
     request = FakeRequest(SystemMessage(content="原"))
     called: list = []
@@ -175,12 +161,9 @@ async def test_middleware_passes_through_without_files(monkeypatch: pytest.Monke
     assert called[0] is request  # 没有清单就不改请求
 
 
-async def test_middleware_reads_ledger_when_object_storage_configured(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """字节在对象存储时，清单真相是 PG 台账（`session_object`），而且不再会去碰 store。"""
+async def test_middleware_reads_the_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """清单真相是 PG 台账（`session_object`），中间件不再碰 LangGraph Store。"""
     _patch_config(monkeypatch)
-    monkeypatch.setattr(sf.blobs, "configured", lambda: True)
 
     class FakeSession:
         async def __aenter__(self):
@@ -193,15 +176,10 @@ async def test_middleware_reads_ledger_when_object_storage_configured(
         assert (owner, thread_id) == ("luoxin", "t-1")
         return [{"name": "a.xlsx", "path": "/uploads/a.xlsx", "space": "u", "bytes": 7, "created_at": "now"}]
 
-    async def fail_list_files(*_a, **_kw):
-        raise AssertionError("台账模式下不该再读 store")
-
     monkeypatch.setattr("custom.service.session_files.as_dicts", fake_as_dicts)
     monkeypatch.setattr("aegra_api.core.orm.get_session_maker", lambda: FakeSession)
-    monkeypatch.setattr(sf, "list_files", fail_list_files)
 
-    store = FakeStore([])
-    mw = sf.SessionFilesMiddleware(store=store)
+    mw = sf.SessionFilesMiddleware()
     seen: list = []
 
     async def handler(request):
@@ -210,7 +188,6 @@ async def test_middleware_reads_ledger_when_object_storage_configured(
 
     assert await mw.awrap_model_call(FakeRequest(SystemMessage(content="原")), handler) == "ok"
     assert "/uploads/a.xlsx" in seen[0].system_message.content
-    assert store.searches == []
 
 
 # ---------- 删会话的遮挡 ----------
@@ -344,8 +321,8 @@ async def test_read_limited_caps_size(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------- 主管的存储路由 ----------
 
 
-def test_supervisor_routes_uploads_to_store() -> None:
-    """/uploads/x.md 交给 StoreBackend（key 带前导斜杠），其余仍然按 space 判定。"""
+def test_supervisor_routes_uploads_to_uploads_backend() -> None:
+    """/uploads/x 交给 UploadsBackend（key 由台账查），其余仍然按 space 判定。"""
     from deepagents.backends.composite import _route_for_path
 
     from graphs.supervisor import supervisor_backend
@@ -355,8 +332,8 @@ def test_supervisor_routes_uploads_to_store() -> None:
         default=backend.default, sorted_routes=backend.sorted_routes, path=p
     )
 
-    store_be, key, prefix = route("/uploads/report.md")
-    assert type(store_be).__name__ == "StoreBackend"
+    uploads_be, key, prefix = route("/uploads/report.md")
+    assert type(uploads_be).__name__ == "UploadsBackend"
     assert (key, prefix) == ("/report.md", "/uploads/")
 
     space_be, _, prefix2 = route("/cbam-reporting/index.md")
@@ -365,13 +342,12 @@ def test_supervisor_routes_uploads_to_store() -> None:
 
 
 def test_backend_mode_switches_default_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`okf.backend: s3fs` 切默认 backend，`/uploads/` 路由跟着换（不再有 StoreBackend）。"""
+    """`okf.backend: s3fs` 只切默认 backend；`/uploads/` 路由不变（md 也在对象存储里）。"""
     from deepagents.backends.composite import _route_for_path
 
     from graphs.access import factory
 
     monkeypatch.setattr(factory, "backend_mode", lambda: "s3fs")
-    monkeypatch.setattr(factory.blobs, "configured", lambda: True)
     backend = factory.session_backend()
     assert type(backend.default).__name__ == "S3Backend"
     assert list(backend.routes) == ["/uploads/"]
@@ -395,41 +371,73 @@ async def test_clear_stops_on_misbehaving_store() -> None:
     assert len(stuck.batches) == ss._MAX_CLEAR_ROUNDS
 
 
-async def test_upload_rejects_when_session_is_full(monkeypatch: pytest.MonkeyPatch) -> None:
-    """每个会话的文件数上限：防单会话无限堆（TTL 只管孤儿，thread 配额只管会话数）。"""
-    from unittest.mock import AsyncMock
+class _FakeUpload:
+    """`UploadFile` 的最小替身：只实现 `filename` 与分块 `read`。"""
 
-    from fastapi import HTTPException
+    def __init__(self, filename: str, body: bytes = b"x") -> None:
+        self.filename = filename
+        self._buf = body
+
+    async def read(self, n: int) -> bytes:
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk
+
+
+def _patch_upload_session(monkeypatch: pytest.MonkeyPatch, rows: list | None = None):
+    """把端点依赖的 DB 与对象存储都换掉，返回 (module, session, user, put_bytes)。"""
+    from unittest.mock import AsyncMock, MagicMock
 
     import custom.api.uploads as up
+    from shared.session import blobs as blobs_mod
 
     session = AsyncMock()
     session.scalar = AsyncMock(return_value="t-1")  # 归属校验通过
-
     user = MagicMock()
     user.identity = "luoxin"
 
+    monkeypatch.setattr(up.session_files, "list_for_thread", AsyncMock(return_value=rows or []))
+    monkeypatch.setattr(up.session_files, "get_one", AsyncMock(return_value=None))
+    monkeypatch.setattr(up.session_files, "upsert", AsyncMock(return_value=None))
+    put = MagicMock()
+    monkeypatch.setattr(blobs_mod, "put_bytes", put)
+    monkeypatch.setattr(blobs_mod, "delete", MagicMock())
+    return up, session, user, put
+
+
+async def test_upload_stores_bytes_and_ledger_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """md 与 xlsx 同一条链路：字节进 `uploads/<uuid>/<名>`，行写台账，`space` 为 NULL。"""
+    import hashlib
+
+    up, session, user, put = _patch_upload_session(monkeypatch)
+    body = b"# hi"
+    resp = await up.upload_session_file(session, user, "t-1", _FakeUpload("notes.md", body))
+
+    assert resp.path == "/uploads/notes.md" and resp.bytes == len(body)
+    key, sent = put.call_args.args
+    assert key.startswith("uploads/") and key.endswith("/notes.md")
+    assert sent == body
+
+    # upsert 必须带上「无空间」与内容指纹
+    kwargs = up.session_files.upsert.call_args.kwargs
+    assert kwargs["space"] is None
+    assert kwargs["object_key"] == key
+    assert kwargs["sha256"] == hashlib.sha256(body).hexdigest()
+    assert kwargs["size_bytes"] == len(body)
+    session.commit.assert_awaited()
+
+
+async def test_upload_rejects_when_session_is_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    """同类文件数上限；同名重传是覆盖，不受上限影响。"""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    rows = [SimpleNamespace(name=f"{i}.md") for i in range(2)]
+    up, session, user, _ = _patch_upload_session(monkeypatch, rows)
     monkeypatch.setattr(up, "MAX_FILES_PER_SESSION", 2)
-    full = [{"path": f"/uploads/{i}.md", "bytes": 1, "created_at": "", "name": f"{i}.md"} for i in range(2)]
-    monkeypatch.setattr(up, "list_files", AsyncMock(return_value=(full, False)))
-    meta = {"name": "1.md", "path": "/uploads/1.md", "bytes": 1, "uploaded_at": "now", "ttl_minutes": 4320}
-    monkeypatch.setattr(up, "put_md", AsyncMock(return_value=meta))
-    monkeypatch.setattr(up.db_manager, "get_store", lambda: AsyncMock())
-
-    class FakeUpload:
-        def __init__(self, filename: str) -> None:
-            self.filename = filename
-            self._sent = False
-
-        async def read(self, n: int) -> bytes:
-            if self._sent:
-                return b""
-            self._sent = True
-            return b"x"
 
     with pytest.raises(HTTPException) as exc:
-        await up.upload_session_file(session, user, "t-1", FakeUpload("new.md"))
+        await up.upload_session_file(session, user, "t-1", _FakeUpload("new.md"))
     assert exc.value.status_code == 413
 
-    # 同名重传是覆盖，不受上限影响
-    await up.upload_session_file(session, user, "t-1", FakeUpload("1.md"))
+    assert await up.upload_session_file(session, user, "t-1", _FakeUpload("1.md")) is not None

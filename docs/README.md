@@ -15,7 +15,7 @@
 | [configuration.md](./configuration.md) | **配置参考**：`aegra.json` 逐键说明与启动期报错、graph key / `assistant_id` 契约、**配置来源三分（§3.1 aegra 原生环境变量 / §3.2 本项目新增的 `config.yaml` / §3.3 密钥）**、日志（stdout + `logs/aegra.log` 轮转与保留）、OpenTelemetry / Prometheus、排错对照表 |
 | [streaming.md](./streaming.md) | **流式参考**：`client.stream` 结构与全部 9 种模式实测矩阵、aegra 模式处理与 `version="v2"` 硬编码、deepagents/`astream_events` 适配、v3 进程内✅/HTTP❌、前端 vs 调试选型、子图流不回传等坑、子 agent 流代理与 `async_tasks` 僵尸状态 |
 | [frontend-api.md](./frontend-api.md) | **前端接口参考**：`custom/api/` 下的前端接口（`account.py` 注册/登录/whoami + `graphs.py` 图清单 + `spaces.py` 空间与文件树/成员 + `tasks.py` 任务状态/流/取消 + `uploads.py` md 与会话大表上传，共 16 个）+ 2 个投递 ack 内部接口（`delivery.py`）、鉴权与 token 时长、原生接口清单、SSE 帧契约（增量 / interrupt-resume / 回写消息识别）、定时任务实测行为、会话删除与已知限制 |
-| [large-files.md](./large-files.md) | **会话文件与大表（实现说明）**：md→Store / xlsx→S3 双载体、`sessions/{h}/{thread}/` 前缀、文件名 `<space>_*.xlsx` 只做路由、签名 `session_scope`、ingest → SQLite、多副本一致性、已知限制与测试清单 |
+| [large-files.md](./large-files.md) | **会话文件与大表（实现说明）**：md 与 xlsx 统一走对象存储 + PG 台账、文件名 `<space>_*.xlsx` 只做路由、签名 `session_scope`、ingest → SQLite、多副本一致性、已知限制与测试清单 |
 | [S3.md](./S3.md) | **对象存储操作手册**：起 SeaweedFS、全部相关 env（大小/配额/缓存）、「本地文件怎么进 S3」三条路（空间知识 `aws s3 sync` / 会话大表 HTTP / 运维直连）、key 布局、上限判定顺序、校验与排错、清理与容量对账 |
 | [adr/](./adr/README.md) | **决定记录**：现行 10 篇 + 历史 6 篇（`adr/archive/`）。索引里按编号列出「一句话结论 + 代码落点」，并给了按主题的阅读顺序（权限与空间 / 任务投递 / 会话文件与大表 / 配额） |
 
