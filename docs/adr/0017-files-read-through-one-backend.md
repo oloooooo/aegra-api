@@ -107,7 +107,8 @@
 1. **`write` 不是 CAS**（见上）。两个副本同时 `write` 同一路径 → 后写的赢，无告警。
 2. **`edit` 的 CAS 只在支持条件写的对象存储上成立**。SeaweedFS 自 PR #7154 起支持
    `If-Match`/`If-None-Match`（filer 同一把锁内判定+写入）；**别的 S3 实现若忽略该头**，
-   `edit` 静默退化成 last-write-wins。`edit` 冲突只重试 1 次，之后把「文件已被改过」交给模型重读。
+   `edit` 静默退化成 last-write-wins（哪些实现、哪种拓扑不成立见缺陷 10）。`edit` 冲突只重试
+   1 次，之后把「文件已被改过」交给模型重读。
 3. **`glob`/`grep` 仍付一次全空间 LIST**（`read`/`ls`/`download_files` 已不再——见决定 9）。
    一次 `list_tree("okf/")` 在 2000 个对象上是 115 ms 且随对象数线性增长；`glob`/`grep` 本身
    就是「扫一批」，暂时接受。升级触发：单空间对象数 > ~1 万，或 LIST > 500 ms 时改成按子路径
@@ -132,8 +133,22 @@
    将来按前缀授权会连缓存目录一起暴露、也没法按会话整批清）。现在内部前缀映射到 `artifacts/`，
    `_keys()` 合并两个前缀的 LIST（多一次 LIST，换 `okf/` 语义干净）。存量对象没迁移：
    上线前 `okf/large_tool_results/` 之类若有内容，需手工搬到 `artifacts/`。
-10. **多集群不成立**：条件写的强一致只在同一 SeaweedFS 集群内；跨集群 `filer.sync` 是异步复制，
-    有最终一致窗口，CAS 会被打破。
+10. **条件写的边界：同集群多网关成立；跨集群、以及不实现条件写的存储都不成立。** 原子性要求
+    「检查 ETag」和「写入」被同一个东西串行化，所以判断只看这一点：
+    - **同一 SeaweedFS 集群内的多个 S3 网关 / 多个 filer：成立**。对象按 key 路由到 hash ring
+      上的 owner filer，由它的 `ObjectTransaction` 在同一把锁内判定+写入（PR #9629 route-by-key、
+      #8801 修 multipart 期间 TOCTOU），官方措辞是 cluster-wide atomic，与客户端连哪个网关无关。
+    - **两个独立集群 + `filer.sync`：不成立**。两边各有各的 hash ring，没有共享的串行化点：
+      同一个 ETag 在两个集群各自 `If-Match` 写会**都返回 200**，异步复制后一方编辑静默消失；
+      同一个复制窗口里 `ls`/`get` 也只能看到最终一致的结果。
+    - **不实现 PUT 条件头的 S3 实现：不成立，而且失败是静默的**。Ceph RGW 的 objectops 里 PUT 只认
+      `content-md5` / `content-type` / `x-amz-meta-*` / `x-amz-acl`（条件头只写在 GET/HEAD 下），
+      tracker 里 2014 年挂的 conditional PUT 至今没落地；MinIO 的客户端库确实发 `If-Match`，但服务端
+      是否真的强制执行没有公开证据（minio-go 自注释为 “MinIO specific extension”），要拿真机验。
+      **S3 协议没有「不支持该参数」的错误码**：头被忽略时响应仍是 200，`put_bytes` 里的
+      `_is_precondition_failed` 根本走不到，`edit` 就此悄悄变成 last-write-wins。
+      要支持这类存储，只能启动时做能力探测（用故意错的 `If-Match` 写探针对象，看是否 412），
+      探不过就 fail-closed——当前选择是「先不开写」，所以探测也没做。
 11. **`UploadsBackend` 的同步协议方法不实现**（继承 `BackendProtocol` 默认 → `NotImplementedError`）。
     框架实际只用异步版本（`aread/als/aglob/agrep/adownload_files`）；任何同步调用路径都会抛错。
 12. **e2e 是一份手动脚本，没接 CI**：`scripts/e2e_s3fs.py` 对着真 SeaweedFS 跑（2026-02-12
