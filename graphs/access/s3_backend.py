@@ -16,7 +16,9 @@
 - ``UploadsBackend``   ``/uploads/`` 会话上传文件，**只读**。对象 key 是
                       `uploads/<uuid>/<name>`（不可从名字推导），唯一路由是 PG 台账
                       `session_object`，所以它只能异步查库：框架调用的正是
-                      `aread/als/aglob/agrep/adownload_files`，同步方法一律报错。
+                      `aread/als/aglob/agrep/adownload_files`。同步版**不实现**：
+                      继承 `BackendProtocol` 的默认（`NotImplementedError`），因为同步读要
+                      把 async PG 会话跑在另一个事件循环里——本地/单副本都不成立。
 
 shortcut: `UploadsBackend` 每个动作查一次台账（一次主键索引查询），不按 run 缓存——
 缓存会让「同一 run 内新上传的文件看不见」这种一致性坑变得难以排查，等真有量再谈。
@@ -28,7 +30,7 @@ import asyncio
 import base64
 import posixpath
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any
 
 import structlog
 from deepagents.backends.protocol import (
@@ -154,6 +156,7 @@ class _ObjectTree:
             FileInfo(path=f"{base}{d}/", is_dir=True, size=0) for d in sorted(dirs) if self._shown(f"{base}{d}")
         ]
         entries.extend(files)
+        entries.sort(key=lambda e: e["path"])  # 与 FilesystemBackend 同序（纯按虚拟路径排）
         if not entries and vpath != "/":
             return LsResult(error=f"Path '{vpath}' not found")
         return LsResult(entries=entries)
@@ -427,9 +430,6 @@ class UploadsBackend(_ObjectTree, BackendProtocol):
             rows = await session_files.list_for_thread(session, owner, thread_id)
         return {f"/{r.name}": _Obj(r.object_key, r.size_bytes) for r in rows}
 
-    def _keys(self) -> dict[str, _Obj]:
-        raise RuntimeError("UploadsBackend 只能异步读取：对象 key 要查台账（见 _rows）")
-
     def _gate_write(self, vpath: str) -> str | None:  # noqa: ARG002
         return _READ_ONLY
 
@@ -460,27 +460,7 @@ class UploadsBackend(_ObjectTree, BackendProtocol):
         keys = await self._rows()
         return await asyncio.to_thread(self._download, keys, paths)
 
-    # ---------- 协议：同步（拿不到台账，明确拒绝） ----------
-
-    def _sync_refused(self) -> NoReturn:
-        raise RuntimeError("UploadsBackend 只能异步读取：对象 key 要查台账（见 _rows）")
-
-    def ls(self, path: str) -> LsResult:  # noqa: ARG002
-        self._sync_refused()
-
-    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:  # noqa: ARG002
-        self._sync_refused()
-
-    def glob(self, pattern: str, path: str | None = None) -> GlobResult:  # noqa: ARG002
-        self._sync_refused()
-
-    def grep(
-        self, pattern: str, path: str | None = None, glob: str | None = None, *, max_count: int | None = None
-    ) -> GrepResult:  # noqa: ARG002
-        self._sync_refused()
-
-    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:  # noqa: ARG002
-        self._sync_refused()
+    # ---------- 协议：写（同步版就是继承来的 async 默认实现要调的那个） ----------
 
     def write(self, file_path: str, content: str) -> WriteResult:  # noqa: ARG002
         return WriteResult(error=_READ_ONLY)

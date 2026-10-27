@@ -1,6 +1,11 @@
 # 会话文件：md 进 Store、xlsx 进对象存储，都私有且随会话删
 
-> 状态：**主体已实现**（决定 2026-10-25，第 3 稿；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
+> 状态：**已由 [ADR-0017](./0017-files-read-through-one-backend.md) 订正**（2026-02-12）：
+> md 也进对象存储，**Store 只在「本地没配对象存储」的 demo 模式用**；xlsx 的对象 key 改成
+> `uploads/<uuid>/<名>`，归属只记台账 `session_object`（不再从 key 或文件名推导）。
+> 本文其余结论（私有、随会话删、配额）不变。
+>
+> 历史状态：**主体已实现**（决定 2026-10-25，第 3 稿；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
 > 本文取代第 1 稿「大表挂 space」的全部内容（那版已作废，理由见文末「作废记录」）。
 > 实现细节见 [`../large-files.md`](../large-files.md)；空间内容进 S3 见 [ADR-0016](./0016-spaces-in-object-storage.md)。
 > 落点：`shared/session/blobs.py`（S3、自管分片可 abort、`delete_prefix`）、`custom/service/session_files.py`（配额与行）、

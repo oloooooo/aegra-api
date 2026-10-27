@@ -8,13 +8,15 @@ import pytest
 from fastapi import FastAPI
 from langchain_core.messages import SystemMessage
 
-from shared.session import store as ss
 from custom.middleware.threads_delete import (
     assert_shadows_core_delete,
     delete_thread,
+)
+from custom.middleware.threads_delete import (
     router as threads_delete_router,
 )
 from graphs.middleware import session_files as sf
+from shared.session import store as ss
 
 
 class FakeItem:
@@ -134,7 +136,7 @@ class FakeRequest:
     def __init__(self, system_message: SystemMessage | None = None) -> None:
         self.system_message = system_message
 
-    def override(self, *, system_message: SystemMessage) -> "FakeRequest":
+    def override(self, *, system_message: SystemMessage) -> FakeRequest:
         return FakeRequest(system_message)
 
 
@@ -171,6 +173,44 @@ async def test_middleware_passes_through_without_files(monkeypatch: pytest.Monke
 
     assert await mw.awrap_model_call(request, handler) == "ok"
     assert called[0] is request  # 没有清单就不改请求
+
+
+async def test_middleware_reads_ledger_when_object_storage_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """字节在对象存储时，清单真相是 PG 台账（`session_object`），而且不再会去碰 store。"""
+    _patch_config(monkeypatch)
+    monkeypatch.setattr(sf.blobs, "configured", lambda: True)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    async def fake_as_dicts(_session, owner, thread_id):
+        assert (owner, thread_id) == ("luoxin", "t-1")
+        return [{"name": "a.xlsx", "path": "/uploads/a.xlsx", "space": "u", "bytes": 7, "created_at": "now"}]
+
+    async def fail_list_files(*_a, **_kw):
+        raise AssertionError("台账模式下不该再读 store")
+
+    monkeypatch.setattr("custom.service.session_files.as_dicts", fake_as_dicts)
+    monkeypatch.setattr("aegra_api.core.orm.get_session_maker", lambda: FakeSession)
+    monkeypatch.setattr(sf, "list_files", fail_list_files)
+
+    store = FakeStore([])
+    mw = sf.SessionFilesMiddleware(store=store)
+    seen: list = []
+
+    async def handler(request):
+        seen.append(request)
+        return "ok"
+
+    assert await mw.awrap_model_call(FakeRequest(SystemMessage(content="原")), handler) == "ok"
+    assert "/uploads/a.xlsx" in seen[0].system_message.content
+    assert store.searches == []
 
 
 # ---------- 删会话的遮挡 ----------
@@ -322,6 +362,23 @@ def test_supervisor_routes_uploads_to_store() -> None:
     space_be, _, prefix2 = route("/cbam-reporting/index.md")
     assert type(space_be).__name__ == "SpaceBackend"
     assert prefix2 is None
+
+
+def test_backend_mode_switches_default_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`okf.backend: s3fs` 切默认 backend，`/uploads/` 路由跟着换（不再有 StoreBackend）。"""
+    from deepagents.backends.composite import _route_for_path
+
+    from graphs.access import factory
+
+    monkeypatch.setattr(factory, "backend_mode", lambda: "s3fs")
+    monkeypatch.setattr(factory.blobs, "configured", lambda: True)
+    backend = factory.session_backend()
+    assert type(backend.default).__name__ == "S3Backend"
+    assert list(backend.routes) == ["/uploads/"]
+    routed, key, prefix = _route_for_path(
+        default=backend.default, sorted_routes=backend.sorted_routes, path="/uploads/a.md"
+    )
+    assert (type(routed).__name__, key, prefix) == ("UploadsBackend", "/a.md", "/uploads/")
 
 
 async def test_clear_stops_on_misbehaving_store() -> None:

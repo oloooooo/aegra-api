@@ -8,8 +8,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Annotated, Any
 
 import structlog
@@ -26,39 +24,18 @@ from custom.api.schemas import (
     ListUserSpaceResponse,
 )
 from custom.db.repositories import SpaceRepository, UserSpaceRepository
-from shared.knowledge.spec import scaffold_space, space_dir, space_rel_path, valid_space_name
+from shared.knowledge.spec import (
+    scaffold_space,
+    space_exists,
+    space_file_count,
+    space_files,
+    space_rel_path,
+    valid_space_name,
+)
 
 logger = structlog.getLogger(__name__)
 
 router = APIRouter(prefix="/custom", tags=["/custom"])
-
-
-
-def _count_files(root: Path) -> int:
-    """空间内文件数（同步遍历）。调用方必须用 `asyncio.to_thread`：`rglob` 是阻塞 IO，
-    直接在 `async def` 里跑会卡住事件循环（space 一大，每次打开空间页都卡）。"""
-    return sum(1 for p in root.rglob("*") if p.is_file()) if root.is_dir() else 0
-
-
-def _list_files(root: Path) -> list[dict[str, Any]]:
-    """空间文件树（同步遍历 + stat）。同上，必须经 `asyncio.to_thread` 调用。"""
-    out: list[dict[str, Any]] = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
-        try:
-            st = p.stat()
-        except OSError:
-            continue  # 遍历期间被删除/改名：跳过，不要让整个文件列表 500
-        out.append(
-            {
-                "path": "/" + p.relative_to(root).as_posix(),
-                "size": st.st_size,
-                "modified": datetime.fromtimestamp(st.st_mtime, UTC).isoformat(),
-                "ext": p.suffix.lower(),
-            }
-        )
-    return out
 
 
 async def _own_space_names(session: AsyncSession, user: User) -> set[str]:
@@ -88,9 +65,9 @@ async def list_spaces(
     is_super = "write" in (user.permissions or [])
     out = []
     for s in spaces:
-        # 目录以空间名派生（shared.knowledge.spec.space_dir），不读 space.path：
+        # 目录以空间名派生（shared.knowledge.spec.space_file_count），不读 space.path：
         # 数据目录搬过家（graphs/okf -> knowledge），存量行里的 path 是旧值。
-        files = await asyncio.to_thread(_count_files, space_dir(s.name))
+        files = await asyncio.to_thread(space_file_count, s.name)
         out.append(
             {
                 "name": s.name,
@@ -114,11 +91,10 @@ async def list_space_files(
     space = await SpaceRepository(session).get(space_name)
     if space is None:
         raise HTTPException(status_code=404, detail="空间不存在")
-    root = space_dir(space_name)
     rel = space_rel_path(space_name)
-    if not root.is_dir():
+    if not await asyncio.to_thread(space_exists, space_name):
         return {"space": space_name, "root": rel, "files": []}
-    return {"space": space_name, "root": rel, "files": await asyncio.to_thread(_list_files, root)}
+    return {"space": space_name, "root": rel, "files": await asyncio.to_thread(space_files, space_name)}
 
 
 @router.get("/spaces/{space_name}/users")

@@ -31,7 +31,7 @@ from graphs.access.factory import session_backend
 from graphs.middleware.async_task_guard import AsyncTaskGuard
 from graphs.middleware.session_files import SessionFilesMiddleware
 from graphs.access.spaces import allowed_spaces
-from shared.knowledge.spec import list_spaces, load_agent_spec, space_dir
+from shared.knowledge.spec import list_spaces, load_agent_spec, space_exists
 from graphs.prompts import MAIN_SYSTEM_PROMPT
 from graphs.tools import MAIN_TOOLS, XLSX_TOOLS
 
@@ -95,7 +95,7 @@ def domain_specs(config: RunnableConfig) -> dict[str, dict]:
     names = sorted(spaces) if spaces is not None else list_spaces()
     specs: dict[str, dict] = {}
     for name in names:
-        if not space_dir(name).is_dir():  # 表里有但目录没了：跳过，不让模型选到死链
+        if not space_exists(name):  # 表里有但目录没了：跳过，不让模型选到死链
             logger.warning("space_dir_missing", space=name)
             continue
         description, _ = load_agent_spec(name)

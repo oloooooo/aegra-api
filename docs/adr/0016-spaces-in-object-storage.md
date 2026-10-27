@@ -1,6 +1,11 @@
 # 空间内容进对象存储，backend 由 env 二选一
 
-> 状态：**已实现**（决定 2026-10-25；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
+> 状态：**镜像部分已由 [ADR-0017](./0017-files-read-through-one-backend.md) 取代**（2026-02-12）：
+> `okf.backend: s3fs` 直读对象存储，不再拉本地镜像；`pull`/`push`、`scripts/okf_{push,pull}_s3.py`
+> 与 `okf.backend: s3` 分支**待退役**。本 ADR 的「为什么不自己写 14 个方法」已被 0017 推翻：
+> 9 个 `a*` 方法都有默认实现，只需 9 个同步方法。
+>
+> 历史状态：**已实现**（决定 2026-10-25；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
 > 与 [ADR-0015](./0015-large-tables-in-object-storage.md) 配套：那边是会话文件，这边是空间知识。
 > 落点：`shared/knowledge/root.py`（`local` 直读 / `s3` 拉本地镜像，`pull`/`push`）、
 > `scripts/okf_push_s3.py` 与 `scripts/okf_pull_s3.py`、`config.yaml` 的 `okf.backend`。
