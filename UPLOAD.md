@@ -122,7 +122,7 @@ agent 视角                       真实落点
 
 | 谁 | 看到清单 | 看到内容 | 靠什么 |
 |---|---|---|---|
-| 主管 agent | 是（md + xlsx，最多 20 条，超出提示 `ls /uploads/`） | 是 | 清单由 `SessionFilesMiddleware` 每轮 run 起始查一次台账；内容走 `/uploads/` 路由 |
+| 主管 agent | 是（md + xlsx，最多 20 条：表保底 10 个名额，剩下给 md） | 是 | 清单由 `SessionFilesMiddleware` 每轮 run 起始查一次台账；内容走 `/uploads/` 路由 |
 | 子 agent（被派活） | **否** | 是（仅本会话） | 清单要自己 `ls /uploads/` 或由主管在派活文本里点名；内容靠派活签发的 `session_scope` |
 | 同用户的另一个会话 | 否 | 否 | 台账按 `(identity, thread_id)` 查，别的会话连 key 都拿不到 |
 | 另一个用户 | 否 | 否 | 上传接口强制 thread ownership（不是你的 → 404）；空间内容另有 `SpaceGuard` |

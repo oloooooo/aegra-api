@@ -122,12 +122,11 @@ event: end        data: {"status": "success"}
 把一个 md 文件挂到当前会话（[adr/0017](./adr/0017-files-read-through-one-backend.md)）。`multipart/form-data`，字段 `thread_id` + `file`。
 
 ```json
-{"name": "报告.md", "path": "/uploads/报告.md", "bytes": 12034,
- "uploaded_at": "2026-10-24T02:11:03+00:00", "ttl_minutes": 4320}
+{"name": "报告.md", "path": "/uploads/报告.md", "bytes": 12034}
 ```
 
 - 校验顺序固定：会话归属 → 文件名 → 扩展名 → 大小 → 编码。先挡归属与文件名，再边读边判大小（超限即 `413`），最后才解码。
-- 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `session_files.max_upload_mb`（默认 10）或本会话文件数已达 `session_files.max_files_per_session`（默认 50）`413`；store 未就绪 `503`。
+- 错误码：别人的会话 `404`（与原生接口一致，不给“存在但无权”的信号）；文件名非法/超 200 字符/非 UTF-8 `422`；非 `.md` `415`；超 `session_files.max_upload_mb`（默认 10）或会话文件数已到 `session_files.max_files_per_session`（默认 50）`413`；对象存储未配置 `503`。
 - 同名重传 = 覆盖（PUT 语义，`/uploads` 下永远只有一份），不占新名额。
 - 字节落在对象存储（`uploads/<uuid>/<名>`），归属记 PG `session_object`，**不进 Space**；`path` 是主管眼里的虚拟路径（`/uploads/<文件名>`）。主管与**同一条会话里派出的子 agent** 都能读到（子 agent 靠派活时签发的 `session_scope`）；主管**下一轮 run 起始**才拿到清单（`graphs/middleware/session_files.py`），所以本轮 run 看不到刚传的文件。
 - 没有 TTL：删会话即清空（先删行 → 再删对象）；漏掉的对象用 `scripts/reap_orphans.py` 对账。

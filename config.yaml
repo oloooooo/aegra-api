@@ -43,7 +43,7 @@ xlsx:
 # --- 对象存储（shared/session/blobs.py，ADR-0015/0017）---
 # 凭证**不在这里**，写 .env：S3_ACCESS_KEY / S3_SECRET_KEY（密钥不进 git）。
 s3:
-  # 空 = 不启用对象存储：上传会话大表返回 503，其余功能不受影响。
+  # 空 = 不启用对象存储：两种上传（md 与 xlsx）都返回 503，其余功能不受影响。
   endpoint: ""
   bucket: aegra-blobs
   region: us-east-1
