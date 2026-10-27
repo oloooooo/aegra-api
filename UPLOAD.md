@@ -111,15 +111,79 @@ agent 视角                       真实落点
 `h(identity)` = sha256 前 16 位（`shared/session/store.py::identity_digest`），只用于 md 的
 Store 命名空间；xlsx 的 key 不含身份，隔离靠台账行 + 每次读都按当前会话过滤。
 
-## 5. 删除与垃圾：三个责任人
+### 可见性边界
 
-| 什么 | 谁负责 |
+| 谁 | 看到清单 | 看到内容 | 靠什么 |
+|---|---|---|---|
+| 主管 agent | 是（md 与 xlsx 合并，最多 20 条） | 是 | 清单由 `SessionFilesMiddleware` 每轮 run 起始算一次（Store 列举 + 台账行合并） |
+| 子 agent（被派活） | **否** | 是（仅本会话） | 靠 `ls /uploads/` 自己发现（`UploadsBackend.als` 会把台账里的表合进来），或主管在派活文本里点名 |
+| 同用户的另一个会话 | 否 | 否 | md 按 Store 命名空间、xlsx 按台账行，两者都以 `(identity, thread_id)` 为键 |
+| 另一个用户 | 否 | 否 | 上传接口强制 thread ownership（不是你的 → 404）；空间内容另有 `SpaceGuard` |
+
+两件事容易搞混：
+
+- **清单注入 ≠ 后端能力**。清单是「告诉 agent 有什么」，后端是「按路径取字节」。主管两样都有，
+  子 agent 只有后者。子 agent 靠 `ls` 发现文件不是巧合：`als` 专门合并了台账，否则它只看得见 Store 里的 md。
+- **看不见 ≠ 不存在**。`ls /uploads/` 只列台账行与 Store 项；盘上可能有孤儿文件（删会话失败、上传中途
+  失败留下的 `.part-*` 与旧 key），对 agent 一律不可见，得手工对账。
+
+**写入恒被拒**：`/uploads/` 路由对 `write_file` / `edit_file` / `delete` 一律回一句
+「会话上传目录只读：请走上传接口」。新增与替换只有 HTTP 上传一条路。
+
+## 5. agent 怎么读 xlsx
+
+`read_file('/uploads/x.xlsx')` 只回一句「这是二进制表格，用 xlsx 工具」。
+真正的路是四个工具：`xlsx_info` / `xlsx_query` / `xlsx_search` / `xlsx_profile`（`graphs/tools/xlsx/`）。
+
+```
+工具调用
+  └─ _fetch(path, runtime)                每次调用都重新取字节：文件换了也不会答旧表
+       ├─ backend.adownload_files([path])   /uploads/ 路由 → 查台账拿 key → 读盘上字节
+       ├─ store.cache_bytes(path, data)     落 {xlsx.cache_dir}/{sha16}{后缀}（tmp + 原子替换）
+       └─ index.ensure(xlsx, cache_dir, sha16, header)
+            ├─ 先探单元格数（openpyxl read_only，不把表读进内存）> xlsx.max_cells → 直接报错
+            ├─ openpyxl 逐 sheet → pandas → sqlite：meta / col_meta / s0..sN
+            └─ 落 {cache_dir}/{sha16}-h{header}-v{BUILD}.sqlite（建临时文件再原子换名）
+  └─ 同步实现丢线程池（sqlite 阻塞）；异常转成错误文本返回，不炸图
+```
+
+- **索引键 = 内容 sha16 + header 行 + BUILD**。内容变 → sha 变 → 新索引，永远不会拿旧表回答；
+  `header` 指「表头在第几行」，不同 header 是不同索引，互不覆盖。
+- **建索引很贵**（实测 129 MB / 41.7 s），所以 `ensure` 先探单元格数把「能上传但处理不了」的表
+  提前拒掉。建好的索引留在盘上，`xlsx.cache_ttl_days` 到期后每进程启动扫一次删掉，用到再建。
+- **查询侧只读三件套**：`mode=ro&immutable=1` + `set_authorizer` 白名单（只放 SELECT 与白名单函数）
+  + 每 20k 条指令查一次 `xlsx.query_budget_ms` 预算，跑飞的长查询会被掐断。
+- **四个工具的分工**：`info` 看结构（sheet / 列 / 类型 / 行数），`query` 按结构化条件取行
+  （`columns` / `where` / `limit` / `offset`），`search` 做文本包含检索，`profile` 对每列出统计。
+  四个都只读，都走同一份索引。
+- **空间里的表**（`has_tables(space)` 为真）走 `CodeInterpreterMiddleware` 的 ptc 模式；只有本会话
+  上传的表时装工具本身（不额外起 JS 解释器）。两条路的取字节方式完全相同。
+- 上传响应里的 `indexed: false` 恒定：上传只写字节与台账，索引是第一次用工具时才建的缓存。
+
+## 6. 删会话：谁清什么
+
+`DELETE /threads/{id}` 被 `custom/middleware/threads_delete.py` 截下来（注册一条同名路由**遮挡**
+核心路由）。顺序固定：
+
+```
+1. 原生 delete_thread   鉴权与 404 语义照旧（不是你的会话 → 404，之后什么都不碰）
+2. 读台账               session_object 里这个 (identity, thread_id) 的所有 key
+3. 删行                 先删行：行留着会让配额虚高
+4. 删盘                 逐 key 删 <uploads.dir> 下的文件，顺手删空目录
+5. 清 Store 命名空间    md 实体在 Store 里，清完才算真删
+```
+
+第 4、5 步各自兜底——任何一步失败只记日志，不把删除变成 500（线程行已经删了，报错只会让
+客户端重试到 404）。所以删除幂等，残留靠下一轮对账/过期：
+
+| 残留 | 谁清 |
 |---|---|
-| 删会话 | `custom/middleware/threads_delete.py`：先读出台账里本会话的 key → 删 `session_object` 行 → 逐 key 删盘 → 清 Store。任何一步失败只记日志，不把删除变成 500 |
-| 孤儿 md | Store 自带 TTL（aegra 启动时 `start_ttl_sweeper()`），**读一次续期**，所以"在用的会话永不失效" |
-| 上传残留 | `.part-*` 半截文件与孤儿 key：没有自动清理，手工对账（见 `docs/large-files.md`「对账」） |
+| `.part-*` 半截文件 | 没有自动清理，手工对账（`docs/large-files.md`「对账」） |
+| 孤儿 key（文件在、行没了） | 同上，按台账外扫 `<uploads.dir>` 对比 |
+| Store 里的 md | Store 自带 TTL（`session_files.upload_ttl_minutes`），**读一次续期** |
+| 本机 xlsx 索引缓存 | `xlsx.cache_ttl_days` 到期后进程启动自清；不删也只是一份可再生缓存 |
 
-## 6. 配置
+## 7. 配置
 
 ```yaml
 # config.yaml
@@ -140,7 +204,7 @@ uploads:                  # xlsx 字节落盘的位置（相对仓库根）
 多副本：字节在**本机盘**上，副本之间不共享。要共享就挂同一卷（NFS/EFS）；
 不想共享就只跑单副本（默认形态）。对象存储版见 `feat/unified-files-s3` 分支。
 
-## 7. 常见问题
+## 8. 常见问题
 
 | 现象 | 原因 |
 |---|---|
@@ -152,7 +216,7 @@ uploads:                  # xlsx 字节落盘的位置（相对仓库根）
 | `500` | 盘写不进去（写满/权限）：`put_stream` 抛 `OSError`，日志里有 `upload_table_failed` |
 | 传了但这一轮看不到 | 清单在**下一轮** run 起始才读；先发一条消息再问 |
 
-## 8. 有意的非目标
+## 9. 有意的非目标
 
 秒传预检、前端直传、断点续传、按内容去重、md 落盘——都不做，理由见
 [ADR-0018](./docs/adr/0018-local-only-file-reads.md)（md 留 Store 是为了白拿 fs 工具与 TTL；
