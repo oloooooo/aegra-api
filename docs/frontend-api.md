@@ -135,7 +135,7 @@ event: end        data: {"status": "success"}
 
 ### 3.8 `POST /custom/uploads/tables`
 
-把一个 xlsx 挂到当前会话（[adr/0015](./adr/0015-large-tables-in-object-storage.md)）。`multipart/form-data`，字段 `thread_id` + `file`。
+把一个 xlsx 挂到当前会话（[adr/0018](./adr/0018-local-only-file-reads.md)；原 ADR-0015 已归档）。`multipart/form-data`，字段 `thread_id` + `file`。
 
 ```json
 {"name": "cbam-reporting_报价表.xlsx", "path": "/uploads/cbam-reporting_报价表.xlsx",

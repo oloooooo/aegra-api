@@ -2,10 +2,10 @@
 
 - 状态：已接受（`feat/unified-files-local` 分支；与 ADR-0017 是同一件事的两种部署形态）
 - 日期：2026-02-13
-- 关联：[ADR-0005](./0005-space-isolation-in-backend.md)（空间判定在 backend）、
+- 关联：[ADR-0005](./0005-spaces-forwarded-via-run-config.md)（spaces 经 run config 转发；空间判定本身在 `SpaceBackend`）、
   [ADR-0013](./0013-session-files-live-in-store.md)（md 存 Store）、
-  [ADR-0017](./0017-files-read-through-one-backend.md)（对象存储版）、
-  [ADR-0015](./0015-large-tables-in-object-storage.md) / [ADR-0016](./0016-spaces-in-object-storage.md)（本分支归档）
+  ADR-0017（对象存储版，在 `feat/unified-files-s3` 分支，不在此目录）、
+  [ADR-0015](./archive/0015-large-tables-in-object-storage.md) / [ADR-0016](./archive/0016-spaces-in-object-storage.md)（本分支归档）
 
 ## 背景
 
@@ -65,9 +65,10 @@
    与 `.part-*`。对账方法见 `docs/large-files.md`。
 4. **`UploadsBackend` 每次取字节都查一次 PG**：`_ledger_keys()` 无缓存，一次 run 里多次
    `download_files` 会重复查（xlsx 四件套每次调用都走这条）。
-5. **同步路径拿不到 xlsx 字节**：`read`/`download_files` 的同步版继承 `StoreBackend`，
-   只看得见 Store 里的 md——对 `/uploads/*.xlsx` 会返回 `file_not_found`。当前工具都是 async，
-   但这是隐式契约。
+5. **同步路径拿不到 xlsx 字节**：`read`/`download_files`/`grep`/`glob` 的同步版继承
+   `StoreBackend`，只看得见 Store 里的 md——对 `/uploads/*.xlsx` 会返回 `file_not_found`，
+   而 `grep`/`glob` 的同步版会**静默漏掉**盘上的表（不报错、只少结果）。当前所有调用方都是
+   async（图与工具），但这是隐式契约：将来谁写一个同步调用方，就会看到“文件不存在”。
 6. **没有 TTL 清理**：`session_files.upload_ttl_minutes` 仍只作用于 Store 里的 md
    （`shared/session/store.py`），盘上字节不会过期。
 7. **空间清单是实时扫盘**：`has_tables()` / `space_files()` 每次 run 递归扫 `knowledge/`，
@@ -92,13 +93,15 @@
 
 ## 验证
 
-- `pytest tests/unit`：**2001 passed / 28 failed / 1 skipped**，28 项失败是 main 上原有的
+- `pytest tests/unit`：**2004 passed / 28 failed / 1 skipped**，28 项失败是 main 上原有的
   （observability、broker window、jsonb、lifespan）。
 - 新增/改写：`tests/unit/test_backend_scope.py`（空间判定，13 条）、
   `tests/unit/test_threads_delete_blobs.py`（删会话清字节）、
-  `tests/unit/test_upload_tables.py`（上传写序与失败清理）、`tests/unit/test_session_files.py`（台账清单 + 路由）。
-- 冒烟（手工）：真 PG + 真服务，上传 xlsx → 主管 run 读到 → 工具改 → 再读；`git diff` 确认
-  `knowledge/` 没被动过。
+  `tests/unit/test_upload_tables.py`（上传写序与失败清理）、`tests/unit/test_session_files.py`（台账清单 + 路由）、
+  `tests/unit/test_uploads_backend_readonly.py`（写家族同步+异步全拒）。
+- 冒烟（手工）：在真 `session_backend()` 上走四道路由，确认 `/uploads/*` 与空间路径的写入被拒、
+  内部驱逐路径 `/large_tool_results/*` 放行；**没有**做真 PG + 真服务的「上传 → 主管 run 读到」
+  全链路（见缺陷 12）。
 
 ## 后果
 

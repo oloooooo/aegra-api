@@ -12,7 +12,7 @@
 | 接口 | `POST /custom/uploads` | `POST /custom/uploads/tables` |
 | 载体 | LangGraph Store（PG 里的 JSON 文本） | 字节落本地盘（`uploads.dir`）+ 归属行进 PG |
 | agent 眼里 | `/uploads/<name>` | `/uploads/<name>` |
-| 谁读它 | `SessionFilesMiddleware`（清单）、Store 的 fs 工具（ls/read/grep/glob） | `xlsx_info / query / search / profile`（`backend.download_files` 取字节 → 落缓存 → SQLite 索引） |
+| 谁读它 | `SessionFilesMiddleware`（清单）+ `/uploads/` 路由的 fs 工具（ls/read/grep/glob，叠在 `StoreBackend` 上） | `xlsx_info / query / search / profile`（`backend.download_files` 取字节 → 落缓存 → SQLite 索引） |
 | 单文件上限 | `session_files.max_upload_mb` = 10 MB | `xlsx.max_blob_mb` = 10 MB |
 | 每会话个数 | `session_files.max_files_per_session` = 50 | `xlsx.max_xlsx_files_per_session` = 20 |
 | 每用户总量 | — | `xlsx.max_blob_mb_per_user` = 2048 MB |
@@ -99,9 +99,9 @@ agent 视角                       真实落点
                                 └─ StoreBackend：ls / read_file / grep / glob 直接用
 
 /uploads/cbam-reporting_x.xlsx →  盘上 <uploads.dir>/<uuid>/x.xlsx（归属在 PG 台账）
-                                ├─ UploadsBackend：查台账 → backend.download_files 取字节
+                                ├─ UploadsBackend：查台账（异步）→ backend.download_files 取字节
                                 ├─ xlsx 工具：落 .cache/xlsx（按内容 sha16）→ 建 SQLite 索引
-                                └─ 不能 read_file / grep（zip 二进制）
+                                └─ read_file 只能拿到 base64、grep 会跳过它（zip 二进制）
 ```
 
 **子 agent** 读同一条会话的文件靠派活时签发的 `session_scope`（HMAC 签名，
@@ -156,3 +156,9 @@ uploads:                  # xlsx 字节落盘的位置（相对仓库根）
 秒传预检、前端直传、断点续传、按内容去重、md 落盘——都不做，理由见
 [ADR-0018](./docs/adr/0018-local-only-file-reads.md)（md 留 Store 是为了白拿 fs 工具与 TTL；
 xlsx 落盘是因为 read/grep 读不了 zip，而工具要的是字节而不是文本）。
+
+**agent 只读**：唯一写入方是上传接口。`/uploads/` 的写家族（`write`/`edit`/`delete`/
+`upload_files`，同步与异步两套）一律返回「会话上传目录只读」，空间路径更早就只能读。
+“让 agent 改表”需要先解决两件事：openpyxl 保存会抹掉全工作簿的公式缓存值（索引里公式列
+全变空）、插删行会让模型手里的行号契约错位。四条实测与取舍见 [ADR-0018](./docs/adr/0018-local-only-file-reads.md)
+缺陷 13/14 与 `docs/large-files.md` §3.5。

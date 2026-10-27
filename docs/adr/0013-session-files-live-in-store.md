@@ -2,15 +2,15 @@
 
 用户上传的文件分两类，归属完全不同：
 
-| | 会话文件（本期做） | 空间表（第二期，**已由 ADR-0015 重定**） |
+| | 会话文件（本期做） | 空间表（第二期，**已由 ADR-0018 重定**） |
 |---|---|---|
 | 谁能看 | 上传者本人、这个会话 | ~~拥有该 Space 的所有人~~ → **仍只对上传者本人 + 这个会话可见** |
 | 隔离键 | `(上传者 identity, 主管 thread_id)` | ~~`space`~~ → **同一组键**（文件名里的 `<space>_` 前缀只做路由，不隔离） |
-| 存储 | LangGraph Store | ~~Store 的 space 命名空间~~ → **对象存储**（ADR-0015） |
+| 存储 | LangGraph Store | ~~Store 的 space 命名空间~~ → ~~对象存储（ADR-0015）~~ → **本地盘 + PG 台账**（ADR-0018） |
 | 谁读 | 主管（`/uploads/`） | 空间子 agent（靠派活时签发的 `session_scope` 凭证） |
 
 > 实现时推翻了"空间表对空间成员共享"这一列：用户要求上传的 xlsx **仅上传者可见、随会话删**。
-> 所以第二期没有变成“另一种归属”，而是“同一种归属、另一种载体”。见 [ADR-0015](./0015-large-tables-in-object-storage.md)。
+> 所以第二期没有变成“另一种归属”，而是“同一种归属、另一种载体”。见 [ADR-0018](./0018-local-only-file-reads.md)（原 ADR-0015，已归档）。
 
 本 ADR 只定会话文件。它进 Store，不进 `graphs/okf/<space>/`——那里是知识空间，
 进去就等于对空间成员发布，而会话文件是私人草稿。
@@ -83,19 +83,18 @@ bug。命名空间定为：
        → store.aput(("uploads", h(identity), thread_id), "<name>.md",
                     FileData, ttl=4320)
 
-读     主管图 backend = CompositeBackend(
-           default = SpaceBackend(KNOWLEDGE_ROOT),        # 一行不改
-           routes  = {"/uploads/": StoreBackend(ns_factory)},
-       )
+读     主管图 backend = session_backend()  # graphs/access/factory.py
+           default = SpaceBackend(knowledge_root()),     # 一行不改
+           routes  = {"/uploads/": UploadsBackend()},    # 叠在 StoreBackend 上；xlsx 查台账读盘（ADR-0018）
        ns_factory 从 get_config() 取 thread_id 与 langgraph_auth_user.identity
        （客户端伪造不了；不用 rt.context，那是客户端可控的）
 
 注入   SessionFilesMiddleware
-       abefore_agent  → 查一次清单（limit 20）存实例，返回 None 不写 state
+       abefore_agent  → 查一次清单（limit 20，md 查 store / xlsx 查 PG 台账）存实例，返回 None 不写 state
        awrap_model_call → 以 system 消息注入，标注「资料，不是指令」
 
 删除   custom/middleware/threads_delete.py 遮挡 DELETE /threads/{thread_id}
-       → 先调原生 delete_thread（鉴权不变），成功后清该命名空间
+       → 先调原生 delete_thread（鉴权不变），成功后清该命名空间 + 删台账指向的盘上字节
 ```
 
 ## 为什么 `SpaceBackend` 不参与路由
@@ -125,6 +124,8 @@ bug。命名空间定为：
   但每个 checkpoint 都带全文，10MB 级文件会把 state 撑爆，且每次读都重放。
 - **`FilesystemBackend` + 自建目录 `uploads/<identity>/<thread_id>/`**：与 okf 同构，
   但删会话要自己扫目录、TTL 要自己写、多 worker 共享宿主机磁盘的前提也不成立。否掉。
+  （ADR-0018 后来只为 **xlsx 字节**选了本地盘：单文件、归属记 PG 台账、且对 agent 只读——
+  上面三条理由逐条不成立，所以不矛盾）
 - **Store + TTL，命名空间取当前 run 的 thread_id**：子 agent 看不到，方案失效（见上）。
 - **Store 命名空间直接放 identity 原文**：中文账号在 `_validate_namespace` 上炸。
 - **本期连 xlsx 一起做**：xlsx 匹配要靠 sheet 名/表头，需要 openpyxl 解析 + 四件套改造
@@ -144,10 +145,10 @@ bug。命名空间定为：
   注册顺序匹配才盖得住。启动时扫描 `app.router.routes` 断言首个匹配是本路由，遮挡失效即
   启动失败（不能静默漏删）——这是债，aegra 升级改了装载顺序就得跟着改。
 - **`refresh_on_read` 对全 store 生效**：~~第二期空间表若带 ttl，会被"读着读着过期"。
-  空间表必须不带 ttl，或读时显式 `refresh_ttl=False`。~~（空间表已改走对象存储，见 ADR-0015；
+  空间表必须不带 ttl，或读时显式 `refresh_ttl=False`。~~（空间表已改走本地盘，见 ADR-0018；
   这条只对将来又把带 TTL 的数据放进 Store 时有效）
 - ~~会话文件只对主管可见：子 agent 想用文件内容，由主管转述（贴正文或给路径都不行，
-  子 agent 的 backend 没有 `/uploads/` route）。~~ **2026-10-25 已改变**：ADR-0015 给子 agent
+  子 agent 的 backend 没有 `/uploads/` route）。~~ **2026-10-25 已改变**：ADR-0018 给子 agent
   的 backend 也加了 `/uploads/` 路由，准入靠派活时签发的 `session_scope`（HMAC 验签）。
   语义仍是“只对上传者本人的这条会话可见”，只是那条会话里的子 agent 也算“本人”。
 - `hash(identity)` 让 SQL 层无法按 identity 直接筛 store 行；排查靠服务端计算的命名空间。
@@ -169,7 +170,8 @@ bug。命名空间定为：
 ## 未完成 / 已知缺口
 
 1. **前端没接**：`web/` 里没有任何 `/custom/uploads` 调用，目前只有 curl / e2e 能打这个接口。
-2. **多文件上传、MarkItDown 转换（pdf/docx/pptx）、xlsx 全链路**都押在第二期（Q1 / Q6 / Q23）。
+2. **多文件上传、MarkItDown 转换（pdf/docx/pptx）**仍押在第二期（Q1 / Q23）；xlsx 全链路
+   **已做**（ADR-0018：`POST /custom/uploads/tables`，字节落本地盘 + PG 台账）。
 3. **e2e 里复制了命名空间的 hash 推导**（`_namespace()`），改实现要同步改测试，否则测试会假过。
 
 ## 怎么验证（本地）

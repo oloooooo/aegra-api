@@ -2,7 +2,9 @@
 
 > 状态：**主体已实现**（决定 2026-10-25，第 3 稿；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
 > 本文取代第 1 稿「大表挂 space」的全部内容（那版已作废，理由见文末「作废记录」）。
-> 实现细节见 [`../large-files.md`](../large-files.md)；空间内容进 S3 见 [ADR-0016](./0016-spaces-in-object-storage.md)。
+> 实现细节见 [`../../large-files.md`](../../large-files.md)；空间内容进 S3 见 [ADR-0016](./0016-spaces-in-object-storage.md)。
+> **本分支（`feat/unified-files-local`）已归档此篇**：字节落本地盘 + PG 台账，见
+> [`../0018-local-only-file-reads.md`](../0018-local-only-file-reads.md)。
 > 落点：`shared/session/blobs.py`（S3、自管分片可 abort、`delete_prefix`）、`custom/service/session_files.py`（配额与行）、
 > `custom/db/models.py::SessionObject`、`custom/api/uploads.py::POST /custom/uploads/tables`、
 > `custom/middleware/threads_delete.py`（两条删除链合流）、`graphs/tools/xlsx/index.py`（SQLite 索引）、

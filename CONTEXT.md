@@ -212,7 +212,7 @@ _Avoid_: 把文件内容当系统提示的一部分、对内容做「注入词�
 **Large table（大表）**:
 一个 `.xlsx`，量级到 8 万行 × 10 列 × 3 sheet（240 万 cell）。工具对它的读法不是
 「打开表格」，而是「查一个已经建好的索引」——四个 `xlsx_*` 工具全部跑在 SQLite 上，
-不再 `pd.read_excel` 全表。见 ADR-0015。
+不再 `pd.read_excel` 全表。见 [ADR-0018](./docs/adr/0018-local-only-file-reads.md)（原 ADR-0015，已归档）。
 _Avoid_: 把 csv / markdown 表格叫大表（走的不是这条链）；把"表格内容"当 context
 （大表永远只有摘要与命中片段进上下文，正文靠工具按需取）
 

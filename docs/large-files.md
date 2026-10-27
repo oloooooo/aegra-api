@@ -1,6 +1,6 @@
 # 会话文件与大表（设计）
 
-配套 ADR：[0015 会话文件](./adr/0015-large-tables-in-object-storage.md)、
+配套 ADR：[0015 大表进对象存储](./adr/archive/0015-large-tables-in-object-storage.md)（已归档）、
 [0018 只基于本地 filesystem + Store](./adr/0018-local-only-file-reads.md)。
 第 3 稿（2026-10-25）：归属从「挂 space」改为「上传者私有 + 随会话删」，命名与 Key 全部重写。
 **已实现**（真服务单进程/多进程实测通过）；本文描述设计与取舍，落地位置见 §9。
@@ -298,7 +298,7 @@ SESSION_SCOPE_SECRET=<hmac key>
 | `custom/api/uploads.py` | `POST /custom/uploads/tables` |
 | `graphs/access/session_scope.py` | 签发/验签/解析（主管自身 config，子 agent 用签名凭证） |
 | `graphs/access/factory.py` | 读文件唯一装配点：`CompositeBackend(default=SpaceBackend, routes={"/uploads/": UploadsBackend()})` |
-| `graphs/access/uploads_backend.py` | `/uploads/` 只读 backend：查台账 → 读盘，只实现异步协议方法 |
+| `graphs/access/uploads_backend.py` | `/uploads/` backend：查台账 → 读盘（异步）；写家族（同步+异步）全部拒绕 |
 | `graphs/middleware/async_task_guard.py` | 派活时签发 `session_scope` |
 | `graphs/space_agent.py` / `graphs/supervisor.py` | CompositeBackend + `/uploads` 路由；主管也装 xlsx 四件套 |
 | `graphs/tools/xlsx/{store,index}.py` + `__init__.py` | 字节解析、ingest → SQLite、四个工具改跑 SQL |
@@ -350,4 +350,4 @@ SESSION_SCOPE_SECRET=<hmac key>
 - 同步哈希阻塞请求线程的线上复盘（2 GB 数分钟）→ 我们 28 MB 约 100 ms，阈值内。
 - Databricks Apps 双身份模型（app identity vs user authorization）→ 对应本方案的「不替换
   `langgraph_auth_user`，只签窄凭证」。
-- 对象存储侧的同类设计见 `feat/unified-files-s3` 分支 + [ADR-0017](./adr/0017-files-read-through-one-backend.md)。
+- 对象存储侧的同类设计见 `feat/unified-files-s3` 分支 + ADR-0017（不在本分支的 `docs/adr/` 里）。
