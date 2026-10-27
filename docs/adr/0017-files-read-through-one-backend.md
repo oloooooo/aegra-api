@@ -65,6 +65,12 @@
 自己写只有 478 行，因为 `BackendProtocol` 的 9 个 `a*` 方法**全有默认实现**，
 细语义（分页切片、替换校验、glob 匹配、`FileData` 组装）都在 `deepagents.backends.utils`，直接复用。
 
+### 7. 表格的 `read` 不给字节给指路提示
+
+`_ObjectTree._read` 遇到 `.xlsx/.xlsm/.xls` 且内容是二进制时，返回「用
+`xlsx_info / xlsx_query`」的错误文本，而不是 base64。base64 表格对模型只烧 token、读不懂；
+字节的唯一正当出口是 `download_files`（xlsx 四件套走这条）。
+
 ## 取舍
 
 | 取舍点 | 选了什么 | 为什么不选另一个 |
@@ -73,6 +79,7 @@
 | 一次动作一次台账查询 vs 按 run 缓存 | 每次查 | 缓存会让「同一 run 内新上传的文件看不见」这种坑只在生产偶发；一次主键查询换确定性 |
 | `write` 用条件写 vs 覆盖 | 覆盖（last-write-wins） | 协议要求 write 是覆盖语义；把 CAS 加在 write 上会让「第二次写」失败，违反契约。CAS 加在真正有读-改-写窗口的 `edit` 上 |
 | `UploadsBackend` 实现同步版 vs 只异步 | 只异步 | 同步读要把 async PG 会话跑在另一个事件循环里（`asyncio.run` 嵌套），本地和单副本都不成立；框架调用的正是异步方法 |
+| 写能力（2026-02-12 用户拍板） | 先不开写：`write`/`edit` 的实现与 `edit` 的 CAS 留着，但不做启动探测 | 写入方还没定下来；加探测会让“写能用”这件事看起来已就绪。真要开写时再议探测与降级 |
 | `spec.py` 模式分支 vs 抽象一层「虚拟文件系统」 | 分支 | 抽象层要同时包住 `Path` 和对象存储，两个调用面（`rglob`/`read_text`/`mkdir`）语义对不齐；分支只有 5 个函数 |
 
 ## 缺陷与已知风险
@@ -87,8 +94,9 @@
    一次 ls 就是全量 LIST。升级触发：单空间对象数 > ~1 万或 LIST 耗时 > 200 ms。
 4. **`grep` 是 N+1 GET**：先 LIST 再逐个 GET 文本文件。`max_count` 只省掉「已满足后不再取」。
    大文件量下要加 per-run 的 ETag→内容缓存。
-5. **`has_tables()` 两种模式语义不同**：本地用 `rglob`（递归），`s3fs` 只看 `<space>/*.xlsx`
-   一层。空间把表放子目录时，`s3fs` 下不会装 xlsx 四件套。现有空间都是平铺，暂不改。
+5. **`has_tables()` 已统一为递归**（原缺陷：两种形态都只看 `<space>/` 一层，表放子目录就不装
+   xlsx 四件套——agent 的失败表现是“我没有读表工具”，不报错、最难排查）。现在两模式都递归
+   扫整棵子树；代价是每次 run 多一次 LIST（`s3fs`）/目录遍历（本地）。
 6. **对象存储没有空目录**：`_space_dir_exists` 用 `list_objects_v2(MaxKeys=1)` 探「有没有以此
    为前缀的对象」，所以「刚建好但还没写文件的空空间」在 `s3fs` 下不存在。
 7. **孤儿对象没有 GC**：`threads_delete` 按台账逐对象删；PG 删成功而 S3 删失败就留下孤儿。
@@ -102,10 +110,10 @@
     有最终一致窗口，CAS 会被打破。
 11. **`UploadsBackend` 的同步协议方法不实现**（继承 `BackendProtocol` 默认 → `NotImplementedError`）。
     框架实际只用异步版本（`aread/als/aglob/agrep/adownload_files`）；任何同步调用路径都会抛错。
-12. **未跑真服务**：本次只跑了 `tests/unit`（2027 通过 / 28 项是本次改动之前就存在的失败）与一份
-    对本地 SeaweedFS 的一次性冒烟脚本（跑完即删，覆盖 25 项：ls/read 分页/二进制 base64/
-    grep 隔离/glob/跨空间拒绝/写拒绝/内部前缀放行/条件写三例/4 线程并发 edit/空间 spec 函数），
-    **没跑 e2e**。
+12. **e2e 是一份手动脚本，没接 CI**：`scripts/e2e_s3fs.py` 对着真 SeaweedFS 跑（2026-02-12
+    全绿 13 项）：纯对象存储下的空间 spec、跨空间拒绝、`read` 对表给指路提示、`download_files`
+    真字节、`_fetch` → 缓存 → sqlite 索引 → `xlsx_info` 读到列名且索引里有 2 行数据、用完清理。
+    仍未覆盖：真 agent 跑一轮对话（要 LLM key 与起服务）、SeaweedFS 集群/多副本形态。
 
 ## 怎么验证（本地）
 

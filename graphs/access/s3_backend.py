@@ -68,6 +68,9 @@ logger = structlog.getLogger(__name__)
 _NOT_FOUND = "file_not_found"
 _READ_ONLY = "会话上传目录只读：新增/替换请走上传接口（POST /custom/uploads[/tables]）"
 
+# `read` 对表格给指路提示而不是 base64（表格只该用 xlsx 四件套读）
+_TABLE_SUFFIXES = (".xlsx", ".xlsm", ".xls")
+
 # 框架把 ooxml/zip/parquet 都归为 text（`_EXTENSION_TO_FILE_TYPE` 只细分图片/音视频），
 # 直接解码会把二进制当乱码交给模型；这几类一律走 base64。
 _FORCE_BINARY = frozenset({".xlsx", ".xlsm", ".docx", ".pptx", ".zip", ".parquet"})
@@ -174,6 +177,11 @@ class _ObjectTree:
         if data is None:
             return ReadResult(error=f"File '{vpath}' not found")
         if _is_binary(vpath, data):
+            if vpath.lower().endswith(_TABLE_SUFFIXES):
+                # base64 表格对模型只烧 token，一句指路比一堆乱码有用
+                return ReadResult(
+                    error=f"{vpath} 是二进制表格，read_file 读不了；用 xlsx_info / xlsx_query 等工具，路径原样传"
+                )
             return ReadResult(file_data=FileData(content=base64.b64encode(data).decode("ascii"), encoding="base64"))
         try:
             text = data.decode("utf-8")

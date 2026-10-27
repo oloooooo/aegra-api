@@ -145,16 +145,6 @@ def _read_text(space: str, name: str) -> str | None:
         return None
 
 
-def _child_names(space: str) -> list[str]:
-    """空间**直接子项**名（不递归，与磁盘版 ``glob('*')`` / ``iterdir()`` 同语义）。"""
-    if _remote():
-        prefix = f"{_SPACE_PREFIX}{space}/"
-        return sorted({key[len(prefix) :].split("/", 1)[0] for key in blobs.list_tree(prefix)})
-    try:
-        return [p.name for p in space_dir(space).iterdir()]
-    except OSError:
-        return []
-
 def parse_agent_md(text: str) -> tuple[dict[str, str], str]:
     """拆 frontmatter 与正文；没有 frontmatter 时返回 ({}, 原文)。"""
     if not text.startswith("---"):
@@ -186,8 +176,14 @@ def load_agent_spec(space: str) -> tuple[str, str]:
 
 
 def has_tables(space: str) -> bool:
-    """空间里有没有 .xlsx：有才给子 agent 装 xlsx 四件套（省掉纯文档空间的工具 schema）。"""
-    return any(name.lower().endswith(".xlsx") for name in _child_names(space))
+    """空间里有没有 .xlsx（**递归**）：有才给子 agent 装 xlsx 四件套。
+
+    两种形态都递归看整棵子树：表放在 ``<space>/data/`` 这类子目录里也算。只看一层的话
+    会静默少装工具，agent 的失败表现是「我没有读表工具」而不是报错，最难排查。
+    """
+    if _remote():
+        return any(key.lower().endswith(".xlsx") for key in blobs.list_tree(f"{_SPACE_PREFIX}{space}/"))
+    return any(p.suffix.lower() == ".xlsx" for p in space_dir(space).rglob("*") if p.is_file())
 
 
 def list_spaces() -> list[str]:
