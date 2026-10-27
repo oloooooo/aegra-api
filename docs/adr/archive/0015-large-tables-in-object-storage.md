@@ -1,4 +1,4 @@
-# 会话文件：md 进 Store、xlsx 进对象存储，都私有且随会话删
+# ~~会话文件：md 进 Store、xlsx 进对象存储，都私有且随会话删~~
 
 > 状态：**主体已实现**（决定 2026-10-25，第 3 稿；2026-10-26 复核代码后订正此状态行——之前一直写着「实现未开始」）。
 > 本文取代第 1 稿「大表挂 space」的全部内容（那版已作废，理由见文末「作废记录」）。
@@ -115,7 +115,7 @@
 
 ```bash
 weed server -s3 -dir=./.seaweedfs            # S3 网关 :8333
-# .env: S3_ENDPOINT=http://127.0.0.1:8333 / S3_BUCKET=aegra-blobs
+# ~~.env: S3_ENDPOINT=http://127.0.0.1:8333 / S3_BUCKET=aegra-blobs~~
 .venv/Scripts/python.exe -m pytest tests/unit/test_xlsx_index.py -q
 ```
 

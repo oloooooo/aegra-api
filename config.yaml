@@ -1,10 +1,9 @@
 # 本项目新增的配置（不属于 aegra 原生）。
 # 逐键说明：docs/configuration.md §3.2
 #
-# 什么放这里：非密钥的项目参数（配额、会话文件上限、对象存储地址、知识空间、发件箱）。
+# 什么放这里：非密钥的项目参数（配额、会话文件上限、上传目录、知识空间、发件箱）。
 # 什么不放这里：
-#   - 密钥 -> .env（JWT_SECRET / PASSWORD_PEPPER / SESSION_SCOPE_SECRET / S3_ACCESS_KEY /
-#     S3_SECRET_KEY / OPENAI_API_KEY）
+#   - 密钥 -> .env（JWT_SECRET / PASSWORD_PEPPER / SESSION_SCOPE_SECRET / OPENAI_API_KEY）
 #   - aegra 原生配置 -> aegra.json、src/aegra_api/settings.py（.env 里的 HOST/PORT/POSTGRES_* 等）
 #
 # 优先级：同名环境变量 > 本文件 > 代码内默认值（shared/config.py）。
@@ -42,41 +41,15 @@ xlsx:
   cache_ttl_days: 7
   query_budget_ms: 5000         # 单次 where 查询的 CPU 预算，超了 interrupt()
 
-# --- 对象存储（shared/session/blobs.py，ADR-0015/0016）---
-# 凭证**不在这里**，写 .env：S3_ACCESS_KEY / S3_SECRET_KEY（密钥不进 git）。
-s3:
-  # 空 = 不启用对象存储：上传会话大表返回 503，其余功能不受影响。
-  endpoint: ""
-  bucket: aegra-blobs
-  region: us-east-1
-
-  # 【启用示例 1：本地 SeaweedFS】（起网关见 docs/S3.md §2）
-  #   endpoint: http://127.0.0.1:8333
-  #   .env:    S3_ACCESS_KEY=dev
-  #            S3_SECRET_KEY=dev          # 未配 IAM 时任意值
-  #   验证：   POST /custom/uploads/tables 应回 201；再用 docs/S3.md §6 的 list_objects_v2 看对象
-  #
-  # 【启用示例 2：真实 S3 / MinIO】
-  #   endpoint: https://s3.us-east-1.amazonaws.com   # MinIO 填 http://host:9000
-  #   bucket: 你的桶名
-  #   region: us-east-1
-  #   .env:    S3_ACCESS_KEY=AKIA…
-  #            S3_SECRET_KEY=…
-  #   最小权限：HeadBucket / CreateBucket / PutObject / GetObject / DeleteObject /
-  #            ListBucket / AbortMultipartUpload / ListMultipartUploads
-  #
-  # 只想开关：把 endpoint 改回 "" 即退回纯磁盘（已上传的大表仍留在 S3，不影响读旧数据）。
-  # 想让空间知识也进 S3（不只会话大表）再加：
-  #   okf:
-  #     backend: s3
-  #   然后 scripts/okf_push_s3.py → scripts/okf_pull_s3.py
+# --- 会话上传的字节（shared/session/disk.py，ADR-0018）---
+uploads:
+  # key 是 `<uuid>/<名>`：归属只记 PG 台账（session_object），不写进路径。
+  # 多副本部署请挂共享卷；不共享时各副本只看得见自己收的文件。
+  dir: .data/uploads
 
 # --- 空间知识（shared/knowledge/root.py，ADR-0016）---
 okf:
-  backend: local                # local = 直接读仓库根 <dir>；s3 = 读本地镜像
   dir: knowledge                # 空间根目录名（相对仓库根；数据不在代码包里）
-  mirror_dir: .cache/okf        # s3 模式的镜像目录
-  mirror_ttl_seconds: 0         # 0 = 只拉一次；改内容后跑 scripts/okf_pull_s3.py
 
 # --- 图（graphs/supervisor.py）---
 agents:

@@ -8,13 +8,15 @@ import pytest
 from fastapi import FastAPI
 from langchain_core.messages import SystemMessage
 
-from shared.session import store as ss
 from custom.middleware.threads_delete import (
     assert_shadows_core_delete,
     delete_thread,
+)
+from custom.middleware.threads_delete import (
     router as threads_delete_router,
 )
 from graphs.middleware import session_files as sf
+from shared.session import store as ss
 
 
 class FakeItem:
@@ -134,7 +136,7 @@ class FakeRequest:
     def __init__(self, system_message: SystemMessage | None = None) -> None:
         self.system_message = system_message
 
-    def override(self, *, system_message: SystemMessage) -> "FakeRequest":
+    def override(self, *, system_message: SystemMessage) -> FakeRequest:
         return FakeRequest(system_message)
 
 
@@ -305,7 +307,7 @@ async def test_read_limited_caps_size(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_supervisor_routes_uploads_to_store() -> None:
-    """/uploads/x.md 交给 StoreBackend（key 带前导斜杠），其余仍然按 space 判定。"""
+    """/uploads/x 交给 UploadsBackend（key 带前导斜杠），其余仍然按 space 判定。"""
     from deepagents.backends.composite import _route_for_path
 
     from graphs.supervisor import supervisor_backend
@@ -315,8 +317,8 @@ def test_supervisor_routes_uploads_to_store() -> None:
         default=backend.default, sorted_routes=backend.sorted_routes, path=p
     )
 
-    store_be, key, prefix = route("/uploads/report.md")
-    assert type(store_be).__name__ == "StoreBackend"
+    uploads_be, key, prefix = route("/uploads/report.md")
+    assert type(uploads_be).__name__ == "UploadsBackend"
     assert (key, prefix) == ("/report.md", "/uploads/")
 
     space_be, _, prefix2 = route("/cbam-reporting/index.md")

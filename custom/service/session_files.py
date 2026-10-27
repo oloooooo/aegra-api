@@ -1,6 +1,6 @@
 """会话文件的元数据与配额（ADR-0015 §3.2）。
 
-字节在对象存储（`shared/session/blobs.py`），行在这里。三条约定：
+字节在本地盘（`shared/session/disk.py`，key = `<uuid>/<名>`），行在这里。三条约定：
 
 - **主键 `(owner_identity, thread_id, name)`**：同名覆盖是 PUT 语义，不是版本链；
   唯一约束落在 DB 上，不靠"先查后插"（并发下两个请求会同时查空、同时插入）。
@@ -17,8 +17,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared import config
 from custom.db.models import SessionObject, UserTables
+from shared import config
 
 # 每会话文件数：md 与 xlsx 分开计（文件名规则、载体、读法都不同）
 MAX_MD_FILES_PER_SESSION = int(config.get("xlsx.max_md_files_per_session"))

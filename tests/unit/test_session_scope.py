@@ -4,8 +4,8 @@
 以及**子 agent 不能借它拿到用户全部 space**（那是 `allowed_spaces` 的独立判定）。
 """
 
-from shared.session.store import session_namespace
 from graphs.access import session_scope as ss
+from shared.session.store import session_namespace
 
 
 def test_mint_verify_roundtrip():

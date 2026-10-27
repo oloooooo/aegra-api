@@ -1,7 +1,7 @@
 """本项目新增的**非密钥**配置：仓库根 `config.yaml`（逐键说明见 docs/configuration.md §3.2）。
 
 密钥不进这个文件，仍然只走环境变量：JWT_SECRET / PASSWORD_PEPPER / SESSION_SCOPE_SECRET /
-S3_ACCESS_KEY / S3_SECRET_KEY / OPENAI_API_KEY。aegra 原生配置走 `aegra.json` 与
+OPENAI_API_KEY。aegra 原生配置走 `aegra.json` 与
 `src/aegra_api/settings.py`，也不在这里。
 
 优先级：同名环境变量 > config.yaml > 本文件的默认值。环境变量优先是为了容器里改一个键
@@ -30,6 +30,7 @@ _SPEC: dict[str, tuple[str, Any]] = {
     "session_files.max_upload_mb": ("MAX_UPLOAD_MB", 10),
     "session_files.max_files_per_session": ("MAX_FILES_PER_SESSION", 50),
     "session_files.upload_ttl_minutes": ("UPLOAD_TTL_MINUTES", 4320),
+    "uploads.dir": ("UPLOADS_DIR", ".data/uploads"),
     "xlsx.max_blob_mb": ("MAX_BLOB_MB", 10),
     "xlsx.max_cells": ("MAX_CELLS", 2_000_000),
     "xlsx.max_xlsx_files_per_session": ("MAX_XLSX_FILES_PER_SESSION", 20),
@@ -38,13 +39,7 @@ _SPEC: dict[str, tuple[str, Any]] = {
     "xlsx.cache_dir": ("XLSX_CACHE_DIR", ".cache/xlsx"),
     "xlsx.cache_ttl_days": ("XLSX_CACHE_TTL_DAYS", 7),
     "xlsx.query_budget_ms": ("XLSX_QUERY_BUDGET_MS", 5000),
-    "s3.endpoint": ("S3_ENDPOINT", ""),
-    "s3.bucket": ("S3_BUCKET", "aegra-blobs"),
-    "s3.region": ("S3_REGION", "us-east-1"),
-    "okf.backend": ("OKF_BACKEND", "local"),
     "okf.dir": ("OKF_DIR", "knowledge"),
-    "okf.mirror_dir": ("OKF_MIRROR_DIR", ".cache/okf"),
-    "okf.mirror_ttl_seconds": ("OKF_MIRROR_TTL_SECONDS", 0.0),
     "agents.server_url": ("AEGRA_SERVER_URL", "http://127.0.0.1:2026"),
     "outbox.poll_interval_seconds": ("OUTBOX_POLL_INTERVAL_SECONDS", 1.0),
     "outbox.batch_size": ("OUTBOX_BATCH_SIZE", 50),

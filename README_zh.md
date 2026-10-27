@@ -15,7 +15,7 @@
   - `supervisor` + `domain_agent` — 主 agent 与**唯一一个**领域子 agent 图；后者按 run config 里的 space 现读 prompt，所以用户有几个空间就有几个子 agent（不用改代码）。
 - **知识空间**：`knowledge/<空间名>/`，每个空间是一份 OKF（Markdown + YAML frontmatter，可带 xlsx 表格）。
 - **前端**（`web/`）：Vue 3 + Vite，左边会话、中间对话、右边面板（子任务实时进度 / 知识库文件树 / 定时任务）。
-- **文件上传**：md 进 LangGraph Store（白拿 fs 工具 + TTL）、xlsx 进对象存储（+ PG 元数据行），落点、限额、删除链见 [`UPLOAD.md`](./UPLOAD.md)。
+- **文件上传**：md 进 LangGraph Store（白拿 fs 工具 + TTL）、xlsx 落本地盘（+ PG 台账行），落点、限额、删除链见 [`UPLOAD.md`](./UPLOAD.md)。
 - **代码布局**：`custom/`（HTTP 面：`app.py` + `middleware/ api/ service/ db/`）、`graphs/`（图面：入口 `supervisor.py` / `space_agent.py` + `middleware/ access/ tools/ prompts/`）、`shared/`（两侧共用的纯逻辑：`config token outbox session/ knowledge/`），`knowledge/` 只放数据。依赖单向：两个包都只依赖 `shared/`，互不 import。详见 [`CONTEXT.md`](./CONTEXT.md) 的「代码布局」。
 
 ---
@@ -48,7 +48,7 @@ cp .env_example .env
 | 文件 | 放什么 |
 |---|---|
 | `.env` | aegra 原生运行参数（数据库、端口、日志…）+ **密钥** + 第三方模型 key |
-| `config.yaml` | 本项目新增的非密钥参数（会话配额、文件上限、对象存储地址、知识空间）—— 已有默认值，不改也能跑 |
+| `config.yaml` | 本项目新增的非密钥参数（会话配额、文件上限、上传目录、知识空间）—— 已有默认值，不改也能跑 |
 
 `.env` 至少改这几项：
 
@@ -77,13 +77,13 @@ OPENAI_BASE_URL=https://api.deepseek.com      # 用官方则可留空
 OPENAI_MODEL=deepseek-flash
 ```
 
-`config.yaml` 只改真要调的（示例：一个账号最多几个会话；生产接对象存储）：
+`config.yaml` 只改真要调的（示例：一个账号最多几个会话；上传字节落在哪）：
 
 ```yaml
 quota:
   max_threads_per_user: 50   # 含子线程；一个会话派 3~5 个子任务就吃掉 3~5 个名额
-s3:
-  endpoint: http://127.0.0.1:8333   # 留空 = 不启用对象存储（上传会话大表会 503）
+uploads:
+  dir: .data/uploads         # 会话里上传的 xlsx 字节落这里（多副本请挂共享卷）
 ```
 
 > `PASSWORD_PEPPER` 一旦改动，**已注册的账号全部无法登录**（bcrypt 哈希不再匹配），需要重新注册或重置密码。
@@ -440,9 +440,9 @@ knowledge/bio-lab/
 **有 `.xlsx` 才会装 xlsx 四件套**（`xlsx_info/query/search/profile` + CodeInterpreterMiddleware），
 纯文档空间自动不装。
 
-> 空间知识也可以放对象存储（`config.yaml` 的 `okf.backend: s3`，多副本读到同一份）：改完跑
-> `scripts/okf_push_s3.py`，各副本跑 `scripts/okf_pull_s3.py`。全部配置与上传方式见
-> [docs/S3.md](./docs/S3.md)。
+> 空间知识就是仓库根的 `knowledge/<空间>/`，改完**随发布走**（没有推送脚本、没有镜像）。
+> 取字节的唯一入口是 `graphs/access/factory.py::session_backend()`，见
+> [ADR-0018](./docs/adr/0018-local-only-file-reads.md)。
 
 ### 11.4 验证（不用重启）
 

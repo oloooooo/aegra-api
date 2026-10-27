@@ -180,9 +180,9 @@ _Avoid_: 把子 agent 的 thread 叫会话（它是任务的私生子线程，�
 **Session file（会话文件）**:
 用户在某个 Session 里上传的原文件，**只对上传者本人、只在这个会话可见，不属于任何 Space**。
 两种载体：md 存 LangGraph Store（`(uploads, hash(identity), 会话 thread_id)`）；xlsx 等二进制存
-对象存储（`(hash(identity), 会话 thread_id)` 前缀），字节不进 Store。**生命周期都是「会话在它就在」**：
-会话删除即删；md 靠孤儿保留期兜底，二进制靠删除链 + 对象存储生命周期兜底。
-路径 `/uploads/<文件名>`。
+本地盘（key `<uuid>/<文件名>`，归属只记 PG `session_object` 行），字节不进 Store。
+**生命周期都是「会话在它就在」**：会话删除即删；md 靠孤儿保留期兜底，二进制靠删除链兜底
+（没有 TTL，孤儿只能对账）。路径 `/uploads/<文件名>`。
 _Avoid_: 把它当 Space 知识（Space 知识对空间成员共享，会话文件只对上传者本人的这个会话可见）；
 叫附件、临时文件（它不是临时件：会话在它就在）；把上传的 xlsx 叫「空间表」
 （它不落 `knowledge/<空间>/`，存量手工放盘的表才是），或叫「空间文件」
@@ -194,9 +194,9 @@ _Avoid_: 把它当 Space 知识（Space 知识对空间成员共享，会话文�
 _Avoid_: 把它当保留期（用户会发现隔天文件消失的期望差）；把它当清理主路径（主路径是删会话）
 
 **Upload leftover（上传残留）**:
-一次上传没走完就留在对象存储里的东西：`tmp/` 下的中间对象（复制到正式 key 之前的那份），
-与超时未完成的分片上传。它不是会话文件、不属于任何会话，也不随删会话消失——
-这是**垃圾**，靠 `scripts/reap_multipart.py` 定期清（或对象存储的生命周期规则兜底）。
+一次上传没走完就留在盘上的东西：`.part-<rand>` 半截文件（`os.replace` 之前的那份），
+以及提交失败后没人引用的孤儿 key。它不是会话文件、不属于任何会话，也不随删会话消失——
+这是**垃圾**，没有自动清理，要靠手工对账（见 `docs/large-files.md`）。
 _Avoid_: 把它当孤儿会话文件（那个有保留期、由 Store 的 TTL 管）；把它当正常数据去对账
 （它会让物理用量大于 PG 里的 `sum(size_bytes)`）
 
@@ -218,15 +218,16 @@ _Avoid_: 把 csv / markdown 表格叫大表（走的不是这条链）；把"表
 由大表字节派生出来的 SQLite 文件，每 sheet 一张表。**它是缓存，不是数据**：可以随时删、
 由任一实例重建；键由「字节 sha256 + header 行号 + 索引格式版本」决定，所以同一份内容
 在哪个实例上建出来都一样。派生不出来不影响上传成功。
-_Avoid_: 把它当第二个真相（真相是对象存储里的字节 + PG 里的行）；把它叫"转换结果"
+_Avoid_: 把它当第二个真相（真相是盘上的字节 + PG 里的行）；把它叫"转换结果"
 （没有转换语义，只是换个存储引擎）；对它做配额或计费（它随时会消失）
 
-**Blob store（对象存储）**:
-SeaweedFS，S3 协议。存会话文件里的二进制（xlsx）与由它派生的表索引，前缀按
-`(hash(上传者 identity), 会话 thread_id)` 隔离——与 Store 的会话文件命名空间同一组键。
-它和 LangGraph Store 是两套东西：Store 放 JSON 文本（md 会话文件），对象存储放二进制。
-_Avoid_: 把两者都说成 "store"；用 S3Backend 之类的说法（本仓库不往 deepagents 的
-backend 里塞对象存储，xlsx 工具自己直连）；把它当 Space 隔离（它按会话隔离，不是按空间）
+**Upload bytes（上传字节）**:
+会话文件里的二进制（xlsx）与由它派生的表索引，落在 `uploads.dir`（默认 `.data/uploads`）。
+key 是 `<uuid4hex>/<文件名>`：**归属不写进路径**，一个 key 属于谁、哪个会话，只记 PG
+`session_object` 行——所以隔离靠台账过滤，不靠目录。它和 LangGraph Store 是两套东西：
+Store 放 JSON 文本（md 会话文件），盘上放二进制。
+_Avoid_: 把它叫对象存储/S3（本分支不接，见 ADR-0018）；把两者都说成 "store"；把它当 Space 隔离
+（它按会话隔离，不是按空间）；按 key 前缀批量删（key 不含身份，只能先查台账）
 
 **Table rule（表规则）**:
 「这张上传的表能不能被当成表来处理」的判定：**只看结构合法性**——是 `.xlsx`、能被解析、
@@ -247,7 +248,7 @@ _Avoid_: 把它当业务校验（"这张表的数据对不对"不是它的职责
   `access/` 横切的访问判定（spaces 列表、会话作用域、带 ACL 的 backend）、
   `tools/` 与 `prompts/`。
 - `shared/` —— **两侧共用的纯逻辑**：`config`（config.yaml 单例）、`token`（JWT 铸造）、
-  `outbox`（投递文本口径）、`session/`（LangGraph Store 与对象存储）、
+  `outbox`（投递文本口径）、`session/`（LangGraph Store 与上传字节落盘）、
   `knowledge/`（知识根、`AGENT.md` 解析与脚手架）。
 
 规则：`custom → shared`、`graphs → shared`，**两个包互不 import**；`shared` 不 import

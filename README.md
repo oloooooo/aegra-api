@@ -265,7 +265,7 @@ Every key in detail, the startup-time error messages, the graph-key / `assistant
 
 ### Environment Variables (`.env`)
 
-Loaded once at import; real environment variables take precedence over the file, so the same `.env` works in Docker/K8s with a few keys overridden. Configuration comes from three places: aegra's own settings in `src/aegra_api/settings.py` (env only), this project's **non-secret** knobs in [`config.yaml`](config.yaml) (read by `shared/config.py`, env override allowed), and **secrets** in `.env` (JWT_SECRET, PASSWORD_PEPPER, SESSION_SCOPE_SECRET, S3 credentials, OPENAI_API_KEY). A commented starting point is [`.env_example`](.env_example) (A native / B secrets / C third-party); the full reference (server, PostgreSQL, pools, Redis/workers, cron, retention, logging, OpenTelemetry, metrics) is in [docs/configuration.md](docs/configuration.md).
+Loaded once at import; real environment variables take precedence over the file, so the same `.env` works in Docker/K8s with a few keys overridden. Configuration comes from three places: aegra's own settings in `src/aegra_api/settings.py` (env only), this project's **non-secret** knobs in [`config.yaml`](config.yaml) (read by `shared/config.py`, env override allowed), and **secrets** in `.env` (JWT_SECRET, PASSWORD_PEPPER, SESSION_SCOPE_SECRET, OPENAI_API_KEY). A commented starting point is [`.env_example`](.env_example) (A native / B secrets / C third-party); the full reference (server, PostgreSQL, pools, Redis/workers, cron, retention, logging, OpenTelemetry, metrics) is in [docs/configuration.md](docs/configuration.md).
 
 ```bash
 # --- Server ---
@@ -434,8 +434,8 @@ aegra-api/
 │   ├── config.py         # config.yaml singleton
 │   ├── token.py          # JWT minting (user + service identity)
 │   ├── outbox.py         # delivery message format
-│   ├── session/          # LangGraph Store namespace + S3 blobs
-│   └── knowledge/        # knowledge root (local|s3) + AGENT.md parsing
+│   ├── session/          # LangGraph Store namespace + uploaded bytes on disk
+│   └── knowledge/        # knowledge root + AGENT.md parsing
 ├── knowledge/            # space content (data, not code)
 ├── tests/                # pytest (unit / integration / e2e)
 ├── web/                  # Vue 3 frontend
@@ -455,7 +455,7 @@ aegra-api/
 - Async subagent (ACP) design: [docs/design.md](docs/design.md)
 - Streaming reference (stream modes, sub-agent stream proxy): [docs/streaming.md](docs/streaming.md) (Chinese)
 - Frontend API contract (custom endpoints, SSE frames, interrupt/resume): [docs/frontend-api.md](docs/frontend-api.md) (Chinese)
-- File upload (md → Store, xlsx → S3; limits, delete chain): [UPLOAD.md](UPLOAD.md) (Chinese)
+- File upload (md → Store, xlsx → local disk; limits, delete chain): [UPLOAD.md](UPLOAD.md) (Chinese)
 - Glossary: [CONTEXT.md](CONTEXT.md)
 
 ## Web UI

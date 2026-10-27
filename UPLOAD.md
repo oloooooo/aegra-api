@@ -1,23 +1,24 @@
 # 文件上传：基本逻辑
 
 用户往一个会话里传文件，走两个接口、落两种载体。这份文档讲**为什么这么设计**和**一次上传到底发生了什么**；
-实现细节见 [`docs/large-files.md`](./docs/large-files.md)，对象存储运维见 [`docs/S3.md`](./docs/S3.md)，
-代码入口是 [`custom/api/uploads.py`](./custom/api/uploads.py)（模块开头有同样的分区说明）。
+实现细节见 [`docs/large-files.md`](./docs/large-files.md)，取字节的唯一入口见
+[ADR-0018](./docs/adr/0018-local-only-file-reads.md)，代码入口是
+[`custom/api/uploads.py`](./custom/api/uploads.py)（模块开头有同样的分区说明）。
 
 ## 0. 一张表看全
 
 | | md（笔记/资料） | xlsx（大表） |
 |---|---|---|
 | 接口 | `POST /custom/uploads` | `POST /custom/uploads/tables` |
-| 载体 | LangGraph Store（PG 里的 JSON 文本） | 字节进对象存储（S3）+ 元数据行进 PG |
+| 载体 | LangGraph Store（PG 里的 JSON 文本） | 字节落本地盘（`uploads.dir`）+ 归属行进 PG |
 | agent 眼里 | `/uploads/<name>` | `/uploads/<name>` |
-| 谁读它 | `SessionFilesMiddleware`（清单）、Store 的 fs 工具（ls/read/grep/glob） | `xlsx_info / query / search / profile`（先查 PG → 下字节 → SQLite 索引） |
+| 谁读它 | `SessionFilesMiddleware`（清单）、Store 的 fs 工具（ls/read/grep/glob） | `xlsx_info / query / search / profile`（`backend.download_files` 取字节 → 落缓存 → SQLite 索引） |
 | 单文件上限 | `session_files.max_upload_mb` = 10 MB | `xlsx.max_blob_mb` = 10 MB |
 | 每会话个数 | `session_files.max_files_per_session` = 50 | `xlsx.max_xlsx_files_per_session` = 20 |
 | 每用户总量 | — | `xlsx.max_blob_mb_per_user` = 2048 MB |
 | 同名再传 | 覆盖（PUT 语义），不占新名额 | 覆盖，不占新名额（旧对象在提交成功后删） |
-| 落点 | 命名空间 `(uploads, h(identity), thread)`，key `/<name>` | `sessions/{h(identity)}/{thread}/{sha16}/<name>` |
-| 孤儿保留 | 72h（`session_files.upload_ttl_minutes`，**读一次续期**） | 无 TTL：靠「删会话」+ 上传残留清理 |
+| 落点 | 命名空间 `(uploads, h(identity), thread)`，key `/<name>` | key `<uuid>/<name>`（盘上 `<uploads.dir>/<uuid>/<name>`），归属只在 PG 台账 |
+| 孤儿保留 | 72h（`session_files.upload_ttl_minutes`，**读一次续期**） | 无 TTL：靠「删会话」+ 对账（孤儿 key 与 `.part-*` 不会被自动清） |
 
 ## 1. 为什么上传必须挂在会话上
 
@@ -64,15 +65,14 @@ curl -s -X POST localhost:2026/custom/uploads \
 ## 3. 一次 xlsx 上传发生了什么
 
 文件名必须是 `<空间名>_<表名>.xlsx`。空间名前缀校验的是**你有没有那个 space**，它只决定
-主管把活派给哪个子 agent，**不决定存哪**：存储前缀永远是 `sessions/{h}/{thread}/`。
+主管把活派给哪个子 agent，**不决定存哪**：每次上传都新分配一个 `<uuid>/<name>` key。
 
 ```
 1. file.size 先挡一次            不读身体就能 413
 2. 文件名 + 空间前缀             不合规 → 422 / 415
-3. put_stream(file, tmp/…)      手写分片：边读边算 sha256，超限自己 abort
-4. copy(tmp, sessions/{h}/{thread}/{sha16}/<name>)    服务端复制，不搬字节
-5. PG 事务                      session_files.upsert()：锁用户行算配额 → 写行 → commit
-6. 删 tmp；提交成功后再删被替换掉的旧对象
+3. disk.put_stream(file, new_key)  边读边算 sha256，写 `<name>.part-<rand>` → os.replace（原子）
+4. PG 事务                      session_files.upsert()：锁用户行算配额 → 写行 → commit
+5. 提交成功后才删被替换掉的旧 key
 ```
 
 返回 `201`：
@@ -84,11 +84,11 @@ curl -s -X POST localhost:2026/custom/uploads \
 
 `indexed: false` 恒定——索引是**缓存**，第一次调 xlsx 工具时才建。
 
-**写序不能换**（`tmp` → 正式 key → PG 事务 → 删 `tmp`）：任何一步崩都只会留下垃圾对象，
-不会出现"行说 A、字节是 B"。同名同内容的并发上传写同一个 key，谁最后提交谁赢。
+**写序不能换**（写字节 → PG 事务 → 删旧 key）：任何一步崩都只会留下孤儿文件（或 `.part-*`），
+不会出现"行说 A、字节是 B"。`os.replace` 保证读到的永远是完整文件。
 
-失败时只删「本次新写、且不是旧行正在用的」对象——同名同内容重传恰好卡在配额时，删了新的
-就等于删掉旧行唯一的那份字节。清理动作自身吞异常，否则「存储不可用 → 503」会变成「未知错误 → 500」。
+失败时只删**本次新写的 key**。key 每次都是新的，所以物理上不可能删掉旧行在用的那份字节
+（这也是不按内容 sha 去重的原因之一）。清理动作自身吞异常，否则会用一个清理错盖掉真正的错。
 
 ## 4. 传完之后，agent 怎么读到
 
@@ -98,24 +98,25 @@ agent 视角                       真实落点
                                 ├─ SessionFilesMiddleware 每轮 run 起始注入清单（不可信内容标注）
                                 └─ StoreBackend：ls / read_file / grep / glob 直接用
 
-/uploads/cbam-reporting_x.xlsx →  对象存储 sessions/{h}/{thread}/{sha16}/x.xlsx
-                                ├─ xlsx 工具：查 PG 拿 object_key → 下到 .cache/xlsx → 建 SQLite 索引
+/uploads/cbam-reporting_x.xlsx →  盘上 <uploads.dir>/<uuid>/x.xlsx（归属在 PG 台账）
+                                ├─ UploadsBackend：查台账 → backend.download_files 取字节
+                                ├─ xlsx 工具：落 .cache/xlsx（按内容 sha16）→ 建 SQLite 索引
                                 └─ 不能 read_file / grep（zip 二进制）
 ```
 
 **子 agent** 读同一条会话的文件靠派活时签发的 `session_scope`（HMAC 签名，
 `graphs/access/session_scope.py`）：它读得到本会话的 `/uploads/*`，读不到别的主管的会话。
 
-`h(identity)` = sha256 前 16 位，Store 命名空间与对象存储前缀**共用同一个函数**
-（`shared/session/store.py::identity_digest`）——两处若不一致，同一份内容会落在两套前缀下。
+`h(identity)` = sha256 前 16 位（`shared/session/store.py::identity_digest`），只用于 md 的
+Store 命名空间；xlsx 的 key 不含身份，隔离靠台账行 + 每次读都按当前会话过滤。
 
 ## 5. 删除与垃圾：三个责任人
 
 | 什么 | 谁负责 |
 |---|---|
-| 删会话 | `custom/middleware/threads_delete.py`：先删 `session_object` 行 → 删 S3 前缀 → 清 Store。任何一步失败只记日志，不把删除变成 500 |
+| 删会话 | `custom/middleware/threads_delete.py`：先读出台账里本会话的 key → 删 `session_object` 行 → 逐 key 删盘 → 清 Store。任何一步失败只记日志，不把删除变成 500 |
 | 孤儿 md | Store 自带 TTL（aegra 启动时 `start_ttl_sweeper()`），**读一次续期**，所以"在用的会话永不失效" |
-| 上传残留 | `tmp/` 中间对象与未完成分片：`PYTHONPATH=. python scripts/reap_multipart.py`（见 `docs/S3.md` §8） |
+| 上传残留 | `.part-*` 半截文件与孤儿 key：没有自动清理，手工对账（见 `docs/large-files.md`「对账」） |
 
 ## 6. 配置
 
@@ -131,13 +132,12 @@ xlsx:                     # xlsx
   max_md_files_per_session: 10   # ⚠ 当前代码没读这个键（md 的个数上限走上一段），改之前先对齐
   max_blob_mb_per_user: 2048
   cache_dir: .cache/xlsx
-s3:
-  endpoint: ""            # 空 = 不启用对象存储：xlsx 上传 503，md 不受影响
-  bucket: aegra-blobs
+uploads:                  # xlsx 字节落盘的位置（相对仓库根）
+  dir: .data/uploads
 ```
 
-两套部署形态：`s3.endpoint` 为空 → 只有 md 可用（本地开发）；填上 → 两种都能用，
-所有副本读同一份对象（生产）。
+多副本：字节在**本机盘**上，副本之间不共享。要共享就挂同一卷（NFS/EFS）；
+不想共享就只跑单副本（默认形态）。对象存储版见 `feat/unified-files-s3` 分支。
 
 ## 7. 常见问题
 
@@ -148,11 +148,11 @@ s3:
 | `413` | 单文件超 10MB、会话内文件数满、或每用户二进制总量满 |
 | `422 文件名前缀 'x' 不是你的空间` | xlsx 文件名必须以自己的 space 名开头 |
 | `422 不是合法 UTF-8 文本` | md 必须是 UTF-8 文本（GBK 文件先转码） |
-| `503 存储未就绪` | 对象存储没配（`s3.endpoint` 为空）或连不上 |
+| `500` | 盘写不进去（写满/权限）：`put_stream` 抛 `OSError`，日志里有 `upload_table_failed` |
 | 传了但这一轮看不到 | 清单在**下一轮** run 起始才读；先发一条消息再问 |
 
 ## 8. 有意的非目标
 
-秒传预检、前端直传、断点续传、按内容去重、md 进对象存储——都不做，理由见
-[ADR-0015](./docs/adr/0015-large-tables-in-object-storage.md)（md 留 Store 是为了白拿 fs 工具与 TTL；
-xlsx 自己直连 S3 是因为 read/grep 读不了 zip）。
+秒传预检、前端直传、断点续传、按内容去重、md 落盘——都不做，理由见
+[ADR-0018](./docs/adr/0018-local-only-file-reads.md)（md 留 Store 是为了白拿 fs 工具与 TTL；
+xlsx 落盘是因为 read/grep 读不了 zip，而工具要的是字节而不是文本）。

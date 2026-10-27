@@ -4,7 +4,7 @@ aegra-api 的配置分三份文件，职责不重叠：
 
 | | `aegra.json` | `config.yaml` | `.env` / 环境变量 |
 |---|---|---|---|
-| **放什么** | 这个部署**对外提供什么**：图、自定义 HTTP app、store / checkpointer / auth 策略 | 本项目新增的**非密钥**参数：会话配额、文件上限、对象存储地址、OKF、发件箱 | aegra 原生运行参数（host / port、PostgreSQL、Redis、worker、cron、日志、OTEL）+ **密钥** + 第三方 SDK |
+| **放什么** | 这个部署**对外提供什么**：图、自定义 HTTP app、store / checkpointer / auth 策略 | 本项目新增的**非密钥**参数：会话配额、文件上限、上传目录、OKF、发件箱 | aegra 原生运行参数（host / port、PostgreSQL、Redis、worker、cron、日志、OTEL）+ **密钥** + 第三方 SDK |
 | **谁读** | `src/aegra_api/config.py` | `shared/config.py` | `src/aegra_api/settings.py`（`load_dotenv()` 在导入时执行）+ 各模块 `os.environ` |
 | **格式** | JSON | YAML | 项目根 `.env`，`KEY=VALUE` |
 | **放密钥** | 不放 | **不放** | 放 |
@@ -13,7 +13,7 @@ aegra-api 的配置分三份文件，职责不重叠：
 判断标准：
 
 - 描述“这个服务托管什么”（托管哪些图、用哪个 auth 处理器、保留策略）→ `aegra.json`
-- 本项目自己加的调参（配额、上限、S3 地址、OKF、发件箱）→ `config.yaml`
+- 本项目自己加的调参（配额、上限、上传目录、OKF、发件箱）→ `config.yaml`
 - 跟机器/部署绑定的 aegra 原生参数、以及任何凭据 → `.env`
 
 三者的逐键说明见 [§3](#3-配置来源)。
@@ -218,14 +218,14 @@ ValueError: Graph IDs 'a.b' and 'a_b' collide after sanitisation (both map to ae
 | 来源 | 放什么 | 谁读 | 优先级 |
 |---|---|---|---|
 | `aegra.json` | aegra 原生：托管哪些图、自定义 HTTP app、store / checkpointer / auth（见 §2） | `src/aegra_api/config.py` | — |
-| `config.yaml`（仓库根） | 本项目新增的**非密钥**参数：配额、会话文件上限、对象存储地址、知识空间、发件箱 | `shared/config.py` | 代码默认值 < 文件 < 同名环境变量 |
+| `config.yaml`（仓库根） | 本项目新增的**非密钥**参数：配额、会话文件上限、上传目录、知识空间、发件箱 | `shared/config.py` | 代码默认值 < 文件 < 同名环境变量 |
 | `.env` / 环境变量 | aegra 原生 env（§3.1）、**密钥**（§3.3）、第三方 SDK（§3.4） | `settings.py` 与各模块 `os.environ` | 环境变量总优先 |
 
 一个键该放哪：
 
 - 影响 aegra 本身怎么跑（host / port / PG / Redis / 日志 / OTEL）→ `.env`（§3.1，上游定义）
-- 本项目加的调参（配额、上限、S3 地址、OKF、发件箱）→ `config.yaml`（§3.2）
-- 凭据（JWT 密钥、密码 pepper、S3 凭证、API key）→ `.env`（§3.3）
+- 本项目加的调参（配额、上限、上传目录、OKF、发件箱）→ `config.yaml`（§3.2）
+- 凭据（JWT 密钥、密码 pepper、API key）→ `.env`（§3.3）
 
 ### 3.1 aegra 原生环境变量（`src/aegra_api/settings.py`）
 
@@ -338,7 +338,7 @@ md 进 LangGraph Store，按（上传者, 主管 thread）隔离。
 
 #### 会话大表 xlsx（`custom/service/session_files.py`、`graphs/tools/xlsx/`）
 
-xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 [large-files.md](./large-files.md)。
+xlsx 字节落本地盘、归属进 PG `session_object`；完整手册见 [large-files.md](./large-files.md)。
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
@@ -351,24 +351,19 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 | `xlsx.cache_ttl_days` | `7` | `XLSX_CACHE_TTL_DAYS` | 本机缓存保留天数 |
 | `xlsx.query_budget_ms` | `5000` | `XLSX_QUERY_BUDGET_MS` | 单次 `where` 查询的 CPU 预算，超了 `interrupt()` |
 
-#### 对象存储（`shared/session/blobs.py`）
+#### 上传字节落盘（`shared/session/disk.py`）
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
-| `s3.endpoint` | 空 | `S3_ENDPOINT` | 空 = 对象存储未启用；xlsx 上传会返回 503，其余功能不受影响 |
-| `s3.bucket` | `aegra-blobs` | `S3_BUCKET` | 桶名，启动时自动创建（幂等） |
-| `s3.region` | `us-east-1` | `S3_REGION` | 任意值（SeaweedFS 不校验） |
+| `uploads.dir` | `.data/uploads` | `UPLOADS_DIR` | 会话上传的 xlsx 字节根目录（相对仓库根）；key 是 `<uuid>/<名>`。多副本请挂共享卷，否则各副本只看得见自己收的文件 |
 
 #### 空间知识 OKF（`shared/knowledge/root.py`、`shared/knowledge/spec.py`）
 
-见 [adr/0016](./adr/0016-spaces-in-object-storage.md)、[S3.md](./S3.md)。
+见 [adr/0018](./adr/0018-local-only-file-reads.md)。
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
-| `okf.backend` | `local` | `OKF_BACKEND` | `local` 直接读 `graphs/<okf.dir>`；`s3` 读本地镜像 |
-| `okf.dir` | `okf` | `OKF_DIR` | 空间根目录名（相对 `graphs/`） |
-| `okf.mirror_dir` | `.cache/okf` | `OKF_MIRROR_DIR` | `s3` 模式的镜像目录 |
-| `okf.mirror_ttl_seconds` | `0` | `OKF_MIRROR_TTL_SECONDS` | 镜像过期重拉的间隔；`0` = 只拉一次（改内容后手动跑 `scripts/okf_pull_s3.py`） |
+| `okf.dir` | `knowledge` | `OKF_DIR` | 空间根目录名（相对**仓库根**，不是 `graphs/`）——数据不在代码包里 |
 
 #### 图（`graphs/supervisor.py`）
 
@@ -400,7 +395,6 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 | `JWT_SECRET` | **无（必填）** | HS256 签/验 access token。缺失 = 启动即 `KeyError: 'JWT_SECRET'` |
 | `PASSWORD_PEPPER` | **无（必填）** | 密码哈希前拼接的全局密文。改了这个值，已注册账号全部登不上（旧哈希不再匹配） |
 | `SESSION_SCOPE_SECRET` | `dev-session-scope` | 签发/校验子 agent 读会话文件的 `session_scope` 的 HMAC 密钥，**生产必须改** |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `dev` / `dev` | 对象存储凭证（SeaweedFS 未配 IAM 时任意值） |
 
 ### 3.4 第三方 SDK 与模型
 
@@ -535,7 +529,7 @@ docker run --log-driver json-file --log-opt max-size=10m --log-opt max-file=5 ..
 | `Graph 'x' not found for assistant` | 库里 assistant 引用的 graph key 已从 `aegra.json` 删掉 | 把 key 加回配置（重启生效），或改客户端指向现存的图 |
 | `Graph 'x' not found in aegra.json. Available: [...]` | 在建 assistant 时传了配置里没有的 `graph_id` | 从提示的可用列表里选 |
 | 改了 `aegra.json` 没反应 | 配置只在启动时读一次 | 重启进程 |
-| 改了 `config.yaml` 没反应 | ① 只在 import 时读一次；② 同名环境变量优先（旧 `.env` 里还留着 `MAX_*` 那一行） | 重启；`env | grep -E 'MAX_|OKF_|S3_|OUTBOX_'` 看有没有变量盖掉它 |
+| 改了 `config.yaml` 没反应 | ① 只在 import 时读一次；② 同名环境变量优先（旧 `.env` 里还留着 `MAX_*` 那一行） | 重启；`env | grep -E 'MAX_|OKF_|UPLOADS_|OUTBOX_'` 看有没有变量盖掉它 |
 | 启动即 `ValueError: ... 不是合法 YAML` | `config.yaml` 缩进/冒号写错 | 用 YAML 校验器过一遍（缩进必须空格，不能 Tab） |
 | 启动即 `ValueError: 配置 xlsx.max_cells 需要数字` | `config.yaml` 里值写成了非数字（比如 `2m`） | 写成纯数字 |
 | `config.yaml` 里加的键不生效 | 键名拼错，或放错了段（`_SPEC` 里没这个键） | 对照 §3.2 的表；单测 `tests/unit/test_project_config.py` 会把拼错的键抳出来 |
@@ -582,10 +576,8 @@ docker run --log-driver json-file --log-opt max-size=10m --log-opt max-file=5 ..
 ```yaml
 quota:
   max_threads_per_user: 50
-s3:
-  endpoint: ""                # 空 = 对象存储不启用
-okf:
-  backend: local
+uploads:
+  dir: .data/uploads          # 会话上传的 xlsx 字节落这里
 ```
 
 `.env`：见仓库根目录的 [`.env_example`](../.env_example)（aegra 原生参数、密钥、第三方 SDK）。**密钥只放这里**。

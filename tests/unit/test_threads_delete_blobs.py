@@ -1,10 +1,10 @@
-"""删会话时的二进制清理（ADR-0015 §6）：先删行，再删对象前缀；任一步失败都不报错。"""
+"""删会话时的二进制清理（ADR-0018 §6）：先读出 key、删行，再逐对象删；任一步失败都不报错。"""
 
 import pytest
 
-from shared.session import blobs
-from custom.service import session_files as session_objects
 from custom.middleware import threads_delete
+from custom.service import session_files as session_objects
+from shared.session import disk
 
 
 class FakeSession:
@@ -26,34 +26,43 @@ class FakeCM:
         return False
 
 
+class FakeRow:
+    def __init__(self, key):
+        self.object_key = key
+
+
 @pytest.fixture
 def wired(monkeypatch):
-    calls: dict[str, list] = {"rows": [], "prefix": []}
+    calls: dict[str, list] = {"rows": [], "deleted": []}
     session = FakeSession()
 
     monkeypatch.setattr(threads_delete, "get_session_maker", lambda: lambda: FakeCM(session))
 
-    async def fake_delete_rows(_s, owner, thread_id):
+    async def fake_list(_s, owner, thread_id):
         calls["rows"].append((owner, thread_id))
+        return [FakeRow("aa/x.xlsx"), FakeRow("bb/y.xlsx")]
+
+    async def fake_delete_rows(_s, owner, thread_id):
         return 2
 
+    monkeypatch.setattr(session_objects, "list_for_thread", fake_list)
     monkeypatch.setattr(session_objects, "delete_for_thread", fake_delete_rows)
-    monkeypatch.setattr(blobs, "configured", lambda: True)  # 默认当“生产”、单测自带一个
-    monkeypatch.setattr(blobs, "delete_prefix", lambda prefix: calls["prefix"].append(prefix) or 3)
+    monkeypatch.setattr(disk, "delete_many", lambda keys: calls["deleted"].extend(keys) or len(keys))
     return calls, session
 
 
-async def test_clears_rows_then_prefix(wired):
+async def test_reads_keys_then_deletes_objects(wired):
+    """key 是 `<uuid>/<名>`，不带会话前缀：只能先读台账再逐个删。"""
     calls, session = wired
 
-    await threads_delete._clear_blobs("u1", "t-1")
+    await threads_delete._clear_files("u1", "t-1")
 
     assert calls["rows"] == [("u1", "t-1")]
-    assert calls["prefix"] == [blobs.session_prefix("u1", "t-1")]
+    assert calls["deleted"] == ["aa/x.xlsx", "bb/y.xlsx"]
     assert session.committed is True
 
 
-async def test_row_failure_skips_prefix_and_swallows(wired, monkeypatch):
+async def test_row_failure_skips_objects_and_swallows(wired, monkeypatch):
     calls, _ = wired
 
     async def boom(*_a, **_kw):
@@ -61,30 +70,33 @@ async def test_row_failure_skips_prefix_and_swallows(wired, monkeypatch):
 
     monkeypatch.setattr(session_objects, "delete_for_thread", boom)
 
-    await threads_delete._clear_blobs("u1", "t-1")  # 不抛
+    await threads_delete._clear_files("u1", "t-1")  # 不抛
 
-    assert calls["prefix"] == []  # 行没删掉就不要动对象，否则「行说 A、字节没了」
+    assert calls["deleted"] == []  # 行没删掉就不要动对象，否则「行说 A、字节没了」
 
 
-async def test_prefix_failure_is_swallowed(wired, monkeypatch):
+async def test_object_failure_is_swallowed(wired, monkeypatch):
     calls, _ = wired
 
-    def boom(_prefix):
-        raise RuntimeError("s3 down")
+    def boom(_keys):
+        raise RuntimeError("disk down")
 
-    monkeypatch.setattr(blobs, "delete_prefix", boom)
+    monkeypatch.setattr(disk, "delete_many", boom)
 
-    await threads_delete._clear_blobs("u1", "t-1")  # 不抛
+    await threads_delete._clear_files("u1", "t-1")  # 不抛
 
     assert calls["rows"] == [("u1", "t-1")]
 
 
-async def test_skips_prefix_when_object_storage_not_configured(wired, monkeypatch):
-    """开发环境不配 S3：不应每次删会话都打一条异常日志。行还是要删的。"""
+async def test_no_rows_means_no_object_deletes(wired, monkeypatch):
+    """没有二进制行（只传过 md）时不该去碰盘。"""
     calls, _ = wired
-    monkeypatch.setattr(blobs, "configured", lambda: False)
-    monkeypatch.setattr(blobs, "configured", lambda: False)
 
-    await threads_delete._clear_blobs("u1", "t-1")
+    async def empty(_s, _owner, _thread_id):
+        return []
 
-    assert calls["prefix"] == []
+    monkeypatch.setattr(session_objects, "list_for_thread", empty)
+
+    await threads_delete._clear_files("u1", "t-1")
+
+    assert calls["deleted"] == []

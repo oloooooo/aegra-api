@@ -1,7 +1,7 @@
 # 会话文件与大表（设计）
 
 配套 ADR：[0015 会话文件](./adr/0015-large-tables-in-object-storage.md)、
-[0016 空间进 S3](./adr/0016-spaces-in-object-storage.md)。操作手册见 [S3.md](./S3.md)。
+[0018 只基于本地 filesystem + Store](./adr/0018-local-only-file-reads.md)。
 第 3 稿（2026-10-25）：归属从「挂 space」改为「上传者私有 + 随会话删」，命名与 Key 全部重写。
 **已实现**（真服务单进程/多进程实测通过）；本文描述设计与取舍，落地位置见 §9。
 
@@ -17,8 +17,8 @@
 ### 0.2 只扫本地盘的判定
 
 - `shared/knowledge/spec.py:96::has_tables` 用 `glob("*.xlsx")` 决定装不装 xlsx 四件套；
-  `graphs/space_agent.py:51` 依赖它。字节进 S3 / 会话私有后，它必须换成
-  ①空间前缀探测（`okf.backend: s3`）或 ②「本次 run 有 `session_scope` 就装」。
+  `graphs/space_agent.py:51` 依赖它。字节会话私有后，它必须改成「本次 run 有
+  `session_scope` 就装」。
 - `custom/api/:158/164` 的 `_count_files` / `_list_files` 用 `rglob` 扫本地盘。
 
 ## 1. 分层
@@ -26,29 +26,31 @@
 | 存什么 | 放哪 | 生命周期 | 是真相吗 |
 |---|---|---|---|
 | md 会话文件 | LangGraph Store `(uploads, h(identity), thread_id)` | 72h 孤儿 TTL + 删会话即删 | 是 |
-| xlsx 字节 | S3 `sessions/{h}/{thread}/{sha16}/{name}` | 删会话即删 | 是 |
-| 元数据 | PG `session_object` | 事务 | 是 |
-| 表索引 | S3 `sessions/{h}/{thread}/idx/{name}.h{hdr}.v{build}.sqlite` + 本机缓存 | 可丢 | **否** |
-| 空间知识 | S3 `okf/<space>/`（ADR-0016） | 随空间 | 是 |
+| xlsx 字节 | 本地盘 `<uploads.dir>/<uuid>/<name>` | 删会话即删 | 是 |
+| 归属 | PG `session_object`（谁、哪个会话、key、sha256、大小） | 事务 | 是 |
+| 表索引 | 本机缓存 `{xlsx.cache_dir}/{sha16}-h{hdr}.v{build}.sqlite` | 可丢 | **否** |
+| 空间知识 | 仓库根 `knowledge/<space>/` | 随发布 | 是 |
 
-**所有会话文件都在 `sessions/{h}/{thread}/` 一个前缀下**，所以「删会话」= list 该前缀 +
-delete，一次覆盖字节与索引——比上一稿的独立 `index/` 前缀省一套删除逻辑。
+**key 里不含身份**，所以「删会话」不再是一次前缀删除：先读台账拿本会话的 key 列表，
+再逐 key 删（`threads_delete.py`）。代价是清理多一次查询，换来的是「一份字节可以被多条台账
+引用，改归属不用搬字节」。
 
 一条规矩定死：**本地磁盘上的一切都是缓存**。
 
 ## 2. 命名、规则与表
 
 ```
-tmp      tmp/{uuid4}/{name}
-blob     sessions/{h(identity)}/{thread_id}/{sha16}/{name}
-index    sessions/{h(identity)}/{thread_id}/idx/{name}.h{header}.v{BUILD}.sqlite
-cache    {xlsx.cache_dir}/{h}-{thread}-{sha16}-{header}-v{BUILD}.sqlite
+blob     {uploads.dir}/{uuid4hex}/{name}
+part     {uploads.dir}/{uuid4hex}/{name}.part-{rand}     写入中间态，os.replace 后消失
+index    {xlsx.cache_dir}/{sha16}-h{header}.v{BUILD}.sqlite
 ```
 
-- `{sha16}` = sha256 前 16 hex，进路径 → 并发同名不同内容各写各的 key，**不会出现
-  「行说 A、字节是 B」**；同内容重传 = 同 key + 同索引键 → 不重建。
-- `v{BUILD}`：改 schema 就 +1，否则永远读到旧结构。
-- 本地缓存名包含 `h + thread + sha16 + header + BUILD`，少一个维度就会串表。
+- `{uuid4hex}` 每次上传新分配 → 并发同名不同内容各写各的 key，**不会出现「行说 A、字节是 B」**；
+  同内容重传也是新 key（不去重，见 ADR-0018 取舍表）。
+- `{sha16}` = 内容 sha256 前 16 hex，**只用在缓存与索引键**上：内容变了缓存键就变。
+- key 只接受 `<32 位小写 hex>/<单层文件名>`（`shared/session/disk.py::_path`），不合规一律当不存在。
+- 索引缓存名含 `sha16 + header + BUILD`，少一个维度就会串表；不再含 `h/thread`
+  （同一份内容只存一份索引，跨会话复用）。
 
 **表规则（硬逻辑，`CONTEXT.md`「Table rule」）**：文件名必须形如
 `<space>_<名字>.xlsx`，且 `<space>` ∈ 该用户的 `user_spaces`；否则 422。
@@ -89,33 +91,26 @@ CREATE TABLE session_object (
 **不用** `b"".join(chunks)`（现在 `custom/api/uploads.py:69` 就是，27.9 MB 常驻两份）。
 `session_files.max_upload_mb=10` 留给 md 不动；`xlsx.max_blob_mb` 独立，缺省 10。
 
-**用 `upload_fileobj` 直写 S3 `tmp/` key**（不落本地文件）：请求流长度在读完前不可信，
-而 `put_object` 要求先给 `ContentLength`；`upload_fileobj` 按 8 MiB 自动分片、长度未知也能跑、
-单片可重试。
-
-**中断的 multipart 必须有人收尾**：`upload_id` 在 `upload_fileobj` 内部，超线抛异常时拿不到
-它来 abort，未完成分片会一直占空间。`shared/session/blobs.py::abort_stale_multiparts(older_than)`
-是现成入口；没有随仓库提供一个定时脚本，自己用系统计划任务调它（crons API 只触发图 run，
-不是运维脚本调度器）。
+**直接流式落盘**（`.part-<rand>` → `os.replace`）：不信 `Content-Length`，边读边计数并算
+sha256，超限抛 `TooLarge`；崩在中途只留 `.part` 垃圾，不会出现半截文件。
 
 ### 3.2 时序（写序：不可变 blob 先，可变元数据后）
 
 ```
 0. 读 PG 现有行（若有），记 old_key
-1. 流式 upload_fileobj → tmp/{uuid}/{name}          计数 + sha256
-2. copy_object tmp → sessions/{h}/{thread}/{sha16}/{name}   单次原子出现
-3. BEGIN
+1. disk.put_stream(file, new_key) → {uuid4hex}/{name}   计数 + sha256，.part → os.replace
+2. BEGIN
      SELECT 1 FROM user_tables WHERE identity=$1 FOR UPDATE     ← 配额串行化
      SELECT COALESCE(sum(bytes),0) FROM session_object WHERE owner_identity=$1
      文件数：md<10、xlsx<20（同名覆盖不占新名额）
      if 超预算 → 413
      INSERT … ON CONFLICT (owner_identity, thread_id, name) DO UPDATE
    COMMIT
-4. DELETE tmp
+3. 提交成功后才删 old_key
 ```
 
-**失败清理**：删 `tmp/` 永远安全；最终 key **只在 `new_key != old_key` 时删**。否则
-「同名同内容重传恰好卡在配额」会删掉旧行仍在引用的字节，造出「有行无字节」。
+**失败清理**：只删**本次新写的 key**。key 每次都是新的（uuid），所以物理上不可能删掉旧行
+仍在引用的字节，造出「有行无字节」。
 
 **幂等**：`(owner_identity, thread_id, name)` 主键 + `ON CONFLICT DO UPDATE`。唯一约束在 DB 上，
 不靠「先查后插」（并发下会同时查空、同时插入）。
@@ -123,7 +118,7 @@ CREATE TABLE session_object (
 ### 3.3 错误码
 
 404 无权限/thread 不存在 · 415 非 `.xlsx` · 413 超字节/超配额 · 422 文件名不合法或 space 前缀
-不是该用户的空间 · 503 对象存储不可用。
+不是该用户的空间 · 500 盘写不进去（写满/权限）。
 
 响应 `{path: "/uploads/<name>", name, space, bytes, sha256, indexed: false}`；**不等 ingest**。
 
@@ -134,14 +129,17 @@ CREATE TABLE session_object (
 
 ## 4. 读取：字节从哪来
 
-`graphs/tools/xlsx/store.py::fetch(path, scope) -> Path`
+`graphs/tools/xlsx/__init__.py::_fetch(path)` → `runtime.backend.download_files([path])`；
+`graphs/tools/xlsx/store.py::cache_bytes` 只负责落缓存。
 
 ```
-/uploads/<name>.xlsx
-  ├─ 本机缓存命中（h+thread+sha16）→ 用它
-  ├─ 查 PG session_object 拿 object_key → get_object → 原子落到缓存
-  └─ 若 path 以 /<space>/ 开头且 okf.backend: local → 存量本地盘（双读兼容）
+/uploads/<name>.xlsx                     → UploadsBackend：查台账拿 key → disk.read
+/<space>/<name>.xlsx                     → SpaceBackend：knowledge/<space>/<name>.xlsx
+  └─ 两条路都返回字节 → store.cache_bytes 按 sha16 落盘 → 建/复用索引
 ```
+
+**工具不自己找字节**：旧的 `_check_scope()` 与「查 PG 拿 key」都删了，判定单点回到 backend
+（ADR-0018）。所以未来多一个写入方，只要它进得了 backend 或台账，工具不用改。
 
 - 缓存写必须 **`.tmp` + `os.replace`**，命中后 `PRAGMA quick_check`。`immutable=1` 关掉了
   SQLite 的锁，撕开写坏的索引会被当有效文件复用。
@@ -159,9 +157,10 @@ CREATE TABLE session_object (
 **不替换 `langgraph_auth_user`**，否则 `allowed_spaces()` 会走普通用户分支读
 `auth_user.user_spaces`，把子 agent 从「本任务 space」放大成「用户全部 space」。
 
-子 agent 的 backend：`CompositeBackend(default=SpaceBackend, routes={"/uploads/": StoreBackend(ns=f(scope))})`，
-xlsx 工具用 `scope` 算 S3 前缀（工具仍绕 backend 直读字节）。主管的
-`_uploads_namespace()` 改成「有 `session_scope` 且验签通过就用它，否则用自身 config」。
+子 agent 的 backend 由 `graphs/access/factory.py::session_backend()` 装配：
+`CompositeBackend(default=SpaceBackend, routes={"/uploads/": UploadsBackend()})`，
+`UploadsBackend` 每次读都按经 `session_scope` 验签后的（上传者, 主管 thread）过滤台账行——
+所以它读得到本会话的 `/uploads/*`，读不到别的会话的。
 
 ## 5. ingest → SQLite
 
@@ -227,15 +226,14 @@ UNION ALL SELECT rowid, 1, CAST(c1 AS TEXT) FROM s0 WHERE c1 LIKE ? ESCAPE '\'
 
 | 场景 | 结果 | 机制 |
 |---|---|---|
-| 两实例同时 ingest | 都成功，语义相同 | 键含 sha256+header+BUILD，PUT 原子，无锁 |
-| 上传中途崩溃 | `tmp/` 孤儿 | 生命周期 7 天 |
-| 第 2 步完、第 3 步崩 | 孤儿 blob | 生命周期；**不会有行没字节** |
-| 第 3 步失败（配额） | 旧行完好 | 只在 `new_key != old_key` 时删最终 key |
-| 上传超限被打断 | 未完成分片 | `abort_stale_multiparts`（脚本未写，需自建定时任务，见 §10） |
-| 删会话 | 前缀全清 | list `sessions/{h}/{thread}/` → delete（覆盖字节+索引） |
-| 并发同名不同内容 | 行指向最后提交者，另一份孤儿 | `{sha16}` 进 key |
+| 两实例同时 ingest | 都成功，语义相同 | 缓存键含 sha256+header+BUILD，`os.replace` 原子，无锁 |
+| 上传中途崩溃 | `.part-*` 垃圾 | 没有自动清理，手工对账（§10） |
+| 第 1 步完、第 2 步崩 | 孤儿 key | 无悬空行（行还没写）；孤儿 key 手工对账 |
+| 第 2 步失败（配额） | 旧行完好 | 只删本次新写的 key |
+| 删会话 | 台账行 + 字节都清 | 读 key 列表 → 删行 → 逐 key 删盘 |
+| 并发同名不同内容 | 行指向最后提交者，另一份成孤儿 | key 含 uuid4 |
 | 配额并发 | 严格 | `SELECT … FROM user_tables FOR UPDATE` |
-| 旧缓存 | 自然失效 | 文件名含 sha16 + BUILD |
+| 旧缓存 | 自然失效 | 缓存名含 sha16 + BUILD |
 
 **不需要**：Redis 广播、分布式锁、`If-None-Match`、引用计数、leader election。
 
@@ -243,23 +241,14 @@ UNION ALL SELECT rowid, 1, CAST(c1 AS TEXT) FROM s0 WHERE c1 LIKE ? ESCAPE '\'
 
 | 包 | 用途 |
 |---|---|
-| `boto3>=1.35`（+ `botocore`） | S3 客户端；同步 API 走 `asyncio.to_thread` |
-| SeaweedFS `weed.exe`（非 pip） | 对象存储本体 |
+| （无新增） | 字节落盘用 stdlib `pathlib`/`hashlib`；`pandas`/`openpyxl` 已有 |
 
-不新增：`sqlite3`（stdlib）、`pandas`/`openpyxl`（已有）、`aioboto3`、`moto`。
-
-**boto3 client 必须懒加载**：`graphs/tools/xlsx/__init__.py` 在 import 期就被
-`graphs/tools/__init__.py:13`、`graphs/tools/xlsx/__init__.py` 拉起，模块级建 client 会让没配
-`s3.endpoint` 的环境（本地 demo、单测）直接 import 失败。
+本分支删掉了 `boto3` 依赖（S3 客户端只在 `feat/unified-files-s3` 分支存在）。
 
 ```yaml
 # config.yaml
-s3:
-  endpoint: http://127.0.0.1:8333
-  bucket: aegra-blobs
-  region: us-east-1
-okf:
-  backend: local            # local | s3（ADR-0016）
+uploads:
+  dir: .data/uploads        # 会话上传字节的根目录（相对仓库根）
 xlsx:
   max_blob_mb: 10
   max_cells: 2000000
@@ -273,65 +262,70 @@ quota:
 ```
 
 ```ini
-# .env —— 只有凭证
-S3_ACCESS_KEY=...
-S3_SECRET_KEY=...
+# .env —— 只有密钥
 SESSION_SCOPE_SECRET=<hmac key>
 ```
-
-`Config(s3={"addressing_style": "path"})` 必须有：给了 `endpoint_url` 后 boto3 仍默认
-virtual-host，`bucket.127.0.0.1:8333` 解析不了。bucket 启动时 `head_bucket` 失败则
-`create_bucket`（幂等）。
 
 ## 8. 改动清单（已落地）
 
 | 文件 | 内容 |
 |---|---|
-| `shared/session/blobs.py` | S3 客户端、key 命名、`put_stream`（自管分片可 abort）、`delete_prefix`、`abort_stale_multiparts` |
+| `shared/session/disk.py` | 本地盘对象：key 命名 `<uuid>/<名>`、`put_stream`（`.part` → `os.replace`，算 sha256）、`read`/`delete`/`delete_many` |
 | `custom/service/session_files.py` | `parse_space`、`quota_violation`、`upsert`（锁用户行） |
 | `custom/db/models.py` + alembic `c1d2e3f4a5b6` | `session_object` 表 |
 | `custom/api/uploads.py` | `POST /custom/uploads/tables` |
 | `graphs/access/session_scope.py` | 签发/验签/解析（主管自身 config，子 agent 用签名凭证） |
+| `graphs/access/factory.py` | 读文件唯一装配点：`CompositeBackend(default=SpaceBackend, routes={"/uploads/": UploadsBackend()})` |
+| `graphs/access/uploads_backend.py` | `/uploads/` 只读 backend：查台账 → 读盘，只实现异步协议方法 |
 | `graphs/middleware/async_task_guard.py` | 派活时签发 `session_scope` |
 | `graphs/space_agent.py` / `graphs/supervisor.py` | CompositeBackend + `/uploads` 路由；主管也装 xlsx 四件套 |
 | `graphs/tools/xlsx/{store,index}.py` + `__init__.py` | 字节解析、ingest → SQLite、四个工具改跑 SQL |
-| `custom/middleware/threads_delete.py` | 删会话连带清 PG 行 + S3 前缀 |
-| `shared/knowledge/root.py` + `scripts/okf_{push,pull}_s3.py` | 空间知识进 S3（ADR-0016） |
-| `tests/unit/test_{blobs,session_objects,upload_tables,session_scope,xlsx_index,xlsx_scope,threads_delete_blobs,okf_mirror}.py` | 约 70 条单测 |
+| `custom/middleware/threads_delete.py` | 删会话连带清台账行 + 盘上字节 |
+| `shared/knowledge/root.py` | 只有一条路：`knowledge_root()` = 仓库根 `knowledge/`（无开关、无镜像） |
+| `tests/unit/test_{backend_scope,session_objects,upload_tables,session_scope,xlsx_index,threads_delete_blobs,session_files}.py` | 约 70 条单测 |
 
 ## 9. 测试策（已落地）
 
-单测共约 70 条，位于 `tests/unit/`（S3 层 monkeypatch `blobs`，不引 moto）：
-`test_blobs.py`、`test_session_objects.py`、`test_upload_tables.py`、`test_session_scope.py`、
-`test_xlsx_scope.py`、`test_xlsx_index.py`、`test_threads_delete_blobs.py`、`test_okf_mirror.py`。
-重点覆盖：越权回归、文件名/空间规则、流式超限与 abort、配额两闸、行号公式
-`rowid + header + 1`、`xlsx_search` 的单元格语义、`where` 语义矩阵、authorizer 边界、
-`session_scope` 验签。
+单测共约 70 条，位于 `tests/unit/`（盘层 monkeypatch `shared.session.disk`，不碰真盘）：
+`test_backend_scope.py`、`test_session_objects.py`、`test_upload_tables.py`、
+`test_session_scope.py`、`test_xlsx_index.py`、`test_threads_delete_blobs.py`、
+`test_session_files.py`。
+重点覆盖：越权回归（含 `..` 与符号链接逃逸）、文件名/空间规则、流式超限与失败清理、
+配额两闸、删会话的「先读 key 再删」、行号公式 `rowid + header + 1`、`xlsx_search` 的单元格
+语义、`where` 语义矩阵、authorizer 边界、`session_scope` 验签。
 
-端到端没写成自动化用例，是**手跑**的（`docs/S3.md` §6 的步骤）：
-真 SeaweedFS + 真 PG + 真服务（单进程 / 两 worker 各一遍），上传 → 主管 run 里
-`xlsx_info('/uploads/…')` 拿到正确 JSON → 删会话后前缀与行都清空。
+端到端没写成自动化用例，是**手跑**的：真 PG + 真服务，
+上传 → 主管 run 里 `xlsx_info('/uploads/…')` 拿到正确 JSON → 删会话后台账行与盘上文件都清空。
 
 ## 10. 未做 / 已知限制
 
 - 首次访问建索引几十秒（预建索引需动 worker）。
-- 前端直传、断点续传、秒传预检：见 ADR-0015 §3.4。
-- 存量 `knowledge/<space>/*.xlsx` **仍是空间文件**（本地盘或 `okf.backend: s3` 的镜像），
-  没有“把空间表迁成会话表”的脚本；两套来源共存是有意的。
-- 存储层配额不严格：PG 的 `sum(size_bytes)` 不含索引与被覆盖的旧 blob，物理用量可能到 2 倍。
-- `abort_stale_multiparts` 依赖 SeaweedFS 实现 `ListMultipartUploads`：已实测可用；
-  但清未完成分片的定时任务未写（`put_stream` 自己管分片时能 abort，
-  这条只给崩溃场景兜底）。
+- 前端直传、断点续传、秒传预检：见 ADR-0018「有意的非目标」。
+- 存量 `knowledge/<space>/*.xlsx` **仍是空间文件**，没有「把空间表迁成会话表」的脚本；
+  两套来源共存是有意的。
+- 配额不严格：PG 的 `sum(size_bytes)` 不含索引与被覆盖的旧 key，物理用量可能到 2 倍。
+- **孤儿无 GC**：崩溃留的 `.part-*`、提交失败留下的 key 没有自动清理。对账办法（只读）：
+
+  ```bash
+  # 盘上有、台账里没有（看着像孤儿）：左差集
+  comm -23 <(cd .data/uploads && find . -type f -not -name '*.part-*' | sed 's|^\./||' | sort) \
+           <(psql -Atc 'select object_key from session_object order by 1')
+  # 台账里有、盘上没了（悬空行：读的时候会 FileNotFoundError）：右差集
+  comm -13 <(cd .data/uploads && find . -type f -not -name '*.part-*' | sed 's|^\./||' | sort) \
+           <(psql -Atc 'select object_key from session_object order by 1')
+  ```
+
+  删孤儿之前先确认它不在任何台账里（`session_object` 是唯一真相）。
 - 只支持 `.xlsx`；`csv` / `xls` / 多文件联查（duckdb）未做。
-- 空间知识走**本地镜像**而非直接读 S3（ADR-0016 的决定变更），所以改了空间内容要 pull。
+- 多副本不共享盘：字节只在本机。要共享得挂同一卷（见 ADR-0018 缺陷 1）。
 
 ## 11. 参考
 
 - [S3 multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)：≥100 MiB 考虑分片；
   part 5 MiB–5 GiB；未完成上传必须显式 abort。
-- 预签名直传 vs 服务端中转（1 GB：58.7 s/72% CPU 对 29.3 s/5% CPU）。
+- 预签名直传 vs 服务端中转（1 GB：58.7 s/72% CPU 对 29.3 s/5% CPU）——本分支不做前端直传。
 - 幂等上传：SHA-256 + DB 唯一索引 + 409，禁止只靠业务层先查后插。
 - 同步哈希阻塞请求线程的线上复盘（2 GB 数分钟）→ 我们 28 MB 约 100 ms，阈值内。
 - Databricks Apps 双身份模型（app identity vs user authorization）→ 对应本方案的「不替换
   `langgraph_auth_user`，只签窄凭证」。
-- SeaweedFS：S3 网关是 filer 的前端；bucket versioning 支持按版本而异，**不依赖**。
+- 对象存储侧的同类设计见 `feat/unified-files-s3` 分支 + [ADR-0017](./adr/0017-files-read-through-one-backend.md)。

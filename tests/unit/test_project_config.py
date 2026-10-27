@@ -40,9 +40,9 @@ def test_env_numeric_string_is_coerced(monkeypatch):
 
 
 def test_empty_env_means_unset(monkeypatch):
-    monkeypatch.setattr(pc, "_FILE", {"s3": {"endpoint": "http://s3:8333"}})
-    monkeypatch.setenv("S3_ENDPOINT", "")
-    assert pc.get("s3.endpoint") == "http://s3:8333"
+    monkeypatch.setattr(pc, "_FILE", {"uploads": {"dir": "shared/uploads"}})
+    monkeypatch.setenv("UPLOADS_DIR", "")
+    assert pc.get("uploads.dir") == "shared/uploads"
 
 
 def test_bad_value_raises_instead_of_silent_default(monkeypatch):

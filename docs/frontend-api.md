@@ -147,13 +147,13 @@ event: end        data: {"status": "success"}
 - 校验顺序：会话归属 → 字节大小 → 文件名/空间 → 流式写入。前两步便宜，大文件在第三步之后才碰。
 - 错误码：会话不是你的 `404`；非 `.xlsx` `415`；超 `xlsx.max_blob_mb`（默认 10）、超每会话文件数
   （`xlsx.max_xlsx_files_per_session`，默认 20）或超每用户总量（`xlsx.max_blob_mb_per_user`，默认 2048）`413`；
-  文件名非法 / 空间没权限 `422`；对象存储未就绪 `503`。
-- **`indexed:false` 是正常状态**：索引在第一次调 `xlsx_*` 工具时才建，建完写回对象存储。
+  文件名非法 / 空间没权限 `422`；盘写不进去 `500`（写满或权限）。
+- **`indexed:false` 是正常状态**：索引是缓存，在第一次调 `xlsx_*` 工具时才建。
 - 同名重传 = 覆盖（PUT 语义）；同内容重传命中同一个 key，不重建索引。
-- 字节进对象存储（`sessions/{h(identity)}/{thread_id}/…`），**md 仍进 Store**；
-  子 agent 只能在同一条会话里读（靠派活时签发的 `session_scope`）。
-- 没有列表/删除接口：删除走删会话（`DELETE /threads/{id}`，连带清 PG 行与整个前缀）。
-  运维细节见 [S3.md](./S3.md)。
+- 字节落本地盘（key `<uuid>/<name>`，归属只记 PG 台账），**md 仍进 Store**；
+  子 agent 只能在同一条会话里读（台账行按会话过滤 + 派活时签发的 `session_scope`）。
+- 没有列表/删除接口：删除走删会话（`DELETE /threads/{id}`，连带清台账行与盘上字节）。
+  实现细节见 [large-files.md](./large-files.md)。
 
 ## 4. 直接用的原生接口
 
@@ -270,7 +270,7 @@ POST /threads/{thread_id}/runs/crons
 
 - 代理接口是**单次 Run 订阅**：子 agent 若被 `update_async_task` 再跑一轮，前端要按新的 `run_id` 重新连。
 - `service_token()` 是 10 年期长期 token（沿用 ADR-0004 的 shortcut），只在服务端使用，不下发浏览器。
-- 没有把文件写进 Space 的接口：空间知识只能手工放盘 / `scripts/okf_push_s3.py`（见 [S3.md](./S3.md)）；
+- 没有把文件写进 Space 的接口：空间知识只能手工放盘到 `knowledge/<space>/`（随发布走）；
   上传的 xlsx 属于会话文件（§3.8），**不落 Space**。也没有列出/删除已上传文件的接口
   （删会话即清空）。
 - 没有 refresh token。

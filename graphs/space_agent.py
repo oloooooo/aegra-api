@@ -24,16 +24,15 @@ from typing import Any
 
 import dotenv
 from deepagents import FilesystemPermission, create_deep_agent
-from deepagents.backends import CompositeBackend, StoreBackend
 from langchain_quickjs import CodeInterpreterMiddleware
 from langgraph.graph.state import RunnableConfig
 
 from graphs.access import session_scope
-from graphs.model import model
+from graphs.access.factory import session_backend
 from graphs.access.spaces import allowed_spaces
-from shared.knowledge.spec import has_tables, knowledge_root, load_agent_spec
-from graphs.access.backend import SpaceBackend
+from graphs.model import model
 from graphs.tools import XLSX_TOOLS
+from shared.knowledge.spec import has_tables, load_agent_spec
 
 dotenv.load_dotenv()
 
@@ -76,11 +75,7 @@ def graph(config: RunnableConfig) -> Any:  # noqa: ANN401 — 返回编译后的
         tools=tools,
         middleware=middleware,
         # 子 agent 同样按 space 隔离：spaces 来自拦截层经 run config 转发的 user_spaces；
-        # `/uploads/` 路由到本会话的 store 命名空间（ADR-0015 §4.1）。xlsx 的字节走工具直读
-        # 对象存储，不经过 backend。
-        backend=CompositeBackend(
-            default=SpaceBackend(root_dir=knowledge_root()),
-            routes={"/uploads/": StoreBackend(namespace=session_scope.uploads_namespace)},
-        ),
+        # `/uploads/` 路由到本会话的上传文件（ADR-0015 §4.1）。装配点见 graphs/access/factory.py。
+        backend=session_backend(),
         permissions=[FilesystemPermission(operations=["write"], paths=["/"], mode="deny")],
     )
