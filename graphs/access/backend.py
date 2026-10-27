@@ -62,11 +62,21 @@ def _is_root_file(vpath: str) -> bool:
     return "/" not in vpath.strip("/")
 
 
-class SpaceBackend(FilesystemBackend):
-    """FilesystemBackend + 按 allowed_spaces 的路径判定。"""
+class SpaceGuard:
+    """按 allowed_spaces 的路径判定（单点）。
 
-    def __init__(self, root_dir: str | Path) -> None:
-        super().__init__(root_dir=root_dir, virtual_mode=True)
+    存储位置不同的 backend 共用这一层（本地盘 `SpaceBackend`、对象存储
+    `graphs/access/s3_backend.py`）：子类只需回答「这个名字在根下是目录/文件吗」，
+    「哪些空间可读、哪些写放行、搜索结果滤掉谁」只有这一份，改规则不会漏改一边。
+    """
+
+    # ---------- 探针：子类实现（参数是路径首段，如 "/sp/a.md" -> "sp"） ----------
+
+    def _space_dir_exists(self, name: str) -> bool:
+        raise NotImplementedError
+
+    def _root_file_exists(self, name: str) -> bool:
+        raise NotImplementedError
 
     # ---------- 判定 ----------
 
@@ -77,15 +87,15 @@ class SpaceBackend(FilesystemBackend):
             return None
         first = _first_segment(vpath)
         if not first:
-            return None  # "/" 本身：ls 走过滤，read "/" 由基类报错
+            return None  # "/" 本身：ls 走过滤，read "/" 由具体 backend 报错
         if first in spaces:
-            if not (self.cwd / first).is_dir():
-                logger.warning("space_folder_missing", space=first, root=str(self.cwd))
+            if not self._space_dir_exists(first):
+                logger.warning("space_folder_missing", space=first)
                 return f"空间文件夹不存在：/{first}（未在知识空间根下创建，不自动创建）"
             return None
         if _is_internal(vpath):
             return None
-        if _is_root_file(vpath) and (self.cwd / first).is_file():
+        if _is_root_file(vpath) and self._root_file_exists(first):
             return None  # 根散文件，全用户只读共享
         visible = sorted(spaces) or ["（无）"]
         return f"无权访问 {vpath}：{first} 不在你的空间列表 {visible} 内"
@@ -97,6 +107,42 @@ class SpaceBackend(FilesystemBackend):
         if spaces is None and _first_segment(vpath):
             return None  # 本地 demo 不设限
         return f"只读存储，拒绝写入 {vpath}"
+
+    def _visible(self, vpath: str, spaces: frozenset[str]) -> bool:
+        if _is_internal(vpath):
+            return False  # 驱逐文件 uuid 不进搜索结果，防跨用户枚举
+        first = _first_segment(vpath)
+        if first in spaces:
+            return True
+        return _is_root_file(vpath) and self._root_file_exists(first)
+
+    @staticmethod
+    def _filter_ls_root(entries: list[dict], spaces: frozenset[str]) -> list[dict]:
+        """`ls /`：只留自己的 space 文件夹 + 根散文件（内部目录、别人的空间隐藏）。"""
+        kept: list[dict] = []
+        for e in entries:
+            name = _first_segment(e["path"])
+            if e.get("is_dir") or e["path"].endswith("/"):
+                if name in spaces:
+                    kept.append(e)
+            else:
+                kept.append(e)  # 根散文件共享只读
+        return kept
+
+
+class SpaceBackend(SpaceGuard, FilesystemBackend):
+    """FilesystemBackend + 按 allowed_spaces 的路径判定。"""
+
+    def __init__(self, root_dir: str | Path) -> None:
+        super().__init__(root_dir=root_dir, virtual_mode=True)
+
+    # ---------- 探针（一次 stat，命中即够） ----------
+
+    def _space_dir_exists(self, name: str) -> bool:
+        return (self.cwd / name).is_dir()
+
+    def _root_file_exists(self, name: str) -> bool:
+        return (self.cwd / name).is_file()
 
     # ---------- ls ----------
 
@@ -114,18 +160,9 @@ class SpaceBackend(FilesystemBackend):
         result = super().ls(path)
         if first:
             return result  # 已限定在自己的空间/根散文件内，无需再过滤
-        # ls /：只留自己的 space 文件夹 + 根散文件（内部目录、别人的空间隐藏）
         if result.entries is None:
             return result
-        kept = []
-        for e in result.entries:
-            name = _first_segment(e["path"])
-            if e.get("is_dir") or e["path"].endswith("/"):
-                if name in spaces:
-                    kept.append(e)
-            else:
-                kept.append(e)  # 根散文件共享只读
-        return LsResult(entries=kept)
+        return LsResult(entries=self._filter_ls_root(result.entries, spaces))
 
     # ---------- read ----------
 
@@ -195,14 +232,6 @@ class SpaceBackend(FilesystemBackend):
                 matches, context_lines, partial_error, pattern, newline=None
             )
         return GrepResult(error=partial_error, matches=matches, truncated=truncated)
-
-    def _visible(self, vpath: str, spaces: frozenset[str]) -> bool:
-        if _is_internal(vpath):
-            return False  # 驱逐文件 uuid 不进搜索结果，防跨用户枚举
-        first = _first_segment(vpath)
-        if first in spaces:
-            return True
-        return _is_root_file(vpath) and (self.cwd / first).is_file()
 
     # ---------- glob ----------
 
