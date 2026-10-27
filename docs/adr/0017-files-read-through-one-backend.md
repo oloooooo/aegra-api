@@ -121,8 +121,10 @@
    扫整棵子树；代价是每次 run 多一次 LIST（`s3fs`）/目录遍历（本地）。
 6. **对象存储没有空目录**：`_space_dir_exists` 用 `list_objects_v2(MaxKeys=1)` 探「有没有以此
    为前缀的对象」，所以「刚建好但还没写文件的空空间」在 `s3fs` 下不存在。
-7. **孤儿对象没有 GC**：`threads_delete` 按台账逐对象删；PG 删成功而 S3 删失败就留下孤儿。
-   首次写入按 sha16 复用会让孤儿被复用，但不去重时就只剩计费。
+7. **孤儿对象没有自动 GC，但有对账脚本**：`threads_delete` 先删行再删对象，PG 删成功而 S3 删
+   失败就留下孤儿（另有并发同名上传、覆盖后旧对象删除失败两个来源）。`scripts/reap_orphans.py`
+   双向比对 `uploads/` 与台账，缺省只报告，`--delete-orphans` / `--delete-rows` 才动手。
+   它是**人工运维脚本**，不是定时任务；要自动就得挂 cron（同 `reap_multipart.py`）。
 8. **md 的 TTL 续期在台账模式下消失了**：Store 路径有 `refresh_ttl=True`，台账模式没有。
    结果是孤儿 md 到期不再被续命——这其实是想要的，但它不再是「靠 TTL 兜底」而是「靠删会话」。
 9. **驱逐文件已挪出 `okf/`**（原缺陷：`/large_tool_results`、`/conversation_history`、`/blobs`
