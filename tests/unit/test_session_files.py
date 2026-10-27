@@ -104,6 +104,27 @@ def _patch_ledger(
 _ROW = {"name": "a.md", "path": "/uploads/a.md", "bytes": 5, "created_at": "now"}
 
 
+def _rows(n: int, suffix: str) -> list[dict[str, object]]:
+    return [
+        {"name": f"{suffix}{i}.{suffix}", "path": f"/uploads/{suffix}{i}.{suffix}", "bytes": 1, "created_at": "now"}
+        for i in range(n)
+    ]
+
+
+def test_listing_keeps_a_slot_share_for_tables() -> None:
+    """md 再多也不能把表挤光，反之亦然（否则 agent 连有几张表都不知道）。"""
+    shown, truncated = sf._cap([*_rows(25, "md"), *_rows(3, "xlsx")])
+    assert len(shown) == 20 and truncated
+    assert len([f for f in shown if f["name"].endswith(".xlsx")]) == 3, "三张表必须都在"
+
+    shown, truncated = sf._cap([*_rows(15, "md"), *_rows(15, "xlsx")])
+    assert len(shown) == 20 and truncated
+    assert len([f for f in shown if f["name"].endswith(".xlsx")]) == sf._TABLE_SLOTS
+
+    shown, _ = sf._cap(_rows(25, "xlsx"))
+    assert len(shown) == 20, "没有 md 时表吃满 20 个名额"
+
+
 async def test_middleware_queries_once_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_config(monkeypatch)
     calls: list = []
