@@ -34,9 +34,13 @@
 7. **删掉对象存储**：`shared/session/blobs.py`、`scripts/okf_{push,pull}_s3.py`、
    `scripts/reap_multipart.py`、`s3.*` / `okf.backend` / `okf.mirror_*` 配置项、
    `boto3` 依赖、`docs/S3.md`。
-8. **`UploadsBackend` 只读且只实现异步**：key 要查台账（async PG），同步协议方法继承
-   `BackendProtocol` 默认的 `NotImplementedError`——同步版要把 async 会话跑在另一个事件循环里，
-   本地/单副本都不成立。写家族返回「请走上传接口」的文案。
+8. **`UploadsBackend` 叠在 `StoreBackend` 上，只覆写取字节与写家族**：md 的
+   `ls/read/grep/glob` 语义继续用 Store 那份（文本、分页、TTL 续期），二进制只有一件不同——
+   `download_files` 要返回真字节，而字节在盘上、路径只在台账里，所以覆写 `adownload_files`：
+   先查台账（async PG）命中就读盘，未命中交回 Store（md）。
+9. **agent 不能写会话文件，也不能改表**：`write`/`edit`/`delete`/`upload_files`（含异步版，
+   `StoreBackend` 两套都有）全部返回「会话上传目录只读」；唯一的写入方是上传接口。
+   xlsx 四件套保持只读——写表需要先解决「openpyxl 会抹掉公式缓存值」（后文缺陷 14）。
 
 ## 取舍
 
@@ -47,6 +51,7 @@
 | 副本 | 单机足够，多副本需挂共享卷 | 对象存储那种天然的多副本共享 |
 | 删除 | 先读台账 key → 删行 → 逐对象删；任一步失败只记日志 | 「行与字节严格一致」需要事务，这里选择「宁可留孤儿，不要留悬空行」 |
 | 一致性 | 本地盘 + `os.replace`，单机强一致 | 无 CAS：两个副本同时写同一 key 是 last-write-wins（key 是 uuid，正常路径不会撞） |
+| 写入能力 | agent 只读：唯一写入方是上传接口 | 「让 agent 改表」这个需求——它得先过「openpyxl 抹公式缓存」那关（缺陷 14），不是存储能解决的 |
 | 依赖 | 删掉 boto3/botocore | 想切对象存储要换分支 |
 | 空间判定 | 复用 `SpaceBackend`（ADR-0005），`..` 由 `FilesystemBackend` 直接拒（抛 `ValueError`） | 旧 `_check_scope` 返回的是错误字符串；现在上升为异常，调用方必须能接住 |
 
@@ -58,9 +63,11 @@
    不存在的字节（`disk.read` 抛 `FileNotFoundError` → 工具报错，不会静默出错数据）。
 3. **孤儿对象无 GC**：正常替换/删除路径会删旧字节，但崩溃、提交失败、手工改库都会留下孤儿 key
    与 `.part-*`。对账方法见 `docs/large-files.md`。
-4. **`UploadsBackend` 每次列举都查一次 PG**：`_rows()` 无缓存，一次 run 里多次 `ls` 会重复查。
-5. **`UploadsBackend` 同步方法不可用**：任何走 `backend.read()`（同步）的路径会抛
-   `NotImplementedError`。当前工具都是 async，但这是隐式契约。
+4. **`UploadsBackend` 每次取字节都查一次 PG**：`_ledger_keys()` 无缓存，一次 run 里多次
+   `download_files` 会重复查（xlsx 四件套每次调用都走这条）。
+5. **同步路径拿不到 xlsx 字节**：`read`/`download_files` 的同步版继承 `StoreBackend`，
+   只看得见 Store 里的 md——对 `/uploads/*.xlsx` 会返回 `file_not_found`。当前工具都是 async，
+   但这是隐式契约。
 6. **没有 TTL 清理**：`session_files.upload_ttl_minutes` 仍只作用于 Store 里的 md
    （`shared/session/store.py`），盘上字节不会过期。
 7. **空间清单是实时扫盘**：`has_tables()` / `space_files()` 每次 run 递归扫 `knowledge/`，
@@ -72,6 +79,16 @@
     没有「运维直接往存储里放文件」的路径。
 11. **删会话的字节清理是 best-effort**：盘删除失败被吞（只记日志），孤儿留下。
 12. **未跑 e2e**：`tests/e2e` 需要真服务，本分支只跑单测（基线 28 failed 与改动无关）。
+13. ~~**`/uploads/` 的写是幽灵写**~~（**已修**）：`UploadsBackend` 曾未覆写写家族，`write` /
+    `edit` / `delete` 落在 LangGraph Store，而 xlsx 工具读的是盘上台账指向的字节。所以
+    `write_file('/uploads/x.xlsx', …)` 返回成功、`ls` 能看到、`read_file` 读得到文本，
+    但**盘上一个字节没变**，`xlsx_info` 读的仍是真表——同一路径两套内容。现在写家族（同步 +
+    异步两套）一律拒绝，回归测试 `tests/unit/test_uploads_backend_readonly.py`。
+14. **openpyxl 保存会抹掉全工作簿的公式缓存值（已实测）**：openpyxl 只写 `<f>` 不写 `<v>`，
+    实测把带 `<v>3</v>` 的文件用一个无关单元格赋值后重新保存，`<v>` 变回空，
+    `data_only`/pandas 读到 `None`/`NaN`。而索引由 `pd.read_excel` 建，所以任何“用
+    openpyxl 改表”的实现都会让**所有公式列**在索引里变空（不只被改那一格）。本机无
+    LibreOffice 也无 `formulas`，服务端重算这条路不存在。
 
 ## 验证
 

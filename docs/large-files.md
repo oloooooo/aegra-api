@@ -127,6 +127,27 @@ sha256，超限抛 `TooLarge`；崩在中途只留 `.part` 垃圾，不会出现
 秒传预检（只省一次上传、多一次 RTT、解决不了竞态）、前端直传/分片/断点续传（28 MB 用不上，
 入口已抽成 `put_stream()`，`xlsx.max_blob_mb > 100` 再换）、内容去重（同名覆盖才是正确语义）。
 
+### 3.5 为什么现在没有写工具（两条实测）
+
+**结论（已定）**：agent 只读。`graphs/tools/xlsx/__init__.py:208` 的 `XLSX_TOOLS` 四个全是只读，
+`SpaceBackend._check_write` 只放行内部驱逐前缀，`UploadsBackend` 的写家族一律拒绝。
+想改表只有一条路：人工改完重新上传。这不是「还没做」，是**有意不做**——理由是两个实测：
+
+1. **openpyxl 保存会把全工作簿的公式缓存值抹掉**。openpyxl 只写 `<f>` 不写 `<v>`；用 openpyxl
+   打开一个带 `<v>3</v>` 的文件、改一个**无关**单元格、再保存，`<v>3</v>` 变回空 `<v />`，
+   `data_only` 与 `pd.read_excel` 读到 `None`/`NaN`。而索引就是 `pd.read_excel` 建的
+   （`xlsx/index.py:69`），所以改一格 = **所有公式列在索引里变空**。没有重算引擎可用
+   （本机无 LibreOffice，无可用的 `formulas` 包）。
+2. **`/uploads/` 的写曾是幽灵写**（已修）。`UploadsBackend` 只覆写了 `adownload_files`，
+   写家族继承 `StoreBackend` → 写进 Store（文本）；而 xlsx 工具读的是台账指向的盘上字节。
+   于是 `write_file('/uploads/x.xlsx', …)` 返回成功、`ls` 看得见、`read_file` 读得到，
+   但盘上文件没变。现在写家族（同步 + 异步两套）一律拒绝，回归测试
+   `tests/unit/test_uploads_backend_readonly.py`。
+
+两个附带约束（将来要做「生成新表」时仍成立）：行号是契约
+（`Excel第{rowid + header + 1}行`，插/删行会让模型手里的旧行号静默错位）；
+本地盘没有 CAS（两个会话同时改同一份 = 后写覆盖前写，不可检测）。详见 ADR-0018 缺陷 13/14。
+
 ## 4. 读取：字节从哪来
 
 `graphs/tools/xlsx/__init__.py::_fetch(path)` → `runtime.backend.download_files([path])`；
@@ -140,6 +161,7 @@ sha256，超限抛 `TooLarge`；崩在中途只留 `.part` 垃圾，不会出现
 
 **工具不自己找字节**：旧的 `_check_scope()` 与「查 PG 拿 key」都删了，判定单点回到 backend
 （ADR-0018）。所以未来多一个写入方，只要它进得了 backend 或台账，工具不用改。
+（注：现在唯一的写入方是上传接口；agent 对 `/uploads/` 只读，见 §3.5。）
 
 - 缓存写必须 **`.tmp` + `os.replace`**，命中后 `PRAGMA quick_check`。`immutable=1` 关掉了
   SQLite 的锁，撕开写坏的索引会被当有效文件复用。
