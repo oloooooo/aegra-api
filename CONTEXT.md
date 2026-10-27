@@ -244,8 +244,8 @@ _Avoid_: 把它当业务校验（"这张表的数据对不对"不是它的职责
   `middleware/` 中间层（Auth handler、删会话的路由遮挡）。
 - `graphs/` —— **图面**，只在 run 里跑。根目录只放 `aegra.json` 直指的两个入口
   （`supervisor.py`、`space_agent.py`）；`middleware/` 中间层（AgentMiddleware）、
-  `access/` 横切的访问判定（spaces 列表、会话作用域、带 ACL 的 backend）、
-  `tools/` 与 `prompts/`。
+  `access/` 横切的访问判定（spaces 列表、会话作用域、带 ACL 的 backend、
+  `factory.py` 装配点与对象存储 backend）、`tools/` 与 `prompts/`。
 - `shared/` —— **两侧共用的纯逻辑**：`config`（config.yaml 单例）、`token`（JWT 铸造）、
   `outbox`（投递文本口径）、`session/`（LangGraph Store 与对象存储）、
   `knowledge/`（知识根、`AGENT.md` 解析与脚手架）。
@@ -255,5 +255,12 @@ FastAPI / LangChain / deepagents。唯一例外：`graphs/tools/xlsx` 懒加载
 `custom.service.session_files` 读会话文件元数据行（表在 `custom/db/models.py`）。
 
 数据不在代码包里：空间知识在仓库根 `knowledge/`（`config.yaml` 的 `okf.dir`）。
+
+**读文件只有一个入口**（ADR-0017）：图和工具都不自己找字节，统一从
+`graphs/access/factory.py::session_backend()` 拿 backend（经 `Runtime` 注入）。
+`okf.backend` 只有两种：`local`（读 `knowledge/`，本地盘）与 `s3fs`（直读对象存储
+`okf/` 前缀，无本地副本）；两种模式共用同一套空间判定（`graphs/access/backend.py`
+的 `SpaceGuard`）。会话上传的字节在对象存储里（`uploads/<uuid>/<名>`，归属只记 PG
+台账 `session_object`），拿不到对象存储时退回 LangGraph Store 命名空间。
 _Avoid_: 往 `graphs/` 里放数据；在 `custom/` 里放图侧要用的模块（要放就放 `shared/`）；
 在两个包根目录新增文件（根目录只放入口）
