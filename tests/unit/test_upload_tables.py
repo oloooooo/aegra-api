@@ -1,7 +1,7 @@
 """`POST /custom/uploads/tables` 的路由逻辑（不连库、不连 S3）。
 
-这里锁的是「写序与失败清理」：提交失败时只能删**本次新写**的对象，且它不能是
-旧行正在用的那一个——否则同名同内容重传恰好卡在配额，就把旧行唯一那份字节删了。
+这里锁的是「写序与失败清理」：提交失败时只能删**本次新写**的对象（key 是
+`uploads/<uuid>/<名>`，与旧行指向的那个永远不同）。
 """
 
 import io
@@ -78,7 +78,7 @@ async def test_happy_path_writes_then_cleans_tmp(env):
     # 写序：先临时 key，再 copy 到正式 key，最后删临时 key
     assert calls["put"][0].startswith("tmp/")
     assert calls["copy"][0][0] == calls["put"][0]
-    assert calls["copy"][0][1].startswith("sessions/")
+    assert calls["copy"][0][1].startswith("uploads/")
     assert calls["delete"] == [calls["put"][0]]
 
 
@@ -130,10 +130,10 @@ async def test_quota_failure_deletes_new_object(env):
     assert calls["copy"][0][1] in calls["delete"]  # 新对象被清掉
 
 
-async def test_quota_failure_keeps_object_when_it_is_the_old_one(env):
-    """同内容重传 + 配额失败：新 key 就是旧行在用的那个，不能删。"""
+async def test_quota_failure_never_deletes_the_object_the_old_row_uses(env):
+    """配额失败回滚：只删本次新写的对象，旧行指向的那份绝不能动。"""
     calls, state = env
-    state["old_key"] = blobs.blob_key("u1", "t-1", "a" * 64, "sp_表.xlsx")
+    state["old_key"] = "uploads/old/x.xlsx"
     state["raise"] = session_objects.QuotaExceeded("满了")
 
     with pytest.raises(HTTPException):
@@ -141,8 +141,8 @@ async def test_quota_failure_keeps_object_when_it_is_the_old_one(env):
             session=FakeSession(), user=_user("sp"), thread_id="t-1", file=FakeFile("sp_表.xlsx")
         )
 
-    assert calls["copy"][0][1] == state["old_key"]  # 前提：新旧 key 确实相同
-    assert calls["copy"][0][1] not in calls["delete"]
+    assert calls["copy"][0][1] in calls["delete"]  # 新对象被清掉
+    assert state["old_key"] not in calls["delete"]  # 旧行那份不动
 
 
 async def test_cleanup_failure_does_not_mask_the_real_error(env, monkeypatch):

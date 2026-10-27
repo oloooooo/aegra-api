@@ -57,12 +57,12 @@
 （`indexed` 恒为 false：索引是缓存，第一次调工具时才建，见 graphs/tools/xlsx/index.py。）
 
 **写序不能换**：tmp → 正式 key → PG 事务 → 删 tmp。任何一步崩都只会留垃圾对象，
-不会出现「行说 A、字节是 B」。同名同内容的并发上传写同一个 (h, thread, sha16, name)，
-谁最后提交谁赢，另一个是孤儿对象——不破坏一致性。
+不会出现「行说 A、字节是 B」。正式 key 是 `uploads/<uuid>/<名>`（`blobs.upload_key`）：
+每次上传一个新对象，提交成功后删被替掉的旧对象；行与字节的对应关系只在
+`session_object` 台账里。
 
-**失败清理只删「本次新写、且不是旧行正在用的」对象**（`_drop_new`）：同名同内容重传
-恰好卡在配额时，删了新对象就等于删掉旧行唯一的那份字节。清理自身必须吞异常——
-它一抛，就把「存储不可用 → 503」变成「未知错误 → 500」（实测踩过）。
+**失败清理只删「本次新写、且不是旧行正在用的」对象**（`_drop_new`）。清理自身必须
+吞异常——它一抛，就把「存储不可用 → 503」变成「未知错误 → 500」（实测踩过）。
 
 ===============================================================================
 五、落到哪里 / 谁能读到
@@ -119,9 +119,9 @@ from aegra_api.core.database import db_manager
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.core.orm import get_session
 from aegra_api.models.auth import User
-from shared.session import blobs
-from custom.service import session_files
 from custom.api.schemas import UploadFileResponse, UploadTableResponse
+from custom.service import session_files
+from shared.session import blobs
 from shared.session.store import (
     MAX_FILES_PER_SESSION,
     MAX_UPLOAD_MB,
@@ -269,7 +269,7 @@ async def upload_session_table(
         sha256, size = await asyncio.to_thread(
             blobs.put_stream, file.file, tmp, max_bytes=session_files.MAX_BLOB_BYTES
         )
-        final = blobs.blob_key(user.identity, thread_id, sha256, name)
+        final = blobs.upload_key(name)
         await asyncio.to_thread(blobs.copy, tmp, final)
         await session_files.upsert(
             session,

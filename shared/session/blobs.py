@@ -1,14 +1,16 @@
-"""对象存储（SeaweedFS，S3 协议）的最小封装：会话文件里的二进制与表索引。
+"""对象存储（SeaweedFS，S3 协议）的最小封装：上传文件的字节与空间镜像。
 
-设计见 `docs/adr/0015`、`docs/large-files.md` §2/§3。三条不能改的约定：
+设计见 `docs/adr/0017`、`docs/large-files.md` §2/§3。几条不能改的约定：
 
-- **key 前缀按会话说**：`sessions/{h(identity)}/{thread_id}/...`。所以「删会话」= 删这个
-  前缀，字节与索引一次清完。`h()` 与 Store 命名空间共用 `session_store.identity_digest`，
-  两处若不一致，同一份内容会落在两套前缀下（排查极难）。
-- **`{sha16}` 进 key**：并发上传同名不同内容时各写各的 key，谁最后写 PG 行谁赢，另一个是
-  孤儿对象。永远不会出现「行说 A、字节是 B」。
+- **归属只在台账里**：上传写的 key 是 `uploads/<uuid>/<名>`，owner/thread/名字全在 PG
+  行（`session_object`）里。删会话 = 按台账逐对象删（`object_dir` 连带派生物）。
+  key 不再是「按会话说」的，因为路由唯一来源必须是台账。
+- **uuid 进 key**：并发上传同名文件各写各的 key，谁最后写 PG 行谁赢，另一个变成孤儿
+  对象（生命周期/巡检收尾）。永远不会出现「行说 A、字节是 B」。
+- **`tmp/` 是中转**：先落 `tmp/` 算 sha256，再 copy 到正式 key，最后删 tmp。
 - **自己管分片**：`upload_fileobj` 的 `upload_id` 藏在内部，超限时**拿不到它来 abort**，
   未完成分片会一直占空间。这里手写 create/upload_part/complete，出错时能 abort。
+- 知识空间镜像用 `okf/` 前缀（ADR-0016，正在被 object backend 取代）。
 
 同步库（boto3），调用方一律 `asyncio.to_thread`。
 """
@@ -22,7 +24,6 @@ import uuid
 from typing import Any
 
 from shared import config
-from shared.session.store import identity_digest
 
 _PART_BYTES = 8 * 1024 * 1024  # S3 要求除最后一片外 ≥5MiB
 _DELETE_BATCH = 1000  # S3 单次 delete_objects 上限
@@ -89,17 +90,19 @@ def reset_client() -> None:
 # ---------- key 命名（单一来源） ----------
 
 
-def session_prefix(owner: str, thread_id: str) -> str:
-    """一个会话在对象存储里的根前缀；删会话就删它。"""
-    return f"sessions/{identity_digest(owner)}/{thread_id}/"
+def upload_key(name: str) -> str:
+    """上传文件的 key：``uploads/<uuid>/<名>``。
+
+    uuid 保证唯一，`<名>` 只是给人看的尾巴；**owner/thread 不在 key 里**——文件归属
+    唯一来源是 PG 台账（`session_object`），不从 key 反推（否则 kex 就成了第二本账，
+    改名/迁移时得两边同时改对）。
+    """
+    return f"uploads/{uuid.uuid4().hex}/{name}"
 
 
-def blob_key(owner: str, thread_id: str, sha256: str, name: str) -> str:
-    return f"{session_prefix(owner, thread_id)}{sha256[:16]}/{name}"
-
-
-def index_key(owner: str, thread_id: str, name: str, header: int, build: int) -> str:
-    return f"{session_prefix(owner, thread_id)}idx/{name}.h{header}.v{build}.sqlite"
+def object_dir(key: str) -> str:
+    """一个对象的目录前缀（删文件连带它的派生物，如已重建的索引）。"""
+    return key.rsplit("/", 1)[0] + "/"
 
 
 def tmp_key(name: str) -> str:
@@ -374,7 +377,6 @@ __all__ = [
     "BlobTooLarge",
     "BlobUnavailable",
     "abort_stale_multiparts",
-    "blob_key",
     "bucket",
     "client",
     "configured",
@@ -387,14 +389,12 @@ __all__ = [
     "exists_prefix",
     "get",
     "get_object",
-    "index_key",
     "list_tree",
+    "object_dir",
     "put_bytes",
-    "put_stream",
     "put_stream",
     "reap_tmp",
     "reset_client",
-    "session_prefix",
-    "stat",
     "tmp_key",
+    "upload_key",
 ]

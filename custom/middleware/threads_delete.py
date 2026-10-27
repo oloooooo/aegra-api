@@ -72,19 +72,24 @@ async def delete_thread(
 
 
 async def _clear_blobs(identity: str, thread_id: str) -> None:
-    """删掉这条会话的二进制：先删 `session_object` 行，再删对象存储前缀。
+    """删掉这条会话的二进制：先从台账读出 key，删行，再逐对象删。
 
     thread 行已经删了，这里再抛错只会让客户端把成功的删除当成失败去重试（然后 404），
-    所以两段各自兜底：行删不掉→下次按同前缀再清；对象删不掉→生命周期兜底。
+    所以两段各自兜底：行删不掉→下次按台账再清；对象删不掉→生命周期兜底。
+
+    key 是 `uploads/<uuid>/<名>`，不再带会话前缀，所以不能按前缀扫——只能先读出
+    台账里的 object_key 再逐对象删。没有行的孤儿对象不在清理范围内。
     """
-    from shared.session import blobs
     from custom.service import session_files
+    from shared.session import blobs
 
     if not blobs.configured():  # 开发环境只跑磁盘：没有对象要删，不必假装失败
         return
 
+    keys: list[str] = []
     try:
         async with get_session_maker()() as fresh:
+            keys = [r.object_key for r in await session_files.list_for_thread(fresh, identity, thread_id)]
             removed = await session_files.delete_for_thread(fresh, identity, thread_id)
             await fresh.commit()
         if removed:
@@ -93,7 +98,7 @@ async def _clear_blobs(identity: str, thread_id: str) -> None:
         logger.exception("session_objects_clear_failed", identity=identity, thread_id=thread_id)
         return
     try:
-        count = await asyncio.to_thread(blobs.delete_prefix, blobs.session_prefix(identity, thread_id))
+        count = await asyncio.to_thread(blobs.delete_many, keys)
         if count:
             logger.info("session_blobs_cleared", identity=identity, thread_id=thread_id, removed=count)
     except Exception:  # noqa: BLE001 —— 同上；生命周期规则会收尾

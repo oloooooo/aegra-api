@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from shared.session import blobs
-from shared.session.store import session_namespace
 
 
 class FakeS3:
@@ -89,15 +88,13 @@ def s3(monkeypatch):
     return fake
 
 
-def test_identity_digest_matches_store_namespace():
-    """Store 命名空间与对象存储前缀必须用同一个哈希，否则同一份内容落在两套前缀下。"""
-    assert blobs.session_prefix("张三", "t-1") == f"sessions/{session_namespace('张三', 't-1')[1]}/t-1/"
-
-
-def test_keys_are_under_session_prefix():
-    p = blobs.session_prefix("u1", "t1")
-    assert blobs.blob_key("u1", "t1", "a" * 64, "x.xlsx") == f"{p}{'a' * 16}/x.xlsx"
-    assert blobs.index_key("u1", "t1", "x.xlsx", 0, 3) == f"{p}idx/x.xlsx.h0.v3.sqlite"
+def test_upload_key_is_uuid_scoped_and_carries_name():
+    """key = uploads/<uuid>/<名>：归属只记台账，不靠 key 反推；uuid 保证同名不撞。"""
+    a = blobs.upload_key("x.xlsx")
+    b = blobs.upload_key("x.xlsx")
+    assert a.startswith("uploads/") and a.endswith("/x.xlsx")
+    assert a != b
+    assert blobs.object_dir(a) == a.rsplit("/", 1)[0] + "/"
     assert blobs.tmp_key("x.xlsx").startswith("tmp/")
     assert blobs.tmp_key("x.xlsx") != blobs.tmp_key("x.xlsx")
 
