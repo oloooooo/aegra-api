@@ -361,14 +361,12 @@ xlsx 字节进对象存储、元数据进 PG `session_object`；完整手册见 
 
 #### 空间知识 OKF（`shared/knowledge/root.py`、`shared/knowledge/spec.py`）
 
-见 [adr/0016](./adr/0016-spaces-in-object-storage.md)、[S3.md](./S3.md)。
+见 [adr/0017](./adr/0017-files-read-through-one-backend.md)、[S3.md](./S3.md)。
 
 | YAML 键 | 默认 | 覆盖变量 | 说明 |
 |---|---|---|---|
-| `okf.backend` | `local` | `OKF_BACKEND` | `local` 直接读 `graphs/<okf.dir>`；`s3` 读本地镜像 |
-| `okf.dir` | `okf` | `OKF_DIR` | 空间根目录名（相对 `graphs/`） |
-| `okf.mirror_dir` | `.cache/okf` | `OKF_MIRROR_DIR` | `s3` 模式的镜像目录 |
-| `okf.mirror_ttl_seconds` | `0` | `OKF_MIRROR_TTL_SECONDS` | 镜像过期重拉的间隔；`0` = 只拉一次（改内容后手动跑 `scripts/okf_pull_s3.py`） |
+| `okf.backend` | `local` | `OKF_BACKEND` | `local` 直接读 `<okf.dir>`；`s3fs` 直读对象存储 `okf/`（无本地副本） |
+| `okf.dir` | `knowledge` | `OKF_DIR` | 空间根目录名（相对仓库根） |
 
 #### 图（`graphs/supervisor.py`）
 

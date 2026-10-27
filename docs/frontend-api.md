@@ -270,7 +270,7 @@ POST /threads/{thread_id}/runs/crons
 
 - 代理接口是**单次 Run 订阅**：子 agent 若被 `update_async_task` 再跑一轮，前端要按新的 `run_id` 重新连。
 - `service_token()` 是 10 年期长期 token（沿用 ADR-0004 的 shortcut），只在服务端使用，不下发浏览器。
-- 没有把文件写进 Space 的接口：空间知识只能手工放盘 / `scripts/okf_push_s3.py`（见 [S3.md](./S3.md)）；
+- 没有把文件写进 Space 的接口：空间知识只能手工放盘 / 直接往对象存储 `okf/` 传（见 [S3.md](./S3.md)）；
   上传的 xlsx 属于会话文件（§3.8），**不落 Space**。也没有列出/删除已上传文件的接口
   （删会话即清空）。
 - 没有 refresh token。

@@ -1,4 +1,4 @@
-"""对象存储（SeaweedFS，S3 协议）的最小封装：上传文件的字节与空间镜像。
+"""对象存储（SeaweedFS，S3 协议）的最小封装：上传文件的字节与空间知识。
 
 设计见 `docs/adr/0017`、`docs/large-files.md` §2/§3。几条不能改的约定：
 
@@ -10,7 +10,7 @@
 - **`tmp/` 是中转**：先落 `tmp/` 算 sha256，再 copy 到正式 key，最后删 tmp。
 - **自己管分片**：`upload_fileobj` 的 `upload_id` 藏在内部，超限时**拿不到它来 abort**，
   未完成分片会一直占空间。这里手写 create/upload_part/complete，出错时能 abort。
-- 知识空间镜像用 `okf/` 前缀（ADR-0016，正在被 object backend 取代）。
+- 空间知识用 `okf/` 前缀（ADR-0017，`S3Backend` 直读）。
 
 同步库（boto3），调用方一律 `asyncio.to_thread`。
 """

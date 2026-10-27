@@ -1,7 +1,7 @@
 # 会话文件与大表（设计）
 
 配套 ADR：[0015 会话文件](./adr/0015-large-tables-in-object-storage.md)、
-[0016 空间进 S3](./adr/0016-spaces-in-object-storage.md)。操作手册见 [S3.md](./S3.md)。
+[0017 读文件只有一个入口](./adr/0017-files-read-through-one-backend.md)。操作手册见 [S3.md](./S3.md)。
 第 3 稿（2026-10-25）：归属从「挂 space」改为「上传者私有 + 随会话删」，命名与 Key 全部重写。
 **已实现**（真服务单进程/多进程实测通过）；本文描述设计与取舍，落地位置见 §9。
 
@@ -259,7 +259,7 @@ s3:
   bucket: aegra-blobs
   region: us-east-1
 okf:
-  backend: local            # local | s3（ADR-0016）
+  backend: local            # local | s3fs（ADR-0017）
 xlsx:
   max_blob_mb: 10
   max_cells: 2000000
@@ -296,14 +296,14 @@ virtual-host，`bucket.127.0.0.1:8333` 解析不了。bucket 启动时 `head_buc
 | `graphs/space_agent.py` / `graphs/supervisor.py` | CompositeBackend + `/uploads` 路由；主管也装 xlsx 四件套 |
 | `graphs/tools/xlsx/{store,index}.py` + `__init__.py` | 字节解析、ingest → SQLite、四个工具改跑 SQL |
 | `custom/middleware/threads_delete.py` | 删会话连带清 PG 行 + S3 前缀 |
-| `shared/knowledge/root.py` + `scripts/okf_{push,pull}_s3.py` | 空间知识进 S3（ADR-0016） |
-| `tests/unit/test_{blobs,session_objects,upload_tables,session_scope,xlsx_index,xlsx_scope,threads_delete_blobs,okf_mirror}.py` | 约 70 条单测 |
+| `graphs/access/s3_backend.py` | 空间知识直读对象存储（`okf.backend: s3fs`，ADR-0017） |
+| `tests/unit/test_{blobs,session_objects,upload_tables,session_scope,xlsx_index,xlsx_scope,threads_delete_blobs,frontend_space_files}.py` | 约 70 条单测 |
 
 ## 9. 测试策（已落地）
 
 单测共约 70 条，位于 `tests/unit/`（S3 层 monkeypatch `blobs`，不引 moto）：
 `test_blobs.py`、`test_session_objects.py`、`test_upload_tables.py`、`test_session_scope.py`、
-`test_xlsx_scope.py`、`test_xlsx_index.py`、`test_threads_delete_blobs.py`、`test_okf_mirror.py`。
+`test_xlsx_scope.py`、`test_xlsx_index.py`、`test_threads_delete_blobs.py`、`test_frontend_space_files.py`。
 重点覆盖：越权回归、文件名/空间规则、流式超限与 abort、配额两闸、行号公式
 `rowid + header + 1`、`xlsx_search` 的单元格语义、`where` 语义矩阵、authorizer 边界、
 `session_scope` 验签。
@@ -316,14 +316,14 @@ virtual-host，`bucket.127.0.0.1:8333` 解析不了。bucket 启动时 `head_buc
 
 - 首次访问建索引几十秒（预建索引需动 worker）。
 - 前端直传、断点续传、秒传预检：见 ADR-0015 §3.4。
-- 存量 `knowledge/<space>/*.xlsx` **仍是空间文件**（本地盘或 `okf.backend: s3` 的镜像），
+- 存量 `knowledge/<space>/*.xlsx` **仍是空间文件**（本地盘，或 `okf.backend: s3fs` 时对象存储里的那份），
   没有“把空间表迁成会话表”的脚本；两套来源共存是有意的。
 - 存储层配额不严格：PG 的 `sum(size_bytes)` 不含索引与被覆盖的旧 blob，物理用量可能到 2 倍。
 - `abort_stale_multiparts` 依赖 SeaweedFS 实现 `ListMultipartUploads`：已实测可用；
   但清未完成分片的定时任务未写（`put_stream` 自己管分片时能 abort，
   这条只给崩溃场景兜底）。
 - 只支持 `.xlsx`；`csv` / `xls` / 多文件联查（duckdb）未做。
-- 空间知识走**本地镜像**而非直接读 S3（ADR-0016 的决定变更），所以改了空间内容要 pull。
+- 空间知识直读对象存储（`s3fs`），改了立刻生效；但 `has_tables()` 在 `s3fs` 下只看 `<space>/*.xlsx` 一层（ADR-0017 缺陷 5）。
 
 ## 11. 参考
 

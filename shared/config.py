@@ -43,8 +43,6 @@ _SPEC: dict[str, tuple[str, Any]] = {
     "s3.region": ("S3_REGION", "us-east-1"),
     "okf.backend": ("OKF_BACKEND", "local"),
     "okf.dir": ("OKF_DIR", "knowledge"),
-    "okf.mirror_dir": ("OKF_MIRROR_DIR", ".cache/okf"),
-    "okf.mirror_ttl_seconds": ("OKF_MIRROR_TTL_SECONDS", 0.0),
     "agents.server_url": ("AEGRA_SERVER_URL", "http://127.0.0.1:2026"),
     "outbox.poll_interval_seconds": ("OUTBOX_POLL_INTERVAL_SECONDS", 1.0),
     "outbox.batch_size": ("OUTBOX_BATCH_SIZE", 50),

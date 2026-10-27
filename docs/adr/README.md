@@ -3,13 +3,13 @@
 **ADR 编号永不复用**：代码注释里写着 `ADR-0013` 这类编号，改布局、合文档都不改号——
 要查某条决定，先在这张表里按编号找文件。
 
-- 本目录：**仍然约束当前代码**的决定（11 篇）
-- [`archive/`](./archive/)：历史决定（6 篇）——被取代、或已被实现固化/被别处文档覆盖
+- 本目录：**仍然约束当前代码**的决定（9 篇）
+- [`archive/`](./archive/)：历史决定（7 篇）——被取代、或已被实现固化/被别处文档覆盖
 
 状态行是唯一必须跟着代码更新的字段；ADR 正文里的模块路径、env 名、行号都是**当时的布局**，
 别照着找文件（当前布局见 [`../../CONTEXT.md`](../../CONTEXT.md) 的「代码布局」）。
 
-## 现行（11）
+## 现行（9）
 
 | # | 决定 | 一句话 | 代码落点 |
 |---|---|---|---|
@@ -22,10 +22,9 @@
 | [0013](./0013-session-files-live-in-store.md) | 会话文件私有且随会话删 | ~~md 放 Store~~（0017 订正：md 也进对象存储，Store 只在 demo 模式用） | `shared/session/blobs.py`、`custom/service/session_files.py` |
 | [0014](./0014-no-hitl-for-eval.md) | 不做 eval 的 HITL 审批 | 子任务只支持取消与状态通知；取消不占发件箱行、不唤醒主管 | `custom/api/tasks.py`、`graphs/middleware/async_task_guard.py` |
 | [0015](./0015-large-tables-in-object-storage.md) | 大表进对象存储 | xlsx 字节进 S3、元数据进 PG、四个工具跑 SQLite 索引；上传者私有 + 随会话删 | `shared/session/blobs.py`、`custom/service/session_files.py`、`graphs/tools/xlsx/index.py` |
-| [0016](./0016-spaces-in-object-storage.md) | 空间知识进 S3 | ~~`okf.backend: local\|s3` 二选一，`s3` 读本地镜像~~ → 0017 取代：`s3fs` 直读，镜像待退役 | `shared/knowledge/root.py` |
 | [0017](./0017-files-read-through-one-backend.md) | 读文件只有一个入口 | 自研 `S3Backend`/`UploadsBackend` 共用一套读法；上传 key `uploads/<uuid>/<名>`，归属与清单真相都是 PG 台账 | `graphs/access/{factory,s3_backend}.py`、`graphs/middleware/session_files.py`、`shared/knowledge/spec.py` |
 
-## 已归档（6）
+## 已归档（7）
 
 | # | 决定 | 为什么归档 |
 |---|---|---|
@@ -35,6 +34,7 @@
 | [0006](./archive/0006-completion-notify-mints-parent-token.md) | ~~完成通知现铸父身份 token~~ | **被 [ADR-0010](./0010-task-delivery-idempotency.md) 取代** |
 | [0008](./archive/0008-active-task-limit-is-per-process.md) | ~~派活并发上限只在单进程成立~~ | **被 [ADR-0012](./0012-thread-quota-replaces-task-limit.md) 取代** |
 | [0009](./archive/0009-worker-mode-requires-redis-broker.md) | 多副本 / worker 必须开 Redis broker | 结论与实测证据已并入 [`../configuration.md`](../configuration.md) §3.1「Redis 与 worker」 |
+| [0016](./archive/0016-spaces-in-object-storage.md) | ~~空间知识读 S3 的本地镜像~~ | **被 [ADR-0017](./0017-files-read-through-one-backend.md) 取代**，镜像代码已删 |
 
 ## 按主题该读哪几篇
 
@@ -44,7 +44,7 @@
 | 子任务结果怎么回到主管、为什么不会投两次 | 0010（+ 0014 讲"取消不是结果"） |
 | 前端怎么看子任务进度、为什么不能直连 | 0007（+ 0014） |
 | 会话文件（md / xlsx）存在哪、怎么隔离和删 | 0013 → 0015 → 0017 |
-| 空间知识放哪、多副本怎么读同一份 | 0017（→ 0016 是它的前身） |
+| 空间知识放哪、多副本怎么读同一份 | 0017（[0016](./archive/0016-spaces-in-object-storage.md) 是它的前身，镜像方案已删） |
 | agent 读文件的路径为什么只有一条 | 0017 |
 | 账号能开多少会话 | 0012 |
 | 部署成多副本要注意什么 | [`../configuration.md`](../configuration.md) §3.1（原 0009） |

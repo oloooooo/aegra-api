@@ -4,7 +4,7 @@
 `graphs/supervisor.py`）与建空间接口（`custom/api/spaces.py`）都从这里取，
 不再有 ``_DOMAIN_SPECS`` 那样的硬编码名单。加/删一个空间 = 加/删一个文件夹 + 一行表。
 
-**两种存放**（`okf.backend`，ADR-0016）：``local`` 读本地盘 ``<okf.dir>/<space>``；
+**两种存放**（`okf.backend`，ADR-0017）：``local`` 读本地盘 ``<okf.dir>/<space>``；
 ``s3fs`` 读对象存储 ``okf/<space>/``。本模块把这层差异吃在自己内部，上面那些调用方
 （图工厂、HTTP 路由）看到的仍是同一组函数：空间存在吗、有哪些文件、AGENT.md 写了什么。
 

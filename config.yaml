@@ -42,7 +42,7 @@ xlsx:
   cache_ttl_days: 7
   query_budget_ms: 5000         # 单次 where 查询的 CPU 预算，超了 interrupt()
 
-# --- 对象存储（shared/session/blobs.py，ADR-0015/0016）---
+# --- 对象存储（shared/session/blobs.py，ADR-0015/0017）---
 # 凭证**不在这里**，写 .env：S3_ACCESS_KEY / S3_SECRET_KEY（密钥不进 git）。
 s3:
   # 空 = 不启用对象存储：上传会话大表返回 503，其余功能不受影响。
@@ -66,17 +66,16 @@ s3:
   #            ListBucket / AbortMultipartUpload / ListMultipartUploads
   #
   # 只想开关：把 endpoint 改回 "" 即退回纯磁盘（已上传的大表仍留在 S3，不影响读旧数据）。
-  # 想让空间知识也进 S3（不只会话大表）再加：
+  # 想让空间知识也进对象存储（不只会话大表）再加：
   #   okf:
-  #     backend: s3
-  #   然后 scripts/okf_push_s3.py → scripts/okf_pull_s3.py
+  #     backend: s3fs           # 直读，不需要任何本地副本
+  #   首次要把 knowledge/ 现有的内容传上去：scripts 里没有一键脚本了（镜像模式退役），
+  #   用 aws s3 sync knowledge/ s3://aegra-blobs/okf/ 或 SeaweedFS 的 filer UI。
 
-# --- 空间知识（shared/knowledge/root.py，ADR-0016）---
+# --- 空间知识（shared/knowledge/{root,spec}.py，ADR-0017）---
 okf:
-  backend: local                # local = 直接读仓库根 <dir>；s3 = 读本地镜像
+  backend: local                # local = 直接读仓库根 <dir>；s3fs = 直读对象存储 okf/
   dir: knowledge                # 空间根目录名（相对仓库根；数据不在代码包里）
-  mirror_dir: .cache/okf        # s3 模式的镜像目录
-  mirror_ttl_seconds: 0         # 0 = 只拉一次；改内容后跑 scripts/okf_pull_s3.py
 
 # --- 图（graphs/supervisor.py）---
 agents:

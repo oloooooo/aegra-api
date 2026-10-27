@@ -1,7 +1,7 @@
 # 所有文件读法收敛到一个 backend：对象存储做真相，台账做归属
 
 > 状态：**已实现**（决定 2026-02-12，分支 `feat/unified-files-s3`）。
-> 取代 [ADR-0016](./0016-spaces-in-object-storage.md) 的「本地镜像」方案；
+> 取代 [ADR-0016](./archive/0016-spaces-in-object-storage.md) 的「本地镜像」方案（镜像代码已随本文退役）；
 > 订正 [ADR-0013](./0013-session-files-live-in-store.md)（md 不再在 Store）与
 > [ADR-0015](./0015-large-tables-in-object-storage.md) 的对象 key 布局。
 > 落点：`graphs/access/{factory,s3_backend}.py`、`shared/session/blobs.py`、
@@ -53,8 +53,9 @@
 
 ### 5. 模式开关 `okf.backend`
 
-`local`（缺省，直读仓库 `knowledge/`）| `s3fs`（直读对象存储 `okf/`，无需本地副本）|
-`s3`（旧镜像，待退役）。`s3fs` 下 `knowledge_root()` 直接抛错——**没有本地目录**，
+`local`（缺省，直读仓库 `knowledge/`）| `s3fs`（直读对象存储 `okf/`，无需本地副本）。
+旧镜像模式 `s3` 与 `pull`/`push`、`scripts/okf_{push,pull}_s3.py` 已**删除**；配置里写 `s3`
+现在会明确报错，而不是静默降级。`s3fs` 下 `knowledge_root()` 同样直接抛错——**没有本地目录**，
 任何还想要 `Path` 的调用点必须在接线时改掉（`spec.py` 已全改，见下）。
 
 ### 6. 为什么仍然自研（复用 ADR-0016 的实测结论）
@@ -73,7 +74,6 @@
 | `write` 用条件写 vs 覆盖 | 覆盖（last-write-wins） | 协议要求 write 是覆盖语义；把 CAS 加在 write 上会让「第二次写」失败，违反契约。CAS 加在真正有读-改-写窗口的 `edit` 上 |
 | `UploadsBackend` 实现同步版 vs 只异步 | 只异步 | 同步读要把 async PG 会话跑在另一个事件循环里（`asyncio.run` 嵌套），本地和单副本都不成立；框架调用的正是异步方法 |
 | `spec.py` 模式分支 vs 抽象一层「虚拟文件系统」 | 分支 | 抽象层要同时包住 `Path` 和对象存储，两个调用面（`rglob`/`read_text`/`mkdir`）语义对不齐；分支只有 5 个函数 |
-| 保留 `okf.backend: s3` 镜像 vs 直接删 | 暂时保留 | 退役要同时改 `scripts/`、部署文档、`config.yaml`；先把 `s3fs` 跑通再删，避免一次改两次回滚 |
 
 ## 缺陷与已知风险
 
@@ -97,7 +97,7 @@
    结果是孤儿 md 到期不再被续命——这其实是想要的，但它不再是「靠 TTL 兜底」而是「靠删会话」。
 9. **驱逐文件与空间内容同前缀**：`/large_tool_results`、`/conversation_history`、`/blobs`
    在 `s3fs` 下写成 `okf/large_tool_results/...`，和空间知识混在一个前缀里；
-   `SpaceGuard` 的可见性把它们排除在 ls/grep 之外，但 mirror 退役前 `push` 会把它们一起传上去。
+   `SpaceGuard` 的可见性把它们排除在 ls/grep 之外，但它们确实占着 `okf/`（运维对账时会看到）。
 10. **多集群不成立**：条件写的强一致只在同一 SeaweedFS 集群内；跨集群 `filer.sync` 是异步复制，
     有最终一致窗口，CAS 会被打破。
 11. **`UploadsBackend` 的同步协议方法不实现**（继承 `BackendProtocol` 默认 → `NotImplementedError`）。
@@ -120,7 +120,8 @@ MSYS_NO_PATHCONV=1 docker run -d --name swtest -p 8333:8333 chrislusf/seaweedfs:
 
 ## 后果
 
-- `okf.backend: s3` 的镜像（`pull`/`push`、`scripts/okf_{push,pull}_s3.py`、`.cache/okf`）**待退役**，
-  退役时删这段代码并更新本 ADR 与 CONTEXT.md。
+- 镜像已退役（2026-02-12）：`pull`/`push`、`scripts/okf_{push,pull}_s3.py`、
+  `tests/unit/test_okf_mirror.py`、`okf.mirror_dir`/`okf.mirror_ttl_seconds` 全部删除，
+  ADR-0016 移入 `archive/`。往对象存储传空间内容现在用标准 S3 客户端（`aws s3 sync`）。
 - 「只基于本地 filesystem + store」的形态另开长期分支（`feat/unified-files-local`），
   main 只留对象存储形态。
