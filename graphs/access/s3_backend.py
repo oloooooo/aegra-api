@@ -59,7 +59,7 @@ from deepagents.backends.utils import (
 )
 
 from graphs.access import session_scope
-from graphs.access.backend import SpaceGuard
+from graphs.access.backend import SpaceGuard, _is_internal
 from graphs.access.spaces import spaces_from_config_or_runtime
 from shared.session import blobs
 
@@ -278,23 +278,29 @@ class S3Backend(SpaceGuard, _ObjectTree, BackendProtocol):
 
     空间隔离复用 `SpaceGuard`（`_check_read`/`_check_write`/`_visible`），这里只回答
     「这个空间文件夹在存储里存在吗」与「字节怎么读写」。
+
+    例外是框架的驱逐文件（`/large_tool_results/`、`/conversation_history/` 等内部前缀）：
+    它们进 ``artifacts/``，不脏 ``okf/``——``okf/`` 的语义是「空间知识，要备份要审阅」，
+    而驱逐文件是一次 run 的临时产物，可以按前缀整批清。
     """
 
-    def __init__(self, prefix: str = "okf/") -> None:
+    def __init__(self, prefix: str = "okf/", artifacts_prefix: str = "artifacts/") -> None:
         self._prefix = prefix if prefix.endswith("/") else prefix + "/"
+        self._artifacts = artifacts_prefix if artifacts_prefix.endswith("/") else artifacts_prefix + "/"
 
     # ---------- 路径 ↔ 对象 key ----------
 
     def _key_of(self, vpath: str) -> str:
-        return f"{self._prefix}{vpath.lstrip('/')}"
+        base = self._artifacts if _is_internal(vpath) else self._prefix
+        return f"{base}{vpath.lstrip('/')}"
 
     def _keys(self) -> dict[str, _Obj]:
-        tree = blobs.list_tree(self._prefix)
-        return {
-            "/" + k[len(self._prefix) :]: _Obj(k, int(v.get("size") or 0))
-            for k, v in tree.items()
-            if len(k) > len(self._prefix) and not k.endswith("/")
-        }
+        out: dict[str, _Obj] = {}
+        for prefix in (self._prefix, self._artifacts):
+            for k, v in blobs.list_tree(prefix).items():
+                if len(k) > len(prefix) and not k.endswith("/"):
+                    out["/" + k[len(prefix) :]] = _Obj(k, int(v.get("size") or 0))
+        return out
 
     def _shown(self, vpath: str) -> bool:
         spaces = spaces_from_config_or_runtime()

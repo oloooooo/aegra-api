@@ -71,6 +71,13 @@
 `xlsx_info / xlsx_query`」的错误文本，而不是 base64。base64 表格对模型只烧 token、读不懂；
 字节的唯一正当出口是 `download_files`（xlsx 四件套走这条）。
 
+### 8. 框架的驱逐文件写 `artifacts/`，不写 `okf/`
+
+`/large_tool_results/`、`/conversation_history/`、`/blobs/` 这类内部前缀是
+`FilesystemMiddleware` 自己的缓存（工具结果太大就落文件、老消息压缩成文件留档），不是空间知识。
+`S3Backend._key_of` 对它们走 `artifacts/` 前缀，`_keys()` 同时 LIST 两个前缀——所以框架驱逐后
+仍能按路径 `read` 回来，但 `okf/` 里查不到它们。
+
 ## 取舍
 
 | 取舍点 | 选了什么 | 为什么不选另一个 |
@@ -90,7 +97,7 @@
 2. **`edit` 的 CAS 只在支持条件写的对象存储上成立**。SeaweedFS 自 PR #7154 起支持
    `If-Match`/`If-None-Match`（filer 同一把锁内判定+写入）；**别的 S3 实现若忽略该头**，
    `edit` 静默退化成 last-write-wins。`edit` 冲突只重试 1 次，之后把「文件已被改过」交给模型重读。
-3. **`ls` 每次 LIST 整个前缀**：`S3Backend._keys()` = `list_tree("okf/")`，空间对象数大时
+3. **`ls` 每次 LIST 整个前缀**：`S3Backend._keys()` = `list_tree("okf/")` + `list_tree("artifacts/")`，空间对象数大时
    一次 ls 就是全量 LIST。升级触发：单空间对象数 > ~1 万或 LIST 耗时 > 200 ms。
 4. **`grep` 是 N+1 GET**：先 LIST 再逐个 GET 文本文件。`max_count` 只省掉「已满足后不再取」。
    大文件量下要加 per-run 的 ETag→内容缓存。
@@ -103,9 +110,11 @@
    首次写入按 sha16 复用会让孤儿被复用，但不去重时就只剩计费。
 8. **md 的 TTL 续期在台账模式下消失了**：Store 路径有 `refresh_ttl=True`，台账模式没有。
    结果是孤儿 md 到期不再被续命——这其实是想要的，但它不再是「靠 TTL 兜底」而是「靠删会话」。
-9. **驱逐文件与空间内容同前缀**：`/large_tool_results`、`/conversation_history`、`/blobs`
-   在 `s3fs` 下写成 `okf/large_tool_results/...`，和空间知识混在一个前缀里；
-   `SpaceGuard` 的可见性把它们排除在 ls/grep 之外，但它们确实占着 `okf/`（运维对账时会看到）。
+9. **驱逐文件已挪出 `okf/`**（原缺陷：`/large_tool_results`、`/conversation_history`、`/blobs`
+   在 `s3fs` 下写成 `okf/large_tool_results/…`，与空间知识同前缀 → 运维对账/备份会把垃圾算进去、
+   将来按前缀授权会连缓存目录一起暴露、也没法按会话整批清）。现在内部前缀映射到 `artifacts/`，
+   `_keys()` 合并两个前缀的 LIST（多一次 LIST，换 `okf/` 语义干净）。存量对象没迁移：
+   上线前 `okf/large_tool_results/` 之类若有内容，需手工搬到 `artifacts/`。
 10. **多集群不成立**：条件写的强一致只在同一 SeaweedFS 集群内；跨集群 `filer.sync` 是异步复制，
     有最终一致窗口，CAS 会被打破。
 11. **`UploadsBackend` 的同步协议方法不实现**（继承 `BackendProtocol` 默认 → `NotImplementedError`）。

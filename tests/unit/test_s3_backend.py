@@ -15,6 +15,8 @@ _FILES = {
     "okf/sp/a.md": {"size": 5},
     "okf/sp/t.xlsx": {"size": 9},
     "okf/sp/sub/deep.md": {"size": 3},
+    # 框架的驱逐文件：在 artifacts/ 而不是 okf/（它们不是空间知识）
+    "artifacts/large_tool_results/r1.txt": {"size": 5},
 }
 
 
@@ -24,7 +26,7 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> sb.S3Backend:
     # 两处都要换：`_check_read` 在 backend 模块里，`_shown`/探针在 s3_backend 里
     monkeypatch.setattr(backend_mod, "spaces_from_config_or_runtime", lambda: None)
     monkeypatch.setattr(sb, "spaces_from_config_or_runtime", lambda: None)
-    monkeypatch.setattr(sb.blobs, "list_tree", lambda _prefix: dict(_FILES))
+    monkeypatch.setattr(sb.blobs, "list_tree", lambda prefix: {k: v for k, v in _FILES.items() if k.startswith(prefix)})
     monkeypatch.setattr(sb, "_get_bytes", lambda obj: b"PK\x03\x04zipish" if obj.key.endswith(".xlsx") else b"hello")
     return sb.S3Backend()
 
@@ -48,3 +50,13 @@ def test_read_on_table_points_at_xlsx_tools(backend: sb.S3Backend) -> None:
     result = backend.read("/sp/t.xlsx")
     assert result.file_data is None
     assert result.error and "xlsx_info" in result.error
+
+
+def test_evicted_files_live_outside_the_space_prefix(backend: sb.S3Backend) -> None:
+    """驱逐文件写 artifacts/：`okf/` 只放空间知识，垃圾能按前缀整批清。"""
+    assert backend._key_of("/large_tool_results/r1.txt") == "artifacts/large_tool_results/r1.txt"
+    assert backend._key_of("/sp/a.md") == "okf/sp/a.md"
+    # 合并 key 表之后仍然读得回来（框架驱逐后会按路径 read 回来）
+    assert backend.read("/large_tool_results/r1.txt").file_data is not None
+    # 空间可见性判定对内部前缀单独放行（`_is_internal`），与 okf/ 前缀无关
+    assert backend._gate("/large_tool_results/r1.txt") is None

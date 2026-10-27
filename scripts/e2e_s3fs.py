@@ -1,8 +1,10 @@
-"""One-off e2e (not committed): real SeaweedFS + real backend + real xlsx toolchain.
+"""手动 e2e（不在 CI 里）：真 SeaweedFS + 真 backend + 真 xlsx 工具链（ADR-0017 缺陷 12）。
 
-Covers the one path under `okf.backend: s3fs` that unit tests cannot prove:
-  object storage -> backend.download_files -> disk cache -> sqlite index -> tool answer
-plus `has_tables()` recursion (a table in a subdirectory must still enable the tools).
+跑法：``PYTHONPATH=. PYTHONUTF8=1 .venv/Scripts/python.exe scripts/e2e_s3fs.py``
+（需要本机 ``docker run -d -p 8333:8333 chrislusf/seaweedfs server -s3``，见 docs/S3.md）
+
+守单测proof不了的那条链路：对象存储 -> ``download_files`` -> 磁盘缓存 -> sqlite 索引 -> 工具答案，
+外加 ``has_tables()`` 递归（表放子目录也要装上工具）、跨空间拒绝、驱逐文件不落 ``okf/``。
 """
 
 import asyncio
@@ -46,10 +48,10 @@ def make_xlsx() -> bytes:
 
 
 async def main() -> None:
+    import graphs.access.spaces as spaces_mod
     from graphs.access import factory
     from graphs.tools.xlsx import _fetch, _info, index
     from graphs.tools.xlsx import store as xstore
-    import graphs.access.spaces as spaces_mod
     from shared.knowledge import spec
     from shared.session import blobs
 
@@ -93,6 +95,13 @@ async def main() -> None:
         resp = (await backend.adownload_files([f"/{SPACE}/data/t.xlsx"]))[0]
         check("download_files returns real bytes", resp.content is not None and resp.content[:2] == b"PK", str(resp.error))
 
+        # --- eviction: framework scratch files must not pollute okf/ ---
+        backend.write("/large_tool_results/e2e-1.txt", "scratch")
+        spilled = blobs.list_tree("artifacts/")
+        check("evicted file lands in artifacts/", any(k.endswith("e2e-1.txt") for k in spilled), str(list(spilled))[:100])
+        check("okf/ stays clean", not any("large_tool_results" in k for k in blobs.list_tree("okf/")))
+        check("evicted file still readable", backend.read("/large_tool_results/e2e-1.txt").file_data is not None)
+
         # --- toolchain: bytes -> cache -> index -> answer ---
         xlsx, cache_key = await _fetch(f"/{SPACE}/data/t.xlsx", None)
         info = await asyncio.to_thread(_info, xlsx, cache_key, "t.xlsx", None, 0)
@@ -108,6 +117,7 @@ async def main() -> None:
         blobs.delete_prefix(f"okf/{SPACE}/")
         blobs.delete_prefix(f"okf/{DOC_SPACE}/")
         blobs.delete_prefix("okf/e2e-other/")
+        blobs.delete_prefix("artifacts/")
         left = blobs.list_tree("okf/e2e")
         check("cleaned up", not left, str(list(left)))
 
