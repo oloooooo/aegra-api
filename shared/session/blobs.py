@@ -123,6 +123,88 @@ def get(key: str) -> bytes:
     return client().get_object(Bucket=bucket(), Key=key)["Body"].read()
 
 
+# ---------- 通用对象原语（backend 也用：LIST / 连 ETag 读 / 条件写） ----------
+
+
+def get_object(key: str) -> tuple[bytes, str] | None:
+    """GET 一个对象，连 ETag 一起返回。不存在返回 None（不抛）。
+
+    ETag 是 `edit` 做 CAS 的比对基准：读到的内容与写回时的 If-Match 必须同源，
+    否则「读-改-写」之间别人改了文件会被静默覆盖。
+    """
+    try:
+        r = client().get_object(Bucket=bucket(), Key=key)
+    except Exception as e:  # noqa: BLE001 —— 只有 NoSuchKey/404 该被吞
+        if _is_missing(e):
+            return None
+        raise
+    # 带引号的原始形态喂给 If-Match 最安全（各实现去引号的方式不一致）
+    return r["Body"].read(), r.get("ETag") or ""
+
+
+def put_bytes(
+    key: str,
+    body: bytes,
+    *,
+    if_match: str | None = None,
+    if_none_match: str | None = None,
+) -> str | None:
+    """PUT 原始字节，可带 S3 条件头；冲突时抛 `PreconditionFailed`（调用方判定）。
+
+    返回新 ETag。条件写要求服务端在同一把锁里判定 + 写入（SeaweedFS 0.9x 起支持），
+    比「先 HEAD 再 PUT」的 last-write-wins 强：并发写不会互相覆盖到不知情。
+    """
+    kw: dict[str, Any] = {"Bucket": bucket(), "Key": key, "Body": body}
+    if if_match:
+        kw["IfMatch"] = if_match
+    if if_none_match:
+        kw["IfNoneMatch"] = if_none_match
+    r = client().put_object(**kw)
+    return r.get("ETag") or None
+
+
+def list_tree(prefix: str) -> dict[str, dict[str, Any]]:
+    """LIST 前缀下的全部对象（自动翻页）：`{key: {size, etag, modified}}`。
+
+    一次返回全部而不是按分隔符分页：知识空间与会话文件都是小量级，调用方
+    （backend 的 ls/glob/grep）要的是一棵完整的树，分页反而要自己拼。
+    """
+    s3, b = client(), bucket()
+    out: dict[str, dict[str, Any]] = {}
+    token: str | None = None
+    while True:
+        kw: dict[str, Any] = {"Bucket": b, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        page = s3.list_objects_v2(**kw)
+        for o in page.get("Contents", []):
+            out[o["Key"]] = {
+                "size": int(o.get("Size") or 0),
+                "etag": o.get("ETag") or "",
+                "modified": o.get("LastModified"),
+            }
+        if not page.get("IsTruncated"):
+            return out
+        token = page.get("NextContinuationToken")
+
+
+def exists_prefix(prefix: str) -> bool:
+    """前缀下有没有对象（对象存储没有空目录，目录的「存在」就是有东西）。"""
+    page = client().list_objects_v2(Bucket=bucket(), Prefix=prefix, MaxKeys=1)
+    return bool(page.get("Contents"))
+
+
+def delete_many(keys: list[str]) -> int:
+    """批量删（每批 1000，S3 上限）；返回删掉的个数。"""
+    if not keys:
+        return 0
+    s3, b = client(), bucket()
+    for i in range(0, len(keys), _DELETE_BATCH):
+        batch = [{"Key": k} for k in keys[i : i + _DELETE_BATCH]]
+        s3.delete_objects(Bucket=b, Delete={"Objects": batch})
+    return len(keys)
+
+
 def download(key: str, dest: str) -> None:
     client().download_file(bucket(), key, dest)
 
@@ -298,11 +380,17 @@ __all__ = [
     "configured",
     "copy",
     "delete",
+    "delete_many",
     "delete_prefix",
     "download",
     "ensure_bucket",
+    "exists_prefix",
     "get",
+    "get_object",
     "index_key",
+    "list_tree",
+    "put_bytes",
+    "put_stream",
     "put_stream",
     "reap_tmp",
     "reset_client",
